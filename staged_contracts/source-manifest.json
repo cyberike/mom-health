@@ -1,0 +1,12 @@
+{
+  "sources": {
+    "staged_contracts\\batch_contract.py": "84d53b039922c55d8d210d050fdf4b241be9350ead3625e03ae20efdbd8fd1e0",
+    "staged_contracts\\contract.py": "3a5438506ec4b71e34381f2f22e70d561e411a9ef5cd7aaf784b53ef02bdd411",
+    "staged_contracts\\memory_buffer.py": "802daf403ab94b8390d2a27144fd29d7404e7dfb8d6c010b93e946e84ebff54b",
+    "staged_contracts\\test_chunks.py": "38b3278498c4875f7b0836593359d3d452ec710f1a5a0d754bf77647e4b0831d",
+    "staged_contracts\\verify.py": "581a5518d157d14da7279ee2e499cd3f1c8e29c1c0ec31d08871c883ed5e7c0c"
+  },
+  "tests": 50,
+  "android_source_unchanged": true,
+  "fallback_apks_unchanged": true
+}

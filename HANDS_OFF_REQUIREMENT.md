@@ -1,0 +1,21 @@
+# Mom's routine: wear the device and charge it
+
+User-confirmed core requirement, October 24, 2026: Mom should not need to start measurements, reconnect, toggle saving, enter endpoints, upload batches or troubleshoot the application. Setup, permissions, consent, maintenance and review belong to the caregiver. Normal use means wearing and charging the device. This supersedes treating the manual prototype interaction as the final product design; it does not silently activate background access or data transmission.
+
+The tested manual fallback and separate candidate remain preserved. No background feature has been enabled. Current 30-second sessions, foreground-only BLE, per-visit recording opt-in and manual upload are development controls, not satisfaction of this requirement.
+
+## Dependency-ordered work
+
+1. Observation identity and caregiver diagnostics. Investigate duplicate-looking receipt timestamps without guessing that equal BPM/time means one observation. Distinguish callback route, receipt event, session and stored record. Never deduplicate independent readings solely by value/time. Current diagnostic source change adds event number and callback route; no device test or installation performed for it.
+2. Caregiver onboarding and durable device association. Design persistent consent with visible revocation, one selected physical watch and caregiver-managed setup. Today's opaque device ID is Activity-local and can change across recreation, so stable association remains missing code. No BLE address should become an externally exposed identity.
+3. Evidence-supported acquisition cadence. Determine whether each watch can record autonomously and provide reliable history, or needs scheduled bounded phone requests. The brief does not establish a measurement interval, continuous sensing capability or validated history completion. Do not invent a cadence or imply continuous coverage.
+4. Android connection/collection lifecycle. Build a separately reviewed foreground-service design with required notification, bounded reconnect/backoff, radio-loss handling, process/reboot recovery, user-stop behavior and battery limits. Existing foreground-disconnect behavior remains active until separately implemented, permission-reviewed and tested. Never keep the screen awake as the solution to unattended collection.
+5. Durable buffering and retention. Preserve pending observations across restart; design explicit retention and backpressure for the current 10,000-record ceiling. Manual deletion by Mom cannot be the normal recovery mechanism. Do not silently erase unsent readings. Disk capacity, upload policy and caregiver intervention must be defined.
+6. Caregiver-managed synchronization. Existing explicit uploader/backend are foundations. Automatic scheduling, secure destination, authentication lifecycle, network/power constraints and retry/backoff are missing implementation/activation steps. No endpoint or credential is configured; no real data transmitted.
+7. Caregiver status and acceptance. Show gaps, last receipt, watch/phone battery and sync freshness honestly. Inform a caregiver about technical disconnection only after notification routing and thresholds are specified; do not invent health alerts. Test screen-off, range loss, charging, restart, network loss, buffer exhaustion and recovery on Pixel/Fold and Mom's S25 Ultra. Wear/charge acceptance must not require Mom to tap controls.
+
+Steps 1–2 can be developed independently of service activation; 3 determines acquisition strategy; 4–6 depend on caregiver consent/access and cadence decisions; 7 validates the integrated design. No schedule is promised before protocol and platform constraints are resolved. The current app is a prototype, not an unattended medical monitor.
+
+## Hardware acceptance recorded so far
+
+The user observed a V8 reading in 0.6.1 on Pixel, all local counts zero with saving off, 21 pending/0 uploaded/0 failed after enabling saving, the same 21 pending after leaving/reopening, and saving reset to unchecked. These are user-led observations, not a comprehensive persistence/cancellation test. Two displayed entries share a receipt timestamp and BPM; their cause is unresolved. No health measurements are copied into this requirements file.

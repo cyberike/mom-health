@@ -1,0 +1,11 @@
+build/
+*.jks
+*.p12
+local.properties
+
+__pycache__/
+*.pyc
+tools/
+*.db
+*.sqlite*
+*.log

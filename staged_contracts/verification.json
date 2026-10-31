@@ -1,0 +1,27 @@
+[
+  {
+    "suite": "ContractTests",
+    "exit_code": 0,
+    "output": "test_contradiction (test_chunks.ContractTests.test_contradiction) ... ok\ntest_history_closed (test_chunks.ContractTests.test_history_closed) ... ok\ntest_identity (test_chunks.ContractTests.test_identity) ... ok\ntest_immutable (test_chunks.ContractTests.test_immutable) ... ok\ntest_model_evidence_not_accuracy (test_chunks.ContractTests.test_model_evidence_not_accuracy) ... ok\ntest_null_is_not_zero (test_chunks.ContractTests.test_null_is_not_zero) ... ok\ntest_null_requires_reason (test_chunks.ContractTests.test_null_requires_reason) ... ok\ntest_synthetic_only (test_chunks.ContractTests.test_synthetic_only) ... ok\ntest_time_requires_zone (test_chunks.ContractTests.test_time_requires_zone) ... ok\ntest_valid_candidate (test_chunks.ContractTests.test_valid_candidate) ... ok\n\n----------------------------------------------------------------------\nRan 10 tests in 0.001s\n\nOK\n"
+  },
+  {
+    "suite": "BufferTests",
+    "exit_code": 0,
+    "output": "test_ack_string_cannot_split_into_other_ids (test_chunks.BufferTests.test_ack_string_cannot_split_into_other_ids) ... ok\ntest_capacity_and_batch_bounds (test_chunks.BufferTests.test_capacity_and_batch_bounds) ... ok\ntest_conflict_preserves (test_chunks.BufferTests.test_conflict_preserves) ... ok\ntest_empty_no_collection (test_chunks.BufferTests.test_empty_no_collection) ... ok\ntest_fresh_instance_empty (test_chunks.BufferTests.test_fresh_instance_empty) ... ok\ntest_full_never_evicts (test_chunks.BufferTests.test_full_never_evicts) ... ok\ntest_idempotent_pending (test_chunks.BufferTests.test_idempotent_pending) ... ok\ntest_invalid_ack_atomic (test_chunks.BufferTests.test_invalid_ack_atomic) ... ok\ntest_order_and_limit (test_chunks.BufferTests.test_order_and_limit) ... ok\ntest_partial_ack (test_chunks.BufferTests.test_partial_ack) ... ok\ntest_retries_retain_without_ack (test_chunks.BufferTests.test_retries_retain_without_ack) ... ok\n\n----------------------------------------------------------------------\nRan 11 tests in 0.001s\n\nOK\n"
+  },
+  {
+    "suite": "BatchTests",
+    "exit_code": 0,
+    "output": "test_bounds (test_chunks.BatchTests.test_bounds) ... ok\ntest_duplicate_rejected (test_chunks.BatchTests.test_duplicate_rejected) ... ok\ntest_envelope_strict (test_chunks.BatchTests.test_envelope_strict) ... ok\ntest_invalid_enum_or_date (test_chunks.BatchTests.test_invalid_enum_or_date) ... ok\ntest_missing_field (test_chunks.BatchTests.test_missing_field) ... ok\ntest_no_implicit_real_mode (test_chunks.BatchTests.test_no_implicit_real_mode) ... ok\ntest_no_input_mutation (test_chunks.BatchTests.test_no_input_mutation) ... ok\ntest_null_roundtrip (test_chunks.BatchTests.test_null_roundtrip) ... ok\ntest_roundtrip (test_chunks.BatchTests.test_roundtrip) ... ok\ntest_unknown_fields_rejected (test_chunks.BatchTests.test_unknown_fields_rejected) ... ok\n\n----------------------------------------------------------------------\nRan 10 tests in 0.001s\n\nOK\n"
+  },
+  {
+    "suite": "ReviewTests",
+    "exit_code": 0,
+    "output": "test_ack_infinite_iterable_bounded (test_chunks.ReviewTests.test_ack_infinite_iterable_bounded) ... ok\ntest_ack_invalid_iterable (test_chunks.ReviewTests.test_ack_invalid_iterable) ... ok\ntest_capacity_cannot_be_widened (test_chunks.ReviewTests.test_capacity_cannot_be_widened) ... ok\ntest_device_id_required (test_chunks.ReviewTests.test_device_id_required) ... ok\ntest_device_session_model_scope (test_chunks.ReviewTests.test_device_session_model_scope) ... ok\ntest_equal_id_different_scope_not_duplicate (test_chunks.ReviewTests.test_equal_id_different_scope_not_duplicate) ... ok\ntest_evidence_cannot_be_promoted (test_chunks.ReviewTests.test_evidence_cannot_be_promoted) ... ok\ntest_malformed_null_reason (test_chunks.ReviewTests.test_malformed_null_reason) ... ok\ntest_mixed_batch_rejected (test_chunks.ReviewTests.test_mixed_batch_rejected) ... ok\ntest_no_model_claim_fields (test_chunks.ReviewTests.test_no_model_claim_fields) ... ok\ntest_partial_ack_retry_scope_preserved (test_chunks.ReviewTests.test_partial_ack_retry_scope_preserved) ... ok\ntest_receipt_time_not_device_order (test_chunks.ReviewTests.test_receipt_time_not_device_order) ... ok\ntest_scope_survives_ack (test_chunks.ReviewTests.test_scope_survives_ack) ... ok\ntest_timestamp_bound (test_chunks.ReviewTests.test_timestamp_bound) ... ok\ntest_utc_boundary_overflow_rejected (test_chunks.ReviewTests.test_utc_boundary_overflow_rejected) ... ok\ntest_utc_normalization (test_chunks.ReviewTests.test_utc_normalization) ... ok\n\n----------------------------------------------------------------------\nRan 16 tests in 0.001s\n\nOK\n"
+  },
+  {
+    "suite": "IntegrationTests",
+    "exit_code": 0,
+    "output": "test_invalid_batch_keeps_pending (test_chunks.IntegrationTests.test_invalid_batch_keeps_pending) ... ok\ntest_no_cross_model_history (test_chunks.IntegrationTests.test_no_cross_model_history) ... ok\ntest_validation_is_not_commit (test_chunks.IntegrationTests.test_validation_is_not_commit) ... ok\n\n----------------------------------------------------------------------\nRan 3 tests in 0.000s\n\nOK\n"
+  }
+]

@@ -1,0 +1,12 @@
+# 0.8.3 candidate: supervised phone acceptance
+
+This checklist is a future user-guided test, not a record that 0.8.3 has been tested. The APK is development-signed and debuggable. Keep the verified 0.7.0 and 0.8.0 backups; do not clear app data or replace them on the phone without understanding Android's update/signature prompts. Obtain the user's permission before installation, enabling the automatic mode, or sending any real reading to a server.
+
+1. With the user participating, update the intended test phone using the verified 0.8.3 APK and review the Android install prompt. Confirm existing pending readings are still present; do not clear them or configure an upload endpoint.
+2. Select the physical V8 and connect deliberately. Confirm the app reports connection, battery and firmware. Start one 30-second measurement, note the watch-reported result and verify that it is marked ended afterward. The value is not independently verified for accuracy.
+3. With the user supervising, test Stop during a new measurement and observe the app's cleanup status. Compare on-wrist and off-wrist light behavior without inferring physical shutdown solely from a successful write. Stop if unexpected sensor behavior persists.
+4. Check screen sleep and reconnect according to the candidate's visible settings. If automatic collection is explicitly approved, test a short supervised screen-off interval and verify its notification, budget and Stop behavior; record any gaps or unexpected reconnects. Do not claim unattended reliability from a brief test.
+5. Test rejected, missing and duplicate acknowledgments first against an approved synthetic endpoint or a dedicated synthetic fixture. Confirm unacknowledged readings stay pending and status explains an incomplete upload, including after retry. Do not send the phone's real pending observations to the synthetic endpoint. A real upload requires a separate approved destination, privacy review and explicit authorization.
+6. Once the actual caregiver site is approved and safely available, separately verify caregiver login, correct read-only access, phone write-only access, private HTTPS behavior and a synthetic end-to-end result. Test the S25 Ultra with the user's participation before representing it as accepted.
+
+The test does not establish clinical accuracy, reliable autonomous monitoring, device shutdown, or backup recovery. Record the app version, phone and watch model, timestamps, visible status and unexpected outcomes; avoid sharing raw health data in screenshots or logs.

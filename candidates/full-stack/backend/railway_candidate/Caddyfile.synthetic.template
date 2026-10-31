@@ -1,0 +1,32 @@
+# LOCAL HTTP/1 SYNTHETIC FIXTURE ONLY. Do not use for deployment.
+# Replace the three placeholders using caddy_synthetic_harness.render_config.
+{
+    admin off
+    persist_config off
+    auto_https off
+    grace_period 5s
+    storage file_system {
+        root __STORAGE_PATH__
+    }
+    servers {
+        protocols h1
+        max_header_size 32KiB
+        timeouts {
+            read_header 2s
+            read_body 3s
+            write 3s
+            idle 5s
+        }
+    }
+}
+
+http://127.0.0.1:__PROXY_PORT__ {
+    bind 127.0.0.1
+    reverse_proxy 127.0.0.1:__UPSTREAM_PORT__ {
+        transport http {
+            network_proxy none
+            dial_timeout 1s
+            response_header_timeout 5s
+        }
+    }
+}

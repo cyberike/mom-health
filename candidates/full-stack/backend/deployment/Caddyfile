@@ -1,0 +1,9 @@
+# Candidate configuration: no service starts until an administrator explicitly provisions it.
+# Set MOM_HEALTH_HOSTED_HOSTNAME to the same public DNS name on both processes.
+{$MOM_HEALTH_HOSTED_HOSTNAME} {
+    # Caddy terminates HTTPS and supplies the scheme itself; never trust a client-supplied value.
+    reverse_proxy 127.0.0.1:8765 {
+        header_up Host {$MOM_HEALTH_HOSTED_HOSTNAME}
+        header_up X-Forwarded-Proto https
+    }
+}

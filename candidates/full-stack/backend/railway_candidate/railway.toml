@@ -1,0 +1,6 @@
+# Candidate only. Configure backend as the service root, then explicitly
+# specify this config path in Railway if a later synthetic deployment is approved.
+[deploy]
+startCommand = "python -m railway_candidate.run"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3

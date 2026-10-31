@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="referrer" content="no-referrer">
+  <title>Mom Health &middot; Caregiver dashboard</title>
+  <link rel="stylesheet" href="styles.css">
+  <script defer src="core.js"></script>
+  <script defer src="app.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to dashboard</a>
+<div class="shell">
+  <aside class="sidebar" aria-label="Dashboard navigation">
+    <a class="brand" href="#main"><span class="brand-mark" aria-hidden="true">&#9829;</span><span>Mom Health<small>Caregiver space</small></span></a>
+    <nav><a class="nav-active" href="#overview">Overview</a><a href="#readings">Saved readings</a><a href="#connection">Data connection</a><a href="#about">About this prototype</a></nav>
+    <div class="sidebar-note"><span class="eyebrow">THE GOAL</span><p>She wears it.<br>She charges it.<br>You handle the rest.</p><small>Hands-off collection is still being built and validated.</small></div>
+  </aside>
+  <main id="main">
+    <header class="topbar"><span class="eyebrow">YOUR CAREGIVER DASHBOARD</span><div class="topbar-actions"><span id="modeBadge" class="badge neutral">Not connected</span><button id="clearSession" class="quiet" type="button">Clear session</button></div></header>
+    <section class="welcome" id="overview" aria-labelledby="welcomeHeading"><div><span class="eyebrow">A LITTLE MORE PEACE OF MIND</span><h1 id="welcomeHeading">A moment to check in.</h1><p>Review what the watch reported, and see what still needs attention.</p></div><span class="welcome-heart" aria-hidden="true">&#9829;</span></section>
+
+    <div id="announcement" class="notice" role="status" aria-live="polite">Start with the synthetic preview, or connect to your configured caregiver backend. No readings are loaded yet.</div>
+    <section class="card connection" id="connection" aria-labelledby="connectionHeading">
+      <div class="section-heading"><div><span class="eyebrow">PRIVATE BY DESIGN</span><h2 id="connectionHeading">Choose your data source</h2></div><span class="local-tag">Development candidate</span></div>
+      <p class="muted">The dashboard only reads from the backend serving this page. It does not connect to the watch or upload readings.</p>
+      <form id="connectForm"><p>Use your caregiver sign-in to open this synthetic-only candidate.</p><div class="connect-row"><input id="accessToken" type="hidden" value=""><button class="primary" id="connectButton" type="submit">Connect to caregiver backend</button><button id="demoButton" type="button">Try synthetic preview</button></div></form>
+      <p class="micro">Clear session removes displayed readings. Browser sign-in may remain cached until you close the browser. Preview data is fictional.</p>
+      <div class="source-controls"><div class="device-field"><label for="deviceSelect">Watch data source</label><select id="deviceSelect" disabled><option value="">No watch data loaded</option></select></div><button id="moreDevices" type="button" hidden>Load more devices</button><button id="refreshButton" type="button" disabled>Refresh readings</button></div>
+      <p id="sourceStatus" class="micro">Backend: not connected &middot; Refresh is manual</p>
+    </section>
+
+    <section class="summary-grid" aria-label="Latest available information">
+      <article class="card heart-card"><div class="metric-label"><span class="heart-icon" aria-hidden="true">&#9829;</span> WATCH-REPORTED HEART RATE</div><div class="bpm-line"><strong id="latestBpm">&mdash;</strong><span>bpm</span></div><p id="latestLabel" class="metric-description">No reading loaded</p><p id="latestTime" class="micro">Receipt time: unavailable</p><p class="micro">Saved observation, not a live measurement. Accuracy is unverified.</p></article>
+      <article class="card small-stat"><span class="eyebrow teal">RECEIVED BY BACKEND</span><strong id="sampleCount" class="stat-number">&mdash;</strong><p>saved observations</p><p id="countNote" class="micro">No source selected</p></article>
+      <article class="card small-stat"><span class="eyebrow blue">LAST SAVED PHONE RECEIPT</span><strong id="receiptAge" class="stat-text">Unknown</strong><p id="receiptNote">No source selected</p><p class="micro">Time since phone receipt of the last record saved to the backend; not proof of current wear or sensor freshness.</p></article>
+    </section>
+
+    <section class="card status-card" aria-labelledby="deviceStatusHeading"><div class="section-heading"><div><span class="eyebrow">NO ASSUMPTIONS</span><h2 id="deviceStatusHeading">Device &amp; sync status</h2></div></div><p id="statusReportTime" class="micro">No gateway status report received.</p><div class="status-grid"><div><span class="status-dot unknown" aria-hidden="true"></span><h3>Watch connection</h3><strong id="watchLink">Not reported</strong><p id="watchLinkNote">Receiving saved data does not establish a current Bluetooth connection.</p></div><div><span class="status-dot unknown" aria-hidden="true"></span><h3>Watch battery</h3><strong id="watchBattery">Not reported</strong><p id="watchBatteryNote">Waiting for an explicit gateway battery report.</p></div><div><span class="status-dot unknown" aria-hidden="true"></span><h3>Phone upload queue</h3><strong id="phoneQueue">Not reported</strong><p id="phoneQueueNote">Pending records on the phone cannot be inferred from backend totals.</p></div></div><p class="status-foot">Reports describe the gateway when it sent them, not a guaranteed current connection. No medical alerts are generated.</p></section>
+
+    <section class="card readings-card" id="readings" aria-labelledby="readingsHeading"><div class="section-heading"><div><span class="eyebrow coral">THE OBSERVATIONS WE HAVE</span><h2 id="readingsHeading">Heart-rate history</h2></div><div class="range-control"><label for="rangeSelect">Show received in</label><select id="rangeSelect"><option value="all">All loaded data</option><option value="24h">Last 24 hours</option><option value="7d">Last 7 days</option></select></div></div><p class="muted">Individual watch-reported observations, plotted by phone receipt time. Dots do not imply continuous monitoring or clinical accuracy.</p><div id="chartEmpty" class="empty-state"><span aria-hidden="true">&#9825;</span><h3>No readings yet</h3><p>Connect a data source or use the clearly labeled synthetic preview.</p></div><div id="chartWrap" class="chart-wrap" hidden><svg id="historyChart" viewBox="0 0 800 230" role="img" aria-labelledby="chartTitle chartDescription"><title id="chartTitle">Saved heart-rate observations</title><desc id="chartDescription">Individual observations by phone receipt time. Values are also available in the table below.</desc></svg></div><p id="loadedStatus" class="micro">0 observations loaded</p>
+      <div class="table-scroll"><table><caption class="sr-only">Loaded watch observations, newest phone receipt time first</caption><thead><tr><th scope="col">Received on phone</th><th scope="col">Heart rate</th><th scope="col">Provenance</th><th scope="col">Observation ID</th></tr></thead><tbody id="historyRows"><tr><td colspan="4" class="table-empty">No saved observations loaded.</td></tr></tbody></table></div><div class="pagination"><button id="loadMore" type="button" disabled>Load older observations</button><span id="pageNote" class="micro">Up to 1,000 observations per dashboard session.</span></div>
+    </section>
+    <footer id="about"><strong>Built for caregiving, with honest limits.</strong><p>This is a development candidate. It is not a medical monitor, diagnostic tool or emergency service. Missing data is not evidence that someone is well or unwell. The working phone app remains a separate fallback.</p><p>No advertising, external assets, analytics, automatic polling or browser health-data storage. Records shown here originate from the selected backend, or from explicitly labeled synthetic preview data.</p></footer>
+  </main>
+</div>
+</body>
+</html>
