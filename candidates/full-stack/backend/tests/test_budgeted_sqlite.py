@@ -42,6 +42,41 @@ class BudgetedSQLiteTests(unittest.TestCase):
         self.assertEqual([item['sample_id']],
                          self.repo.ingest(Batch.model_validate(batch(item)))['duplicate_ids'])
 
+    def test_ingest_is_all_or_nothing_wherever_the_budget_expires(self):
+        # With a per-instruction progress handler, make the budget expire at
+        # the 2nd, 3rd, ... clock read of a real ingest (the first read only
+        # anchors the deadline) until one ingest is acknowledged: past the
+        # commit no further budget check runs. Every outcome must be an
+        # acknowledgment with the whole batch stored, or an error with nothing
+        # stored and no receipt; the identical retry then succeeds once.
+        reads, refused, expire_at = [0], 0, 1
+        while True:
+            expire_at += 1
+            self.assertLess(expire_at, 5000, 'ingest never reached an acknowledgment')
+            reads[0] = 0
+
+            def expiring():
+                reads[0] += 1
+                return 100.0 if reads[0] < expire_at else 103.0
+            repo = BudgetedSQLiteRepository(self.path, budget_seconds=2, busy_seconds=.1, instruction_interval=1, clock=expiring)
+            request = Batch.model_validate(batch(sample(), sample(), sample()))
+            ids = [s.sample_id for s in request.samples]
+            try:
+                receipt = repo.ingest(request)
+            except sqlite3.DatabaseError:
+                refused += 1
+                stored = receipts = 0
+            else:
+                self.assertEqual(ids, receipt['accepted_ids'])
+                stored, receipts = 3, 1
+            with closing(sqlite3.connect(self.path)) as observer, self.subTest(expire_at=expire_at):
+                self.assertEqual(stored, observer.execute('SELECT count(*) FROM samples WHERE sample_id IN (?,?,?)', ids).fetchone()[0])
+                self.assertEqual(receipts, observer.execute('SELECT count(*) FROM batches WHERE batch_id=?', (request.batch_id,)).fetchone()[0])
+            self.assertEqual(ids, self.repo.ingest(request)['accepted_ids'])
+            if receipts:
+                break
+        self.assertGreater(refused, 100)  # hundreds of distinct interrupt points were exercised
+
     def test_expired_budget_rolls_back_without_commit(self):
         with closing(self.repo.connect()) as conn:
             conn.execute('BEGIN IMMEDIATE')
