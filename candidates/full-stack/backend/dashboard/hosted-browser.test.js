@@ -72,7 +72,7 @@ async function connected(view) {
 async function withHosted(mode, action) {
   const backend = await startBackend({ mode });
   const browser = await chromium.launch({ args: loopbackArgs([[HOST, backend.port]]) });
-  try { await seed(backend, mode); await action(browser); } finally { await browser.close(); await stopBackend(backend); }
+  try { await seed(backend, mode); await action(browser, backend); } finally { await browser.close(); await stopBackend(backend); }
 }
 
 let passed = 0;
@@ -138,6 +138,34 @@ async function check(name, action) { await action(); passed++; console.log("PASS
     const view = await signIn(browser, "direct", CAREGIVER);
     assert.equal(view.navigation.status(), 200);
     assert.equal((await connected(view)).count, "3");
+    await finish(view);
+  }));
+
+  await check("direct_candidate.py: keyboard focus stays on Connect, the watch selector and Refresh in the hosted copy", () => withHosted("direct", async (browser, backend) => {
+    const second = { sample_id: randomUUID(), device_id: "synthetic-hosted-v1", session_id: randomUUID(), model: "V1", source: "live",
+      received_at: new Date(Date.now() - 120000).toISOString(), measured_at: null, heart_rate_bpm: 79, missing_reason: null, synthetic: true };
+    assert.equal((await phonePost(backend, "direct", "/v1/batches", { schema_version: 1, batch_id: randomUUID(), samples: [second] })).status, 200);
+    const view = await signIn(browser, "direct", CAREGIVER);
+    const page = view.page;
+    const focused = () => page.evaluate(() => document.activeElement === document.body ? "BODY" : document.activeElement.id);
+    await page.focus("#connectButton");
+    await page.keyboard.press("Enter"); await idle(page);
+    // Devices are listed by ID, so the one-sample V1 watch is selected first.
+    assert.equal(await page.locator("#deviceSelect").inputValue(), "synthetic-hosted-v1");
+    assert.equal(await text(page, "sampleCount"), "1");
+    assert.equal(await focused(), "connectButton");
+    await page.focus("#deviceSelect");
+    await page.keyboard.press("ArrowDown"); await idle(page);
+    assert.equal(await page.locator("#deviceSelect").inputValue(), DEVICE);
+    assert.equal(await text(page, "sampleCount"), "3");
+    assert.equal(await focused(), "deviceSelect");
+    await page.keyboard.press("ArrowUp"); await idle(page);
+    assert.equal(await page.locator("#deviceSelect").inputValue(), "synthetic-hosted-v1");
+    assert.equal(await text(page, "sampleCount"), "1");
+    assert.equal(await focused(), "deviceSelect");
+    await page.focus("#refreshButton");
+    await page.keyboard.press("Enter"); await idle(page);
+    assert.equal(await focused(), "refreshButton");
     await finish(view);
   }));
 
