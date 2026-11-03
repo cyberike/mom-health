@@ -2,10 +2,13 @@
 surface under another device ID, including IDs that differ only by a suffix,
 separator or letter case. Fictional data and fresh SQLite fixtures only.
 """
+from datetime import datetime, timezone
 import unittest
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+from mom_health_backend import repository
 from mom_health_backend.app import Settings, create_app
 from mom_health_backend.repository import encode_cursor
 
@@ -15,6 +18,16 @@ except ImportError:  # imported as tests.<module>
     from tests.synthetic_support import TOKEN, batch, fixture_dir, sample, status
 
 SIMILAR = ('synthetic-dev', 'synthetic-dev-1', 'synthetic-dev_1', 'SYNTHETIC-DEV', 'synthetic-dev-10')
+
+
+class FixedClock:
+    """Replaces repository.datetime so save_status sees chosen wall-clock times."""
+
+    def __init__(self, *times):
+        self.times = list(times)
+
+    def now(self, tz=None):
+        return self.times.pop(0)
 
 
 class DeviceIsolationTests(unittest.TestCase):
@@ -94,6 +107,42 @@ class DeviceIsolationTests(unittest.TestCase):
             if cursor is None:
                 break
         self.assertEqual(sorted(SIMILAR + ('synthetic-dev-2',)), seen)
+
+    def test_direct_device_addresses_are_rejected_on_every_endpoint(self):
+        # CONTRACT.md: device_id is an opaque identifier, not a direct BLE
+        # address. Separator-formatted addresses were previously accepted.
+        client = self.open()
+        addresses = ('aabbccddeeff', 'AABBCCDDEEFF', '0123456789aB', 'AA-BB-CC-DD-EE-FF', 'aa_bb_cc_dd_ee_ff',
+                     'AA-BB_CC-DD-EE-FF', 'AABB-CCDD-EEFF')
+        for address in addresses:
+            with self.subTest(address=address):
+                self.assertEqual(422, client.post('/v1/batches', json=batch(sample(device_id=address))).status_code)
+                self.assertEqual(422, client.post('/v1/gateway-status', json=status(address)).status_code)
+                self.assertEqual(422, client.get('/v1/samples', params={'device_id': address}).status_code)
+                self.assertEqual(422, client.get('/v1/gateway-status', params={'device_id': address}).status_code)
+                self.assertEqual(422, client.get('/v1/devices', params={'cursor': address}).status_code)
+        self.assertEqual([], self.ok(client.get('/v1/devices'))['devices'])
+        for opaque in ('synthetic-watch', 'AA-BB-CC-DD-EE-FF-00', 'deadbeefcafe1', '3f1c2b9e-1d4c-4a8e-9b7f-2c6d5e4f3a21'):
+            with self.subTest(opaque=opaque):
+                self.ok(client.post('/v1/batches', json=batch(sample(device_id=opaque))))
+
+    def test_gateway_status_returns_the_newest_report_even_at_a_whole_second(self):
+        # Real-data mode keeps one synthetic and one real report per device and
+        # must return whichever arrived last. A report saved at an exact second
+        # previously serialized without a fraction and sorted as "newer".
+        whole = datetime(2026, 11, 3, 12, 0, 0, 0, tzinfo=timezone.utc)
+        later = datetime(2026, 11, 3, 12, 0, 0, 500000, tzinfo=timezone.utc)
+        for first, second in ((True, False), (False, True)):
+            with self.subTest(first_synthetic=first):
+                client = self.open(allow_real_data=True)
+                device = 'synthetic-order-' + ('a' if first else 'b')
+                with patch.object(repository, 'datetime', FixedClock(whole, later)):
+                    saved = [self.ok(client.post('/v1/gateway-status', json=status(device, battery_percent=battery, synthetic=flag)))
+                             for flag, battery in ((first, 11), (second, 99))]
+                self.assertLess(saved[0]['server_received_at'], saved[1]['server_received_at'])
+                current = self.ok(client.get('/v1/gateway-status', params={'device_id': device}))
+                self.assertEqual((99, second), (current['status']['battery_percent'], current['status']['synthetic']))
+                self.assertEqual(saved[1]['server_received_at'], current['server_received_at'])
 
 
 if __name__ == '__main__':

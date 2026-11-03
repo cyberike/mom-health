@@ -14,6 +14,7 @@ from threading import Barrier
 import unittest
 from uuid import uuid4
 
+from fastapi.testclient import TestClient
 
 from unittest.mock import patch
 
@@ -24,9 +25,9 @@ from railway_candidate.budgeted_sqlite import BudgetedSQLiteRepository
 from railway_candidate.direct_candidate import MAX_IN_FLIGHT, create_direct_candidate
 
 try:
-    from synthetic_support import LoopbackServer, TOKEN, batch, fixture_dir, sample
+    from synthetic_support import LoopbackServer, TOKEN, batch, fixture_dir, sample, status
 except ImportError:  # imported as tests.<module>
-    from tests.synthetic_support import LoopbackServer, TOKEN, batch, fixture_dir, sample
+    from tests.synthetic_support import LoopbackServer, TOKEN, batch, fixture_dir, sample, status
 
 WORKERS = 24
 
@@ -156,6 +157,40 @@ class AmbiguousOutcomeTests(unittest.TestCase):
             self.assertEqual([s['sample_id'] for s in submitted['samples']], json.loads(payload)['accepted_ids'])
         with closing(sqlite3.connect(database)) as connection:
             self.assertEqual(4, connection.execute('SELECT COUNT(*) FROM samples').fetchone()[0])
+
+
+class StatusReportRaceTests(unittest.TestCase):
+    def test_a_delayed_status_report_never_overwrites_a_later_acknowledged_one(self):
+        # The first report stalls after it arrives (here: inside connect()) while
+        # a second report is stored and acknowledged. The stored and served
+        # report must be the one with the latest acknowledged receipt time.
+        database = fixture_dir('concurrency-fixtures') / 'synthetic.sqlite3'
+        repository = SQLiteRepository(database)
+        plain, armed = repository.connect, threading.Event()
+        stalled, resume = threading.Event(), threading.Event()
+
+        def connect():
+            if armed.is_set():
+                armed.clear()
+                stalled.set()
+                if not resume.wait(10):
+                    raise TimeoutError('synthetic test gate was never released')
+            return plain()
+        repository.connect = connect
+        with TestClient(create_app(Settings(sqlite_path=str(database)), repository=repository), client=('127.0.0.1', 50000)) as client:
+            acknowledged = {}
+            armed.set()
+            delayed = threading.Thread(target=lambda: acknowledged.update(
+                delayed=client.post('/v1/gateway-status', json=status(connection='disconnected', pending_samples=21)).json()))
+            delayed.start()
+            self.assertTrue(stalled.wait(10))
+            acknowledged['prompt'] = client.post('/v1/gateway-status', json=status(connection='connected', pending_samples=0)).json()
+            resume.set()
+            delayed.join(10)
+            served = client.get('/v1/gateway-status', params={'device_id': 'synthetic-watch'}).json()
+        latest = max(acknowledged.values(), key=lambda ack: ack['server_received_at'])
+        self.assertTrue(all(ack['accepted'] for ack in acknowledged.values()))
+        self.assertEqual(latest['server_received_at'], served['server_received_at'])
 
 
 class GatedBudgetedRepository(BudgetedSQLiteRepository):

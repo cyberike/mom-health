@@ -305,6 +305,56 @@ async function check(name, action) { await action(); passed++; console.log("PASS
       await close(view);
     });
 
+    await check("keyboard-only use reaches every control and keeps focus on the control in use", async () => {
+      const view = await open(seeded);
+      const page = view.page;
+      await page.keyboard.press("Tab");
+      assert.equal(await active(page), "skip-link");
+      assert((await page.locator(".skip-link").boundingBox()).y >= 0);
+      await page.keyboard.press("Enter");
+      await page.keyboard.press("Tab");
+      assert.equal(await active(page), "clearSession");
+      await page.keyboard.press("Tab");
+      assert.equal(await active(page), "accessToken");
+      await page.keyboard.type(TOKEN);
+      await page.keyboard.press("Tab");
+      assert.equal(await active(page), "connectButton");
+      await page.keyboard.press("Enter");
+      await idle(page);
+      assert.equal(await text(page, "sampleCount"), "60");
+      assert.equal(await active(page), "connectButton", "focus must return to Connect after it is re-enabled");
+      await page.keyboard.press("Tab"); // synthetic preview
+      await page.keyboard.press("Tab");
+      assert.equal(await active(page), "deviceSelect");
+      await page.keyboard.press("ArrowDown"); await idle(page);
+      assert.equal(await page.locator("#deviceSelect").inputValue(), BRAVO);
+      assert.equal(await active(page), "deviceSelect", "focus must stay on the watch selector while browsing devices");
+      await page.keyboard.press("ArrowDown"); await idle(page);
+      assert.equal(await page.locator("#deviceSelect").inputValue(), CHARLIE);
+      await page.keyboard.press("ArrowUp"); await idle(page);
+      await page.keyboard.press("ArrowUp"); await idle(page);
+      assert.equal(await page.locator("#deviceSelect").inputValue(), ALPHA);
+      await page.keyboard.press("Tab");
+      assert.equal(await active(page), "refreshButton");
+      await page.keyboard.press("Enter"); await idle(page);
+      assert.equal(await active(page), "refreshButton");
+      await page.keyboard.press("Tab");
+      assert.equal(await active(page), "rangeSelect");
+      // Chromium makes the overflowing table container a keyboard scroll stop.
+      await page.keyboard.press("Tab");
+      assert.equal(await active(page), "table-scroll");
+      await page.keyboard.press("Tab");
+      assert.equal(await active(page), "loadMore");
+      await page.keyboard.press("Enter"); await idle(page);
+      assert.equal((await snapshot(page)).ids.length, 60);
+      // The exhausted pager is disabled and cannot keep focus. Navigation must
+      // continue from its position (back into the readings card), not restart
+      // at the top of the page.
+      await page.keyboard.press("Shift+Tab");
+      assert.equal(await page.evaluate(() => Boolean(document.activeElement.closest("#readings"))), true, "Shift+Tab after the last page left the readings card: " + await active(page));
+      await close(view);
+    });
+
     await check("backend restart: failed refresh is reported, then the restarted backend serves the same records", async () => {
       const own = await startBackend();
       try {
