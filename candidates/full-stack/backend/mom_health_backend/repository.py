@@ -156,9 +156,17 @@ class Repository:
     def save_status(self,status,allow_real=False):
         if not status.synthetic and not allow_real:
             raise ValueError("real_data_disabled")
-        now=datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
         connection=self.connect()
         try:
+            # Take the receipt time only while holding the write lock, so the
+            # stored report is always the latest one acknowledged. Fixed-width
+            # microseconds keep TEXT order chronological for status():
+            # isoformat() drops a zero fraction ("...:00Z" sorts after "...:00.5Z").
+            if self.postgres:
+                connection.execute("SELECT pg_advisory_xact_lock(7240090003)")
+            else:
+                connection.execute("BEGIN IMMEDIATE")
+            now=datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00","Z")
             self.execute(connection,"INSERT INTO gateway_status(device_id,synthetic,canonical,server_received_at) VALUES (?,?,?,?) ON CONFLICT(device_id,synthetic) DO UPDATE SET canonical=excluded.canonical,server_received_at=excluded.server_received_at",(status.device_id,int(status.synthetic),canonical(status.model_dump()),now))
             connection.commit()
             return dict(accepted=True,server_received_at=now)
