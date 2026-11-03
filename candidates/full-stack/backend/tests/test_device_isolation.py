@@ -113,7 +113,7 @@ class DeviceIsolationTests(unittest.TestCase):
         # address. Separator-formatted addresses were previously accepted.
         client = self.open()
         addresses = ('aabbccddeeff', 'AABBCCDDEEFF', '0123456789aB', 'AA-BB-CC-DD-EE-FF', 'aa_bb_cc_dd_ee_ff',
-                     'AA-BB_CC-DD-EE-FF', 'AABB-CCDD-EEFF')
+                     'AA-BB_CC-DD-EE-FF', 'AABB-CCDD-EEFF', 'abc-def-012-345', 'a_b_c_d_e_f_0_1_2_3_4_5')
         for address in addresses:
             with self.subTest(address=address):
                 self.assertEqual(422, client.post('/v1/batches', json=batch(sample(device_id=address))).status_code)
