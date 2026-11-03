@@ -15,7 +15,9 @@ def identifier(value: str) -> str:
 def device_identifier(value: str) -> str:
     if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value):
         raise ValueError("Expected opaque device identifier")
-    if re.fullmatch(r"[0-9A-Fa-f]{12}", value):
+    # A 48-bit BLE address, bare or with '-'/'_' between any byte pairs, is a
+    # direct device address rather than an opaque identifier.
+    if re.fullmatch(r"[0-9A-Fa-f]{2}(?:[-_]?[0-9A-Fa-f]{2}){5}", value):
         raise ValueError("Direct device addresses are not identifiers")
     return value
 
