@@ -5,7 +5,7 @@
   const ui = Object.fromEntries(["modeBadge", "clearSession", "announcement", "accessToken", "connectForm", "connectButton", "demoButton", "deviceSelect", "moreDevices", "refreshButton", "sourceStatus", "latestBpm", "latestLabel", "latestTime", "sampleCount", "countNote", "receiptAge", "receiptNote", "rangeSelect", "chartEmpty", "chartWrap", "historyChart", "loadedStatus", "historyRows", "loadMore", "pageNote", "statusReportTime", "watchLink", "watchLinkNote", "watchBattery", "watchBatteryNote", "phoneQueue", "phoneQueueNote"].map(id => [id, el(id)]));
   let mode = "none", token = "", devices = [], rows = [], deviceCursor = null, sampleCursor = null;
   let gateway = null;
-  let selectedId = "", busy = false, generation = 0, controller = null, syntheticOnly = true;
+  let selectedId = "", busy = false, generation = 0, controller = null, syntheticOnly = true, focusReturn = null;
   const seenDeviceCursors = new Set(), seenSampleCursors = new Set();
   const dateFormat = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "medium" });
   const timeFormat = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" });
@@ -13,11 +13,20 @@
   function localTime(value) { return dateFormat.format(new Date(value)); }
   function currentDevice() { return devices.find(d => d.device_id === selectedId) || null; }
   function setBusy(value) {
+    // Disabling the focused control drops keyboard focus to <body>. Remember the
+    // control that started an operation and return focus to it afterwards when
+    // focus was lost and the control is usable again.
+    const starting = value && !busy, ending = busy && !value;
+    if (starting) { const current = document.activeElement; focusReturn = current && current !== document.body ? current : null; }
     busy = value; ui.connectButton.disabled = value; ui.refreshButton.disabled = value || mode === "none";
     ui.deviceSelect.disabled = value || !devices.length; ui.loadMore.disabled = value || !sampleCursor || rows.length >= core.MAX_SAMPLES;
     ui.moreDevices.disabled = value || !deviceCursor || devices.length >= core.MAX_DEVICES;
     ui.moreDevices.hidden = !deviceCursor;
     ui.connectForm.setAttribute("aria-busy", String(value));
+    if (ending) {
+      const target = focusReturn, current = document.activeElement; focusReturn = null;
+      if (target && target.isConnected && !target.disabled && !target.hidden && (!current || current === document.body)) target.focus();
+    }
   }
   function clearSession(notify = true) {
     generation++; if (controller) controller.abort(); controller = null;
