@@ -75,13 +75,18 @@ class LoopbackServer:
         if self.thread.is_alive():
             raise RuntimeError('Synthetic loopback server failed to stop')
 
-    def request(self, method, path, body=None, token=TOKEN, timeout=20):
-        """Plain HTTP/1.1 over loopback; no proxy or environment configuration applies."""
+    def request(self, method, path, body=None, token=TOKEN, timeout=20, headers=None):
+        """Plain HTTP/1.1 over loopback; no proxy or environment configuration applies.
+
+        ``headers`` may override defaults, e.g. a fictional Host for the hosted
+        candidates (http.client then sends that Host instead of 127.0.0.1).
+        """
         connection = http.client.HTTPConnection('127.0.0.1', self.port, timeout=timeout)
         try:
-            headers = {'Connection': 'close'}
+            extra, headers = headers or {}, {'Connection': 'close'}
             if token:
                 headers['Authorization'] = 'Bearer ' + token
+            headers.update(extra)
             payload = None
             if body is not None:
                 payload = json.dumps(body).encode()

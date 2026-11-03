@@ -9,13 +9,19 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 import json
 import sqlite3
+import threading
 from threading import Barrier
 import unittest
 from uuid import uuid4
 
+
+from unittest.mock import patch
+
 from mom_health_backend.app import Settings, create_app
 from mom_health_backend.models import Batch
 from mom_health_backend.repository import BatchConflict, SQLiteRepository
+from railway_candidate.budgeted_sqlite import BudgetedSQLiteRepository
+from railway_candidate.direct_candidate import MAX_IN_FLIGHT, create_direct_candidate
 
 try:
     from synthetic_support import LoopbackServer, TOKEN, batch, fixture_dir, sample
@@ -118,6 +124,104 @@ class RepositoryRaceTests(unittest.TestCase):
             self.assertEqual(expected, receipt)
         self.assertEqual([(3,)], self.rows('SELECT COUNT(*) FROM samples'))
         self.assertEqual(80, json.loads(self.rows('SELECT canonical FROM samples WHERE sample_id=?', (collided['sample_id'],))[0][0])['heart_rate_bpm'])
+
+
+class CommitThenFail(sqlite3.Connection):
+    """Commits durably, then raises once: the caller cannot know the outcome."""
+    armed = False
+
+    def commit(self):
+        super().commit()
+        if CommitThenFail.armed:
+            CommitThenFail.armed = False
+            raise sqlite3.OperationalError('synthetic fault after a durable commit')
+
+
+class AmbiguousOutcomeTests(unittest.TestCase):
+    def test_no_acknowledgment_after_a_durable_commit_then_the_retry_gets_the_receipt(self):
+        database = fixture_dir('concurrency-fixtures') / 'synthetic.sqlite3'
+        repository = SQLiteRepository(database)
+        repository.connect = lambda: sqlite3.connect(repository.path, timeout=5, factory=CommitThenFail)
+        self.addCleanup(setattr, CommitThenFail, 'armed', False)
+        submitted = batch(*[sample() for _ in range(4)])
+        with LoopbackServer(create_app(Settings(sqlite_path=str(database), access_token=TOKEN), repository=repository)) as server:
+            CommitThenFail.armed = True
+            code, payload = server.request('POST', '/v1/batches', submitted)
+            self.assertEqual(503, code)
+            self.assertNotIn('accepted_ids', json.loads(payload))
+            with closing(sqlite3.connect(database)) as connection:
+                self.assertEqual(1, connection.execute('SELECT COUNT(*) FROM batches').fetchone()[0])
+            code, payload = server.request('POST', '/v1/batches', submitted)
+            self.assertEqual(200, code)
+            self.assertEqual([s['sample_id'] for s in submitted['samples']], json.loads(payload)['accepted_ids'])
+        with closing(sqlite3.connect(database)) as connection:
+            self.assertEqual(4, connection.execute('SELECT COUNT(*) FROM samples').fetchone()[0])
+
+
+class GatedBudgetedRepository(BudgetedSQLiteRepository):
+    """Real budgeted SQLite storage; each ingest waits at a test gate first."""
+
+    def __init__(self, path):
+        super().__init__(path)
+        self.entered, self.lock = 0, threading.Lock()
+        self.full, self.release = threading.Event(), threading.Event()
+
+    def ingest(self, batch, allow_real=False):
+        with self.lock:
+            self.entered += 1
+            if self.entered == MAX_IN_FLIGHT:
+                self.full.set()
+        if not self.release.wait(20):
+            raise TimeoutError('synthetic test gate was never released')
+        return super().ingest(batch, allow_real)
+
+
+class DirectCandidateAdmissionTests(unittest.TestCase):
+    """The inactive direct-auth candidate on real loopback HTTP with real storage."""
+    HOST = 'synthetic.example.com'
+    PHONE = 'fictional-phone-token-for-admission-tests-0123456'
+
+    def test_busy_or_storage_503s_never_coincide_with_a_commit_and_retries_converge(self):
+        database = fixture_dir('concurrency-fixtures') / 'mom-health-synthetic.sqlite3'
+        repository = GatedBudgetedRepository(database)
+        with patch('railway_candidate.direct_candidate.validate_storage', return_value=str(database)):
+            app = create_direct_candidate(self.HOST, 'fictional-caregiver', 'fictional-caregiver-password-for-admission-1',
+                                          self.PHONE, str(database), str(database.parent), repository=repository)
+        headers = {'Host': self.HOST}
+        bodies = [batch(*[sample(device_id='synthetic-admit-' + str(i)) for _ in range(20)]) for i in range(MAX_IN_FLIGHT + 8)]
+        post = lambda server, body: server.request('POST', '/v1/batches', body, token=self.PHONE, headers=headers)
+        with LoopbackServer(app) as server, ThreadPoolExecutor(max_workers=MAX_IN_FLIGHT) as pool:
+            admitted = [pool.submit(post, server, body) for body in bodies[:MAX_IN_FLIGHT]]
+            self.assertTrue(repository.full.wait(20), 'admitted requests never reached storage')
+            overflow = [post(server, body) for body in bodies[MAX_IN_FLIGHT:]]
+            self.assertEqual([503] * 8, [code for code, _ in overflow])
+            self.assertTrue(all(json.loads(payload)['detail'] == 'Service busy; retry later' for _, payload in overflow))
+            repository.release.set()
+            first = [future.result(30) for future in admitted] + overflow
+            with closing(sqlite3.connect(database)) as connection:
+                receipts = dict(connection.execute('SELECT batch_id, response FROM batches').fetchall())
+                stored = dict(connection.execute('SELECT device_id, COUNT(*) FROM samples GROUP BY device_id').fetchall())
+            for body, (code, payload) in zip(bodies, first):
+                device = body['samples'][0]['device_id']
+                if code == 200:
+                    self.assertEqual(json.loads(receipts[body['batch_id']]), json.loads(payload))
+                    self.assertEqual(20, stored[device])
+                else:
+                    # No acknowledgment was issued, so nothing may be committed.
+                    self.assertEqual(503, code)
+                    self.assertNotIn('accepted_ids', json.loads(payload))
+                    self.assertNotIn(body['batch_id'], receipts)
+                    self.assertNotIn(device, stored)
+            for body, (code, payload) in zip(bodies, first):
+                for _ in range(20):
+                    if code == 200:
+                        break
+                    code, payload = post(server, body)
+                self.assertEqual(200, code)
+                self.assertEqual(20, len(json.loads(payload)['accepted_ids'] + json.loads(payload)['duplicate_ids']))
+        with closing(sqlite3.connect(database)) as connection:
+            self.assertEqual(len(bodies), connection.execute('SELECT COUNT(*) FROM batches').fetchone()[0])
+            self.assertEqual(20 * len(bodies), connection.execute('SELECT COUNT(*) FROM samples').fetchone()[0])
 
 
 class LoopbackRetryTests(unittest.TestCase):

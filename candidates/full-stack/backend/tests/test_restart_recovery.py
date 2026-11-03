@@ -26,7 +26,9 @@ except ImportError:  # imported as tests.<module>
 BACKEND = Path(__file__).resolve().parents[1]
 
 # Runs in a child process: begins a real ingest, then stalls inside the open
-# transaction after its third sample INSERT until the parent kills it.
+# transaction after its Nth sample INSERT until the parent kills it. A two-page
+# cache forces uncommitted pages into the database file first, so recovery
+# must replay a genuinely hot rollback journal.
 STALLED_WRITER = r'''
 import json, sqlite3, sys, time
 sys.path.insert(0, sys.argv[1])
@@ -39,13 +41,18 @@ class Stall(sqlite3.Connection):
         result = super().execute(sql, *args)
         if sql.startswith("INSERT INTO samples"):
             Stall.inserted += 1
-            if Stall.inserted == 3:
+            if Stall.inserted == int(sys.argv[3]):
                 print("HOLDING", flush=True)
                 time.sleep(120)
         return result
 
+def connect():
+    connection = sqlite3.connect(repo.path, timeout=5, factory=Stall)
+    connection.execute("PRAGMA cache_size=2")
+    return connection
+
 repo = SQLiteRepository(sys.argv[2])
-repo.connect = lambda: sqlite3.connect(repo.path, timeout=5, factory=Stall)
+repo.connect = connect
 repo.ingest(Batch.model_validate(json.loads(sys.stdin.readline())))
 print("UNEXPECTED COMMIT", flush=True)
 '''
@@ -159,30 +166,38 @@ class RestartRecoveryTests(unittest.TestCase):
             self.assertEqual(1, self.get(server, '/v1/devices')['devices'][0]['sample_count'])
 
     def test_writer_killed_inside_an_ingest_leaves_nothing_and_the_retry_commits_once(self):
-        SQLiteRepository(self.database).initialize()
-        submitted = batch(*[sample() for _ in range(5)])
-        child = subprocess.Popen([sys.executable, '-c', STALLED_WRITER, str(BACKEND), str(self.database)],
+        seeded = batch(*[sample() for _ in range(3)])
+        with self.serve() as server:
+            self.assertEqual(200, server.request('POST', '/v1/batches', seeded)[0])
+            committed = self.get(server, '/v1/samples', device_id='synthetic-watch', limit=100)
+        original = self.database.read_bytes()
+        journal = Path(str(self.database) + '-journal')
+        submitted = batch(*[sample(device_id='synthetic-killed') for _ in range(100)])
+        child = subprocess.Popen([sys.executable, '-c', STALLED_WRITER, str(BACKEND), str(self.database), '90'],
                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         try:
             child.stdin.write(json.dumps(submitted) + '\n')
             child.stdin.flush()
             self.assertEqual('HOLDING', child.stdout.readline().strip())
-            journal = Path(str(self.database) + '-journal')
-            self.assertTrue(journal.exists(), 'expected an open rollback journal mid-transaction')
+            self.assertNotEqual(bytes(8), journal.read_bytes()[:8], 'expected a synced (hot) rollback journal header')
+            self.assertNotEqual(original, self.database.read_bytes(), 'expected uncommitted pages in the database file')
         finally:
             child.kill()
             child.wait(15)
             child.stdin.close()
             child.stdout.close()
-        with self.serve() as server:
-            self.assertEqual([], self.get(server, '/v1/samples', device_id='synthetic-watch', limit=100)['samples'])
+        with self.serve() as server:  # first access replays the hot journal
+            self.assertEqual(committed, self.get(server, '/v1/samples', device_id='synthetic-watch', limit=100))
+            self.assertEqual([], self.get(server, '/v1/samples', device_id='synthetic-killed', limit=100)['samples'])
             code, payload = server.request('POST', '/v1/batches', submitted)
             self.assertEqual(200, code)
             self.assertEqual([s['sample_id'] for s in submitted['samples']], json.loads(payload)['accepted_ids'])
             self.assertEqual(json.loads(payload), json.loads(server.request('POST', '/v1/batches', submitted)[1]))
-        self.assertEqual(5, self.count('SELECT COUNT(*) FROM samples'))
-        self.assertEqual(1, self.count('SELECT COUNT(*) FROM batches'))
-        self.assertFalse(Path(str(self.database) + '-journal').exists())
+        with closing(sqlite3.connect(self.database)) as connection:
+            self.assertEqual('ok', connection.execute('PRAGMA integrity_check').fetchone()[0])
+        self.assertEqual(103, self.count('SELECT COUNT(*) FROM samples'))
+        self.assertEqual(2, self.count('SELECT COUNT(*) FROM batches'))
+        self.assertFalse(journal.exists())
 
 
 if __name__ == '__main__':
