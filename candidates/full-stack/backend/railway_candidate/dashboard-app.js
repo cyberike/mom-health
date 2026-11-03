@@ -44,7 +44,7 @@
     try {
       const response = await fetch(path, { method: "GET", headers: token ? { "Authorization": "Bearer " + token, "Accept": "application/json" } : { "Accept": "application/json" }, cache: "no-store", credentials: "same-origin", redirect: "error", signal: abort.signal });
       if (generation !== epoch) throw new Error("Cancelled");
-      if (!response.ok) throw new Error(response.status === 401 ? "Access was refused. Check the caregiver token, then connect again." : response.status === 403 ? "Backend denied this request. Check the caregiver access configuration." : "Backend request failed (HTTP " + response.status + "). No current data was confirmed.");
+      if (!response.ok) throw new Error(response.status === 401 ? "Access was refused. Sign in again with the caregiver account (a cached browser sign-in can require closing the browser), then connect again." : response.status === 403 ? "Backend denied this request. Check the caregiver access configuration." : "Backend request failed (HTTP " + response.status + "). No current data was confirmed.");
       if (!(response.headers.get("content-type") || "").includes("application/json")) throw new Error("Backend returned an unsupported response.");
       const reader = response.body.getReader(); const chunks = []; let bytes = 0;
       while (true) { const part = await reader.read(); if (part.done) break; bytes += part.value.byteLength; if (bytes > 262144) { await reader.cancel(); throw new Error("Backend response exceeded the dashboard limit."); } chunks.push(part.value); }

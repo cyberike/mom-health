@@ -74,5 +74,12 @@ async function test(name, action) { await action(); passed++; console.log("PASS 
     assert.match(ui.elements.latestLabel.textContent, /Synthetic test record/);
     assert.match(ui.elements.statusReportTime.textContent, /^Synthetic test report/);
   });
+  await test("a refused sign-in points to the browser caregiver sign-in, not a token the page does not have", async () => {
+    const ui = setup(() => new Response("{}", { status: 401, headers: { "content-type": "application/json" } }), fixture);
+    connect(ui); await idle(ui);
+    assert.match(ui.elements.announcement.textContent, /refused/);
+    assert.match(ui.elements.announcement.textContent, /sign in/i);
+    assert.doesNotMatch(ui.elements.announcement.textContent, /token/i);
+  });
   console.log(passed + " hosted dashboard checks passed using simulated DOM and transport; not browser or hosted-service validation.");
 })().catch(error => { console.error(error); process.exitCode = 1; });
