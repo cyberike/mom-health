@@ -187,6 +187,8 @@ class RestartRecoveryTests(unittest.TestCase):
             child.stdin.close()
             child.stdout.close()
         with self.serve() as server:  # first access replays the hot journal
+            # Startup recovery, not the retry's own write, removed the journal.
+            self.assertFalse(journal.exists())
             self.assertEqual(committed, self.get(server, '/v1/samples', device_id='synthetic-watch', limit=100))
             self.assertEqual([], self.get(server, '/v1/samples', device_id='synthetic-killed', limit=100)['samples'])
             code, payload = server.request('POST', '/v1/batches', submitted)
