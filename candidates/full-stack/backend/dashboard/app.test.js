@@ -25,7 +25,8 @@ function setup(handler, fixture = {}) {
   elements.rangeSelect.value = "all";
   const calls = [], lifecycle = {};
   const window = { MomHealthDashboard: core, addEventListener(event, action) { lifecycle[event] = action; } };
-  const context = { window, document: { getElementById: id => elements[id], createElement: tag => new Element(tag), createElementNS: (namespace, tag) => new Element(tag) }, location: { protocol: "http:" }, URLSearchParams, AbortController, TextDecoder, Uint8Array, Intl, Date, setTimeout, clearTimeout,
+  const context = { window, document: { getElementById: id => elements[id], createElement: tag => new Element(tag), createElementNS: (namespace, tag) => new Element(tag) }, location: { protocol: "http:" }, URLSearchParams, AbortController, TextDecoder, Uint8Array, Intl, Date,
+    setTimeout: fixture.setTimeout || setTimeout, clearTimeout: fixture.clearTimeout || clearTimeout,
     fetch: async (url, options) => { calls.push({ url, options }); return handler(url, options); } };
   vm.runInNewContext(script, context, { filename: "app.js" });
   return { elements, calls, lifecycle };
