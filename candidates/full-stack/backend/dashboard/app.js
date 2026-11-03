@@ -62,7 +62,7 @@
       // earlier failure on screen as if it described the records now shown.
       if (epoch === generation && errorShown) say("Request completed. The view shows the records loaded so far; this does not confirm a current watch connection.");
     }
-    catch (error) { if (epoch === generation) say(error.name === "AbortError" ? "Request timed out or was cancelled. Refresh explicitly to try again; no automatic retry occurs." : error.message || "Data could not be loaded.", true); }
+    catch (error) { if (epoch === generation) say(error.name === "AbortError" ? (mode === "backend" ? "Request timed out or was cancelled. Refresh explicitly to try again; no automatic retry occurs." : "Request timed out or was cancelled. Connect again to retry; no automatic retry occurs.") : error.message || "Data could not be loaded.", true); }
     finally { if (epoch === generation) setBusy(false); }
   }
   function renderDevices() {
@@ -174,7 +174,7 @@
     ui.sourceStatus.textContent = "Preview generated locally · No backend request or real watch data";
     renderDevices(); render(); say("SYNTHETIC PREVIEW — every reading here is fictional. No request was sent and nothing was saved.");
   });
-  ui.deviceSelect.addEventListener("change", () => { if (busy) return; selectedId = ui.deviceSelect.value; rows = []; gateway = null; sampleCursor = null; render(); if (mode === "backend") operation(async epoch => { await loadSamplePage(epoch, true); await loadGatewayStatus(epoch); }); });
+  ui.deviceSelect.addEventListener("change", () => { if (busy) { ui.deviceSelect.value = selectedId; return; } selectedId = ui.deviceSelect.value; rows = []; gateway = null; sampleCursor = null; render(); if (mode === "backend") operation(async epoch => { await loadSamplePage(epoch, true); await loadGatewayStatus(epoch); }); });
   ui.refreshButton.addEventListener("click", () => {
     if (mode === "demo") { ui.demoButton.click(); return; }
     if (mode !== "backend") return;

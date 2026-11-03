@@ -44,7 +44,7 @@ function backend() {
   };
   state.handler = (url, options) => {
     if (!state.hold(url)) return state.answer(url);
-    return new Promise(resolve => state.held.push({ url, options, release: () => resolve(state.answer(url)) }));
+    return new Promise(resolve => state.held.push({ url, options, release: () => resolve(state.answer(url)), respond: response => resolve(response) }));
   };
   return state;
 }
@@ -192,6 +192,92 @@ async function test(name, action) { await action(); passed++; console.log("PASS 
         assert.match(ui.elements.sourceStatus.textContent, /Backend reached/, failing);
         assert.equal(ui.elements.refreshButton.disabled, false);
       }
+    });
+
+    await test(variant + ": a connect that times out names an action that is actually available", async () => {
+      const timers = new Map(); let next = 1;
+      const fake = { setTimeout: (fn, ms) => { timers.set(next, { fn, ms }); return next++; }, clearTimeout: id => { timers.delete(id); } };
+      const ui = setup((url, options) => new Promise((_, reject) => options.signal.addEventListener("abort", () => reject(new DOMException("The operation was aborted.", "AbortError")))), { ...fixture, ...fake });
+      connect(ui); await ticks();
+      const pending = [...timers.values()];
+      assert.deepEqual(pending.map(t => t.ms), [12000]);
+      pending[0].fn(); await idle(ui);
+      assert.match(ui.elements.announcement.textContent, /timed out/);
+      assert.equal(ui.elements.refreshButton.disabled, true);
+      assert.doesNotMatch(ui.elements.announcement.textContent, /Refresh/, "Refresh is disabled before a backend was reached");
+      assert.match(ui.elements.announcement.textContent, /Connect again/);
+      assert.equal(ui.elements.connectButton.disabled, false);
+    });
+
+    await test(variant + ": a change event forced while a load is pending never leaves the selector on another watch", async () => {
+      // Unreachable by users (the selector is disabled while busy); guards the
+      // coupling between the busy early return and the displayed watch.
+      const api = backend(); const ui = setup(api.handler, fixture);
+      connect(ui); await idle(ui);
+      api.hold = url => url.startsWith("/v1/samples?");
+      ui.elements.refreshButton.click(); await ticks();
+      assert.equal(api.held.length, 1);
+      ui.elements.deviceSelect.value = B; ui.elements.deviceSelect.listeners.change();
+      api.hold = () => false; api.held.shift().release(); await idle(ui);
+      assert.equal(ui.elements.deviceSelect.value, A);
+      assert.equal(ui.elements.sampleCount.textContent, "3");
+      assert.equal(ui.calls.filter(call => call.url.includes(B)).length, 0);
+    });
+
+    await test(variant + ": a cursor from a cleared session is never reused or appended after reconnecting", async () => {
+      const api = backend(); const ui = setup(api.handler, fixture); let session = 1;
+      api.override = url => url.startsWith("/v1/samples?") && url.includes(A) && !url.includes("cursor=") ? json({ samples: rows[A].slice(0, 2), next_cursor: "synthetic-session-" + session + "-cursor" }) : null;
+      connect(ui); await idle(ui);
+      api.hold = url => url.includes("cursor=");
+      ui.elements.loadMore.click(); await ticks();
+      const stale = api.held.shift();
+      assert(stale.url.includes("synthetic-session-1-cursor"));
+      ui.elements.clearSession.click();
+      session = 2; api.hold = () => false;
+      connect(ui); await idle(ui);
+      stale.respond(json({ samples: rows[A].slice(2), next_cursor: null })); await ticks();
+      assert.equal(shown(ui), 2, "the abandoned page must not be appended");
+      api.hold = url => url.includes("cursor=");
+      ui.elements.loadMore.click(); await ticks();
+      assert(api.held[0].url.includes("synthetic-session-2-cursor"));
+      api.hold = () => false; api.held.shift().release(); await idle(ui);
+      assert.equal(shown(ui), 3);
+    });
+
+    await test(variant + ": pagehide during a connect aborts it, discards the late reply and forgets the token", async () => {
+      const api = backend(); const ui = setup(api.handler, fixture);
+      api.hold = url => url === "/v1/health";
+      connect(ui, variant === "local" ? "synthetic-lifecycle-token-one-0000000000001" : ""); await ticks();
+      const stale = api.held.shift();
+      ui.lifecycle.pagehide();
+      assert.equal(stale.options.signal.aborted, true);
+      stale.release(); await ticks();
+      assert.equal(ui.elements.modeBadge.textContent, "Not connected");
+      assert.equal(shown(ui), 0);
+      assert.equal(ui.elements.accessToken.value, "");
+      api.hold = () => false; const before = ui.calls.length;
+      connect(ui); await idle(ui);
+      assert(ui.calls.slice(before).every(call => !call.options.headers.Authorization));
+    });
+
+    if (variant === "local") await test("local: a request abandoned by Clear session never mixes into a session with another token", async () => {
+      const first = "synthetic-lifecycle-token-one-0000000000001", second = "synthetic-lifecycle-token-two-0000000000002";
+      const api = backend(); const ui = setup(api.handler, fixture);
+      api.hold = url => url.startsWith("/v1/samples?");
+      connect(ui, first); await ticks();
+      const stale = api.held.shift();
+      assert.equal(stale.options.headers.Authorization, "Bearer " + first);
+      ui.elements.clearSession.click();
+      const before = ui.calls.length;
+      api.hold = url => url.startsWith("/v1/gateway-status?");
+      connect(ui, second); await ticks();
+      const fresh = api.held.shift();
+      stale.respond(json({ detail: "Authorization required" }, 401)); await ticks();
+      assert.equal(ui.elements.connectButton.disabled, true, "the abandoned request must not end the new session's operation");
+      assert.doesNotMatch(ui.elements.announcement.textContent, /refused/);
+      api.hold = () => false; fresh.release(); await idle(ui);
+      assert(ui.calls.slice(before).every(call => call.options.headers.Authorization === "Bearer " + second));
+      assert.equal(shown(ui), 3);
     });
 
     for (const [code, message] of [[401, /Access was refused/], [403, /denied this request/], [429, /HTTP 429/], [503, /HTTP 503/]]) {
