@@ -81,13 +81,14 @@
   function render() {
     const device = currentDevice(); const latest = device && device.latest; const filtered = core.filterRows(rows, ui.rangeSelect.value);
     ui.latestBpm.textContent = latest && latest.heart_rate_bpm !== null ? latest.heart_rate_bpm : "—";
-    ui.latestLabel.textContent = latest ? (mode === "demo" ? "Synthetic preview observation" : latest.heart_rate_bpm === null ? "Last saved observation has no usable HR" : "Last saved observation - not live") : "No reading loaded";
+    // Backend records are labeled synthetic wherever shown, as the table rows are.
+    ui.latestLabel.textContent = latest ? (mode === "demo" ? "Synthetic preview observation" : latest.synthetic ? (latest.heart_rate_bpm === null ? "Synthetic test record has no usable HR" : "Synthetic test record - not watch-reported") : latest.heart_rate_bpm === null ? "Last saved observation has no usable HR" : "Last saved observation - not live") : "No reading loaded";
     ui.latestTime.textContent = latest ? "Phone receipt: " + localTime(latest.received_at) : "Receipt time: unavailable";
     ui.sampleCount.textContent = device ? device.sample_count.toLocaleString() : "—";
     ui.countNote.textContent = device ? (mode === "demo" ? "Fictional preview records only" : "Backend total for this selected source") : "No source selected";
     ui.receiptAge.textContent = core.ageLabel(latest ? latest.received_at : null);
     ui.receiptNote.textContent = latest ? (mode === "demo" ? "Synthetic timing, not your watch" : "Current connection is unknown") : "No source selected";
-    ui.statusReportTime.textContent = gateway ? "Last report received by backend: " + localTime(gateway.server_received_at) + " (" + core.ageLabel(gateway.server_received_at) + "). Gateway clock: " + localTime(gateway.reported_at) : "No gateway status report received.";
+    ui.statusReportTime.textContent = gateway ? (gateway.synthetic ? "Synthetic test report, not from a real gateway. " : "") + "Last report received by backend: " + localTime(gateway.server_received_at) + " (" + core.ageLabel(gateway.server_received_at) + "). Gateway clock: " + localTime(gateway.reported_at) : "No gateway status report received.";
     const connectionNames = { connected: "Connected when reported", disconnected: "Disconnected when reported", connecting: "Connecting when reported", error: "Error when reported" };
     ui.watchLink.textContent = gateway ? connectionNames[gateway.connection] : "Not reported";
     ui.watchLinkNote.textContent = gateway ? "Saved gateway report only. The watch may have changed state since then." : "Receiving saved data does not establish a current Bluetooth connection.";
