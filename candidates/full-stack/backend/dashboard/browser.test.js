@@ -174,6 +174,8 @@ async function check(name, action) { await action(); passed++; console.log("PASS
       assert.equal(connected.phoneQueue, "2 pending / 60 uploaded");
       assert.equal(connected.rows.length, 50);
       assert.equal(connected.token, "");
+      await view.page.click("#loadMore"); await idle(view.page);
+      assert.equal((await snapshot(view.page)).rows.length, 60);
       await view.page.click("#clearSession");
       const cleared = await snapshot(view.page);
       assert.match(await text(view.page, "announcement"), /Session cleared/);
@@ -201,6 +203,15 @@ async function check(name, action) { await action(); passed++; console.log("PASS
       const recovered = await snapshot(view.page);
       assert.equal(recovered.sampleCount, "60");
       assert.equal(await view.page.locator("#announcement.error").count(), 0);
+      // A wrong token after a good session removes the displayed records;
+      // the right token then restores an identical view.
+      await connect(view.page, WRONG_TOKEN);
+      assert.match(await text(view.page, "announcement"), /Access was refused/);
+      const wiped = await snapshot(view.page);
+      assert.deepEqual(wiped.rows, ["No observations in this view."]);
+      assert.equal(wiped.refreshDisabled, true);
+      await connect(view.page);
+      assert.deepEqual(await snapshot(view.page), recovered);
       await close(view, /status of 401 \(Unauthorized\)/);
     });
 
