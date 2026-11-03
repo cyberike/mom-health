@@ -5,6 +5,7 @@ No server socket or physical device is used.
 """
 import base64
 from contextlib import closing
+import os
 from pathlib import Path
 import sqlite3
 import time
@@ -26,6 +27,12 @@ class DirectCompositionSQLiteChecks(unittest.TestCase):
         database = root / 'mom-health-synthetic.sqlite3'
         with database.open('xb'):
             pass
+        if os.name == 'posix':
+            # The existing-only validator demands an owner-only root and file on
+            # POSIX. The default umask (0755/0644) is correctly rejected; this
+            # test previously ran only on Windows, where that branch is skipped.
+            root.chmod(0o700)
+            database.chmod(0o600)
         host = 'synthetic.example.com'
         user = 'fictional-caregiver'
         password = 'fictional-caregiver-password-1234567890'
@@ -76,6 +83,37 @@ class DirectCompositionSQLiteChecks(unittest.TestCase):
                 self.assertEqual(committed.json(), client.post('/v1/batches', headers=write_headers, json=retry_batch).json())
         self.assertGreaterEqual(len(seen), 5)
         self.assertEqual({str(database)}, set(seen))
+
+    @unittest.skipUnless(os.name == 'posix', 'real POSIX owner/mode checks')
+    def test_default_umask_fixture_is_rejected_before_any_connection(self):
+        # Real (unmocked) Linux metadata: a group/other-readable root or file must
+        # fail closed before the repository ever opens SQLite.
+        for root_mode, file_mode in ((0o755, 0o600), (0o700, 0o644)):
+            with self.subTest(root=oct(root_mode), file=oct(file_mode)):
+                root = (Path(__file__).resolve().parents[2] / 'build' /
+                        'direct-composition-fixtures' / str(uuid4())).resolve()
+                root.mkdir(parents=True, exist_ok=False)
+                database = root / 'mom-health-synthetic.sqlite3'
+                with database.open('xb'):
+                    pass
+                root.chmod(root_mode)
+                database.chmod(file_mode)
+                seen = []
+                original_connect = BudgetedSQLiteRepository.connect
+
+                def tracked_connect(repository):
+                    seen.append(repository.path)
+                    return original_connect(repository)
+
+                with patch('railway_candidate.gateway.os.path.ismount', return_value=True), \
+                     patch.object(BudgetedSQLiteRepository, 'connect', new=tracked_connect), \
+                     self.assertRaises(ValueError):
+                    build_budgeted_local_config('synthetic.example.com', 'fictional-caregiver',
+                                                'fictional-caregiver-password-1234567890',
+                                                'fictional-phone-token-12345678901234567890',
+                                                str(database), str(root))
+                self.assertEqual([], seen)
+                self.assertEqual(0, database.stat().st_size)
 
 
 if __name__ == '__main__': unittest.main()
