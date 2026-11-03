@@ -159,6 +159,41 @@ async function test(name, action) { await action(); passed++; console.log("PASS 
       assert.equal(ui.elements.watchBattery.textContent, "47% - last reported");
     });
 
+    await test(variant + ": a later successful Load older or watch change replaces an earlier error banner", async () => {
+      const api = backend(); const ui = setup(api.handler, fixture); let failOlder = false;
+      api.override = url => {
+        if (!url.startsWith("/v1/samples?") || !url.includes(A)) return null;
+        if (!url.includes("cursor=")) return json({ samples: rows[A].slice(0, 2), next_cursor: "synthetic-older-page" });
+        return failOlder ? json({ detail: "refused" }, 401) : json({ samples: rows[A].slice(2), next_cursor: null });
+      };
+      connect(ui); await idle(ui);
+      failOlder = true; ui.elements.loadMore.click(); await idle(ui);
+      assert.match(ui.elements.announcement.textContent, /Access was refused/);
+      failOlder = false; ui.elements.loadMore.click(); await idle(ui);
+      assert.equal(shown(ui), 3);
+      assert.doesNotMatch(ui.elements.announcement.textContent, /refused|HTTP/, "a stale error must not sit beside freshly loaded rows");
+      const previous = api.override;
+      api.override = url => url.startsWith("/v1/samples?") && url.includes(B) ? json({ detail: "Storage unavailable" }, 503) : previous(url);
+      ui.elements.deviceSelect.value = B; ui.elements.deviceSelect.listeners.change(); await idle(ui);
+      assert.match(ui.elements.announcement.textContent, /HTTP 503/);
+      ui.elements.deviceSelect.value = A; ui.elements.deviceSelect.listeners.change(); await idle(ui);
+      assert.equal(ui.elements.sampleCount.textContent, "3");
+      assert.doesNotMatch(ui.elements.announcement.textContent, /HTTP 503/);
+    });
+
+    await test(variant + ": a connect that fails after the backend answered never claims 'not connected' beside a backend badge", async () => {
+      for (const failing of ["/v1/devices?", "/v1/gateway-status?"]) {
+        const api = backend(); const ui = setup(api.handler, fixture);
+        api.override = url => url.startsWith(failing) ? json({ detail: "Storage unavailable" }, 503) : null;
+        connect(ui); await idle(ui);
+        assert.match(ui.elements.announcement.textContent, /HTTP 503/);
+        assert.equal(ui.elements.modeBadge.textContent, "Backend · synthetic only");
+        assert.doesNotMatch(ui.elements.sourceStatus.textContent, /not connected/, failing);
+        assert.match(ui.elements.sourceStatus.textContent, /Backend reached/, failing);
+        assert.equal(ui.elements.refreshButton.disabled, false);
+      }
+    });
+
     for (const [code, message] of [[401, /Access was refused/], [403, /denied this request/], [429, /HTTP 429/], [503, /HTTP 503/]]) {
       await test(variant + ": HTTP " + code + " on a later refresh is reported, and reconnecting fully recovers", async () => {
         const api = backend(); const ui = setup(api.handler, fixture);

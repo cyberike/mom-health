@@ -5,11 +5,11 @@
   const ui = Object.fromEntries(["modeBadge", "clearSession", "announcement", "accessToken", "connectForm", "connectButton", "demoButton", "deviceSelect", "moreDevices", "refreshButton", "sourceStatus", "latestBpm", "latestLabel", "latestTime", "sampleCount", "countNote", "receiptAge", "receiptNote", "rangeSelect", "chartEmpty", "chartWrap", "historyChart", "loadedStatus", "historyRows", "loadMore", "pageNote", "statusReportTime", "watchLink", "watchLinkNote", "watchBattery", "watchBatteryNote", "phoneQueue", "phoneQueueNote"].map(id => [id, el(id)]));
   let mode = "none", token = "", devices = [], rows = [], deviceCursor = null, sampleCursor = null;
   let gateway = null;
-  let selectedId = "", busy = false, generation = 0, controller = null, syntheticOnly = true, focusReturn = null;
+  let selectedId = "", busy = false, generation = 0, controller = null, syntheticOnly = true, focusReturn = null, errorShown = false;
   const seenDeviceCursors = new Set(), seenSampleCursors = new Set();
   const dateFormat = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "medium" });
   const timeFormat = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" });
-  function say(message, error = false) { ui.announcement.textContent = message; ui.announcement.classList.toggle("error", error); }
+  function say(message, error = false) { ui.announcement.textContent = message; ui.announcement.classList.toggle("error", error); errorShown = error; }
   function localTime(value) { return dateFormat.format(new Date(value)); }
   function currentDevice() { return devices.find(d => d.device_id === selectedId) || null; }
   function setBusy(value) {
@@ -56,7 +56,12 @@
   async function operation(work) {
     if (busy) return;
     const epoch = ++generation; if (controller) controller.abort(); controller = new AbortController(); setBusy(true);
-    try { await work(epoch); }
+    try {
+      await work(epoch);
+      // Watch changes and pagers announce nothing on success; never leave an
+      // earlier failure on screen as if it described the records now shown.
+      if (epoch === generation && errorShown) say("Request completed. The view shows the records loaded so far; this does not confirm a current watch connection.");
+    }
     catch (error) { if (epoch === generation) say(error.name === "AbortError" ? "Request timed out or was cancelled. Refresh explicitly to try again; no automatic retry occurs." : error.message || "Data could not be loaded.", true); }
     finally { if (epoch === generation) setBusy(false); }
   }
@@ -156,6 +161,8 @@
       if (health.schema_version !== 1 || typeof health.synthetic_only !== "boolean" || health.status !== "ready") throw new Error("Backend contract is not supported.");
       syntheticOnly = health.synthetic_only; mode = "backend";
       ui.modeBadge.textContent = syntheticOnly ? "Backend · synthetic only" : "Private backend data"; ui.modeBadge.className = "badge backend";
+      // Until every record request succeeds, say what is actually known.
+      ui.sourceStatus.textContent = "Backend reached: " + localTime(new Date().toISOString()) + " · Records not fully loaded";
       await loadDevices(epoch, true); if (selectedId) { await loadSamplePage(epoch, true); await loadGatewayStatus(epoch); }
       ui.sourceStatus.textContent = "Backend checked: " + localTime(new Date().toISOString()) + " · No automatic polling";
       say(devices.length ? "Backend records loaded. This does not confirm a current watch connection. Refresh manually to check for new records." : "Backend is available, but no permitted watch records have arrived. Your phone's locally saved readings are not automatically on this backend.");
