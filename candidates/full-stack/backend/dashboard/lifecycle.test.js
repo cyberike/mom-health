@@ -280,6 +280,73 @@ async function test(name, action) { await action(); passed++; console.log("PASS 
       assert.equal(shown(ui), 3);
     });
 
+    await test(variant + ": a failed refresh says the status and observations were not loaded instead of claiming none exist", async () => {
+      const api = backend(); const ui = setup(api.handler, fixture);
+      assert.doesNotMatch(ui.elements.pageNote.textContent, /Refresh/, "Refresh is disabled before connecting");
+      connect(ui); await idle(ui);
+      assert.equal(ui.elements.watchBattery.textContent, "47% - last reported");
+      api.override = url => url.startsWith("/v1/devices?") ? json({ detail: "Storage unavailable" }, 503) : null;
+      ui.elements.refreshButton.click(); await idle(ui);
+      assert.notEqual(ui.elements.statusReportTime.textContent, "No gateway status report received.");
+      assert.match(ui.elements.statusReportTime.textContent, /not loaded/);
+      api.override = url => url.startsWith("/v1/samples?") && url.includes(B) ? json({ detail: "Storage unavailable" }, 503) : null;
+      ui.elements.deviceSelect.value = B; ui.elements.deviceSelect.listeners.change(); await idle(ui);
+      assert.equal(shown(ui), 0);
+      assert.doesNotMatch(ui.elements.pageNote.textContent, /End of the currently available page sequence/);
+      assert.match(ui.elements.pageNote.textContent, /not loaded/);
+      api.override = () => null;
+      ui.elements.refreshButton.click(); await idle(ui);
+      assert.match(ui.elements.pageNote.textContent, /End of the currently available page sequence/);
+    });
+
+    await test(variant + ": a network failure is described in caregiver terms", async () => {
+      const api = backend(); let offline = false;
+      const ui = setup((url, options) => offline ? Promise.reject(new TypeError("Failed to fetch")) : api.handler(url, options), fixture);
+      connect(ui); await idle(ui);
+      offline = true; ui.elements.refreshButton.click(); await idle(ui);
+      assert.notEqual(ui.elements.announcement.textContent, "Failed to fetch");
+      assert.match(ui.elements.announcement.textContent, /could not be reached/);
+      assert.match(ui.elements.announcement.textContent, /No current data was confirmed/);
+      assert.equal(ui.elements.refreshButton.disabled, false);
+    });
+
+    await test(variant + ": an empty backend's chart never suggests loading older observations", async () => {
+      const api = backend(); api.override = url => url.startsWith("/v1/devices?") ? json({ devices: [], next_cursor: null }) : null;
+      const ui = setup(api.handler, fixture);
+      connect(ui); await idle(ui);
+      assert.equal(ui.elements.loadMore.disabled, true);
+      assert.doesNotMatch(ui.elements.chartEmpty.querySelector("p").textContent, /load older/i);
+    });
+
+    await test(variant + ": Refresh says so when the chosen watch is not on the first device page", async () => {
+      const api = backend();
+      api.override = url => !url.startsWith("/v1/devices?") ? null : url.includes("cursor=")
+        ? json({ devices: [summaries[1]], next_cursor: null }) : json({ devices: [summaries[0]], next_cursor: A });
+      const ui = setup(api.handler, fixture);
+      connect(ui); await idle(ui);
+      ui.elements.moreDevices.click(); await idle(ui);
+      ui.elements.deviceSelect.value = B; ui.elements.deviceSelect.listeners.change(); await idle(ui);
+      assert.equal(ui.elements.sampleCount.textContent, "2");
+      ui.elements.refreshButton.click(); await idle(ui);
+      assert.equal(ui.elements.deviceSelect.value, A);
+      assert.match(ui.elements.announcement.textContent, /previously selected watch/);
+      assert.match(ui.elements.announcement.textContent, /Load more devices/);
+    });
+
+    if (variant === "local") await test("local: a second Connect with the emptied token field never wipes a token session", async () => {
+      const token = "synthetic-lifecycle-token-one-0000000000001";
+      const api = backend(); const ui = setup(api.handler, fixture);
+      connect(ui, token); await idle(ui);
+      assert.equal(ui.elements.accessToken.value, "");
+      const before = ui.calls.length;
+      connect(ui, ""); await idle(ui);
+      assert.equal(ui.calls.length, before, "an empty resubmit must not reconnect without the token");
+      assert.equal(shown(ui), 3);
+      assert.equal(ui.elements.modeBadge.textContent, "Backend · synthetic only");
+      assert.doesNotMatch(ui.elements.announcement.textContent, /refused/);
+      assert.match(ui.elements.announcement.textContent, /Already connected/);
+    });
+
     for (const [code, message] of [[401, /Access was refused/], [403, /denied this request/], [429, /HTTP 429/], [503, /HTTP 503/]]) {
       await test(variant + ": HTTP " + code + " on a later refresh is reported, and reconnecting fully recovers", async () => {
         const api = backend(); const ui = setup(api.handler, fixture);

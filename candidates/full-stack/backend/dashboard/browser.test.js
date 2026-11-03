@@ -215,6 +215,13 @@ async function check(name, action) { await action(); passed++; console.log("PASS
       connecting.release(); await idle(view.page); await connecting.stop();
       assert.equal(view.api("/v1/health"), 1);
       assert.equal(view.api("/v1/devices"), 1);
+      // A second activation after the connect completed (the slow half of a
+      // double-click, or Enter again in the emptied token field) keeps the session.
+      await view.page.click("#connectButton"); await idle(view.page);
+      await view.page.locator("#accessToken").press("Enter"); await idle(view.page);
+      assert.equal(view.api("/v1/health"), 1);
+      assert.equal((await snapshot(view.page)).rows.length, 50);
+      assert.match(await text(view.page, "announcement"), /Already connected/);
 
       const refreshing = await hold(view.page, url => url.pathname === "/v1/devices");
       await view.page.click("#refreshButton", { clickCount: 3 });
