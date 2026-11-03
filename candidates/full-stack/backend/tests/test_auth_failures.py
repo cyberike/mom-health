@@ -2,6 +2,7 @@
 that rotates the access token. Fictional tokens and fresh SQLite fixtures only.
 """
 from contextlib import closing
+import socket
 import sqlite3
 import unittest
 
@@ -10,9 +11,9 @@ from fastapi.testclient import TestClient
 from mom_health_backend.app import Settings, create_app
 
 try:
-    from synthetic_support import TOKEN, batch, fixture_dir, sample, status
+    from synthetic_support import LoopbackServer, TOKEN, batch, fixture_dir, sample, status
 except ImportError:  # imported as tests.<module>
-    from tests.synthetic_support import TOKEN, batch, fixture_dir, sample, status
+    from tests.synthetic_support import LoopbackServer, TOKEN, batch, fixture_dir, sample, status
 
 OTHER = 'synthetic-resilience-token-rotated-not-deployed-02'
 PROTECTED = (('GET', '/v1/health', None), ('GET', '/v1/devices', None),
@@ -41,10 +42,11 @@ class BoundaryAuthorizationTests(unittest.TestCase):
 
     def test_wrong_or_malformed_credentials_are_refused_everywhere_without_side_effects(self):
         client = self.client()
+        # Surrounding whitespace is not listed: over real HTTP, h11 trims it
+        # (see test_real_http_trims_surrounding_whitespace_but_not_inner_spacing).
         refused = {'missing': {}, 'wrong token': {'Authorization': 'Bearer ' + OTHER},
                    'lowercase scheme': {'Authorization': 'bearer ' + TOKEN},
                    'double space': {'Authorization': 'Bearer  ' + TOKEN},
-                   'trailing space': {'Authorization': 'Bearer ' + TOKEN + ' '},
                    'basic scheme': {'Authorization': 'Basic ' + TOKEN},
                    'token only': {'Authorization': TOKEN}}
         for label, headers in refused.items():
@@ -79,6 +81,23 @@ class BoundaryAuthorizationTests(unittest.TestCase):
                              ('HEAD', '/v1/samples?device_id=synthetic-watch'), ('GET', '/docs'), ('GET', '/openapi.json')):
             with self.subTest(method=method, path=path):
                 self.assertEqual(401, client.request(method, path).status_code)
+
+    def test_real_http_trims_surrounding_whitespace_but_not_inner_spacing(self):
+        # The Boundary compares the header byte-exactly. Over a real listener,
+        # h11 strips optional whitespace around a field value (RFC 9110), so a
+        # trailing space or tab is accepted there, while spacing inside the
+        # value and the scheme's case still must match exactly.
+        app = create_app(Settings(sqlite_path=str(self.database), access_token=TOKEN))
+        expected = ((b'Bearer ' + TOKEN.encode() + b' ', 200), (b'Bearer ' + TOKEN.encode() + b'\t', 200),
+                    (b'Bearer  ' + TOKEN.encode(), 401), (b'bearer ' + TOKEN.encode(), 401), (b'Bearer ' + OTHER.encode(), 401))
+        with LoopbackServer(app) as server:
+            for value, status_code in expected:
+                with self.subTest(value=value), closing(socket.create_connection(('127.0.0.1', server.port), timeout=5)) as stream:
+                    stream.sendall(b'GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAuthorization: ' + value + b'\r\n\r\n')
+                    reply = b''
+                    while chunk := stream.recv(4096):
+                        reply += chunk
+                    self.assertEqual(status_code, int(reply.split(b' ', 2)[1]))
 
     def test_restart_with_a_rotated_token_refuses_the_old_one_and_keeps_the_data(self):
         first = self.client(TOKEN)
