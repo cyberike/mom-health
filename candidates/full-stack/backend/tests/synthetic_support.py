@@ -55,8 +55,10 @@ class LoopbackServer:
         self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.listener.bind(('127.0.0.1', 0))
         self.port = self.listener.getsockname()[1]
-        config = uvicorn.Config(self.app, log_level='critical', access_log=False, lifespan='on',
-                                proxy_headers=False, timeout_graceful_shutdown=5, **self.options)
+        options = dict(log_level='critical', access_log=False, lifespan='on', proxy_headers=False,
+                       timeout_graceful_shutdown=5)
+        options.update(self.options)
+        config = uvicorn.Config(self.app, **options)
         self.server = uvicorn.Server(config)
         self.thread = threading.Thread(target=self.server.run, kwargs={'sockets': [self.listener]}, daemon=True)
         self.thread.start()

@@ -7,6 +7,7 @@ gate, so a client can disconnect at a known point. Fictional data only.
 import asyncio
 from contextlib import closing
 import json
+import logging
 import socket
 import sqlite3
 import threading
@@ -39,6 +40,17 @@ class PausingConnection(sqlite3.Connection):
         return result
 
 
+class WarningRecords(logging.Handler):
+    """Collects server log records at WARNING or above."""
+
+    def __init__(self):
+        super().__init__(logging.WARNING)
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record.getMessage())
+
+
 class CancellationLoopbackTests(unittest.TestCase):
     def setUp(self):
         self.database = fixture_dir('cancellation-fixtures') / 'synthetic.sqlite3'
@@ -46,6 +58,15 @@ class CancellationLoopbackTests(unittest.TestCase):
         repository.connect = lambda: sqlite3.connect(repository.path, timeout=5, factory=PausingConnection)
         self.app = create_app(Settings(sqlite_path=str(self.database), access_token=TOKEN), repository=repository)
         self.addCleanup(setattr, PausingConnection, 'gate', None)
+
+    def capture_server_warnings(self):
+        # Call after the server started (Uvicorn reapplies its logging config
+        # when a server is created). A disconnect that raised inside the server
+        # then fails the test instead of passing silently.
+        records = WarningRecords()
+        logging.getLogger('uvicorn.error').addHandler(records)
+        self.addCleanup(logging.getLogger('uvicorn.error').removeHandler, records)
+        return records
 
     def raw(self, server, payload, *, send_bytes=None):
         stream = socket.create_connection(('127.0.0.1', server.port), timeout=5)
@@ -61,7 +82,8 @@ class CancellationLoopbackTests(unittest.TestCase):
     def test_disconnect_during_body_upload_stores_nothing_and_server_stays_healthy(self):
         submitted = batch(*[sample() for _ in range(5)])
         payload = json.dumps(submitted).encode()
-        with LoopbackServer(self.app) as server:
+        with LoopbackServer(self.app, log_level='warning') as server:
+            warnings = self.capture_server_warnings()
             stream = self.raw(server, payload, send_bytes=len(payload) // 2)
             time.sleep(0.2)
             stream.close()
@@ -70,6 +92,7 @@ class CancellationLoopbackTests(unittest.TestCase):
             self.assertEqual([], json.loads(server.request('GET', '/v1/devices')[1])['devices'])
             code, body = server.request('POST', '/v1/batches', submitted)
             self.assertEqual((200, 5), (code, len(json.loads(body)['accepted_ids'])))
+            self.assertEqual([], warnings.records)
         self.assertEqual(5, self.stored('SELECT COUNT(*) FROM samples'))
         self.assertEqual(1, self.stored('SELECT COUNT(*) FROM batches'))
 
@@ -77,7 +100,8 @@ class CancellationLoopbackTests(unittest.TestCase):
         submitted = batch(*[sample() for _ in range(5)])
         gate = {'entered': threading.Event(), 'release': threading.Event()}
         PausingConnection.gate = gate
-        with LoopbackServer(self.app) as server:
+        with LoopbackServer(self.app, log_level='warning') as server:
+            warnings = self.capture_server_warnings()
             stream = self.raw(server, json.dumps(submitted).encode())
             self.assertTrue(gate['entered'].wait(10), 'ingest never reached the gated INSERT')
             stream.close()  # the phone gives up while the server is inside the transaction
@@ -96,6 +120,7 @@ class CancellationLoopbackTests(unittest.TestCase):
             self.assertEqual([s['sample_id'] for s in submitted['samples']], receipt['accepted_ids'])
             self.assertEqual([], receipt['duplicate_ids'] + receipt['rejected'])
             self.assertEqual(receipt, json.loads(server.request('POST', '/v1/batches', submitted)[1]))
+            self.assertEqual([], warnings.records)
         self.assertEqual(5, self.stored('SELECT COUNT(*) FROM samples'))
         self.assertEqual(1, self.stored('SELECT COUNT(*) FROM batches'))
 
