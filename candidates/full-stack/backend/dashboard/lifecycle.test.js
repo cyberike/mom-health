@@ -365,6 +365,20 @@ async function test(name, action) { await action(); passed++; console.log("PASS 
       });
     }
 
+    await test(variant + ": every new session starts from the widest time range", async () => {
+      const api = backend(); const ui = setup(api.handler, fixture);
+      const choose = value => { ui.elements.rangeSelect.value = value; ui.elements.rangeSelect.listeners.change(); };
+      connect(ui); await idle(ui);
+      choose("24h"); ui.elements.clearSession.click();
+      assert.equal(ui.elements.rangeSelect.value, "all");
+      choose("7d"); connect(ui); await idle(ui);
+      assert.equal(ui.elements.rangeSelect.value, "all");
+      assert.equal(shown(ui), 3);
+      choose("24h"); ui.elements.demoButton.click();
+      assert.equal(ui.elements.rangeSelect.value, "all");
+      assert.equal(shown(ui), 24);
+    });
+
     await test(variant + ": Refresh re-checks the data mode and requests no records after it changed", async () => {
       const api = backend(); const ui = setup(api.handler, fixture);
       connect(ui); await idle(ui);

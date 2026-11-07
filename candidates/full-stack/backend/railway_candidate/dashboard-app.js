@@ -32,6 +32,8 @@
     generation++; if (controller) controller.abort(); controller = null;
     mode = "none"; token = ""; gateway = null; devices = []; rows = []; selectedId = ""; deviceCursor = null; sampleCursor = null; statusLoaded = false; samplesLoaded = false;
     seenDeviceCursors.clear(); seenSampleCursors.clear(); ui.accessToken.value = "";
+    // Every session starts from the widest range, so an earlier filter never hides loaded records.
+    ui.rangeSelect.value = "all";
     ui.modeBadge.textContent = "Not connected"; ui.modeBadge.className = "badge neutral";
     ui.sourceStatus.textContent = "Backend: not connected · Refresh is manual";
     renderDevices(); render(); setBusy(false);
