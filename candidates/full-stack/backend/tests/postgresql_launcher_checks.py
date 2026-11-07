@@ -8,7 +8,9 @@ directory (under build/, deep enough that its socket goes in a private
 directory under /tmp; one layout of the ownership check uses a short copy under
 /tmp, whose socket stays in the cluster), with a small probe command and
 --discard, so every cluster is removed again and concurrent runs cannot disturb
-each other. The other checks need only POSIX, and the module imports anywhere.
+each other. The other checks need only POSIX, except two that read /proc and
+are skipped without it: the environment check of the cleanup (Linux) and the
+runuser step check (Linux, root and runuser). The module imports anywhere.
 From candidates/full-stack/backend:
 
     python -m unittest tests.postgresql_launcher_checks -v
@@ -86,6 +88,55 @@ class Popen(subprocess.Popen):
 subprocess.Popen = Popen
 sys.argv = sys.argv[3:]
 runpy.run_path(launcher, run_name='__main__')
+'''
+# The launcher with find_bindir() failing in one of two ways, so it fails before its first status line.
+EARLY_ERROR = r'''
+import sys
+sys.path.insert(0, sys.argv[1])
+import postgresql_throwaway as launcher
+failure = sys.argv[2]
+
+
+def find_bindir(explicit=None):
+    if failure == 'message':
+        raise SystemExit('PostgreSQL server binaries (initdb, pg_ctl) not found; pass --bindir')
+    raise PermissionError(13, 'Permission denied (synthetic)')
+
+
+launcher.find_bindir = find_bindir
+sys.argv = ['postgresql_throwaway.py'] + sys.argv[3:]
+sys.exit(launcher.main())
+'''
+# Status lines on a non-blocking stderr: the first meets a full pipe, the rest come after the parent drained it.
+FULL_STREAM = r'''
+import subprocess, sys
+sys.path.insert(0, sys.argv[1])
+import postgresql_throwaway as launcher
+launcher.say('status line 1')
+print('said', flush=True)
+sys.stdin.readline()  # the parent has drained the pipe
+launcher.say('status line 2')
+launcher.say('status line 3')
+subprocess.run([sys.executable, '-c', 'import sys; sys.stderr.write("command stderr line\\n")'])
+'''
+# A last status line that meets a full non-blocking stderr, then the exit, with flush_stderr() registered as main() does.
+FULL_AT_EXIT = r'''
+import atexit, sys
+sys.path.insert(0, sys.argv[1])
+import postgresql_throwaway as launcher
+atexit.register(launcher.flush_stderr)
+launcher.say('last status line')
+print('exiting', flush=True)
+'''
+# A command that leaves a process behind which names the cluster only as PGDATA, until RELEASE exists.
+LEAVES_A_PROCESS = r'''
+import os, subprocess, sys
+release = %r
+data = os.path.join(os.environ['MOM_HEALTH_TEST_POSTGRESQL_CLUSTER'], 'data')
+waiter = subprocess.Popen([sys.executable, '-c', 'import os, time\nwhile not os.path.exists(%%r):\n    time.sleep(0.05)' %% release],
+                          env=dict(os.environ, PGDATA=data), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL, start_new_session=True)
+print(waiter.pid, flush=True)
 '''
 # A status line written after the reader went away, then an exit with the given status.
 CLOSED_STREAM = r'''
@@ -173,13 +224,14 @@ def private_copy(test, owner=None, short=False):
 
 
 def launch(script, command, *options, run_as=RUN_AS, env=None, stderr=subprocess.PIPE, ignore=(), interpreter=sys.executable,
-           user=None, wrapper=()):
+           user=None, wrapper=(), command_line=None):
     """Start a launcher in its own process group, with SIGINT, SIGTERM and SIGHUP at their defaults
-    (or ignored, for those in ``ignore``) whatever this test process inherited."""
+    (or ignored, for those in ``ignore``) whatever this test process inherited. The launcher runs
+    ``interpreter -c command``, or command_line if given."""
     def dispositions():
         for signum in SIGNALS:
             signal.signal(signum, signal.SIG_IGN if signum in ignore else signal.SIG_DFL)
-    argv = [interpreter, *wrapper, str(script), *run_as, '--discard', *options, '--', interpreter, '-c', command]
+    argv = [interpreter, *wrapper, str(script), *run_as, '--discard', *options, '--', *(command_line or [interpreter, '-c', command])]
     if user:
         argv = ['runuser', '-u', user, '--'] + argv
     return subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=stderr, text=True, env=env, start_new_session=True,
@@ -256,6 +308,23 @@ class CleanupHelperTests(unittest.TestCase):
         self.assertEqual(1, len(said))
         self.assertIn('single-user server is running', said[0])
 
+    @unittest.skipUnless(os.path.exists('/proc/self/environ'), 'needs Linux /proc')
+    def test_a_process_with_the_data_directory_as_pgdata_is_left_over_and_no_other(self):
+        data = '/synthetic/postgresql-fixtures/%d/data' % os.getpid()
+        variants = {'PGDATA is the data directory': ({'PGDATA': data}, True),
+                    'PGDATA is a directory that only starts the same': ({'PGDATA': data + '-other'}, False),
+                    'another variable names it': ({'NOT_PGDATA': data}, False)}
+        base, pids = {name: value for name, value in os.environ.items() if name != 'PGDATA'}, {}
+        for name, (extra, _) in variants.items():
+            process = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()'], stdin=subprocess.PIPE, env={**base, **extra})
+            self.addCleanup(process.wait)
+            self.addCleanup(process.stdin.close)
+            pids[name] = process.pid
+        found = launcher.leftover_processes(dict(data=data))
+        for name, (_, left) in variants.items():
+            with self.subTest(name):
+                self.assertIs(left, pids[name] in found)
+
     def test_the_cleanup_waits_for_processes_that_still_name_the_cluster(self):
         left, slept = iter([[4242], [4242], []]), []
         with patch.object(launcher, 'running', lambda info: False), patch.object(launcher, 'leftover_processes', lambda info: next(left)), \
@@ -314,6 +383,119 @@ class SignalTests(unittest.TestCase):
                 # Python's final flush of a buffered stderr would fail, and the exit status would be 120.
                 self.assertEqual(143, process.wait(60))
 
+    def test_an_error_before_the_first_status_line_keeps_its_exit_status_when_nobody_reads_stderr(self):
+        import pty  # POSIX only, like the termios module it needs
+        failures = (('usage error', [str(HERE / 'postgresql_throwaway.py'), '--discard'], 2),
+                    ('error message', ['-c', EARLY_ERROR, str(HERE), 'message', *RUN_AS, '--discard', '--', 'true'], 1),
+                    ('uncaught exception', ['-c', EARLY_ERROR, str(HERE), 'exception', *RUN_AS, '--discard', '--', 'true'], 1))
+        for (name, argv, expected), stream, buffered in itertools.product(failures, ('pipe', 'terminal'), (True, False)):
+            with self.subTest(name, stream=stream, buffered=buffered):
+                environment = {key: value for key, value in os.environ.items() if key != 'PYTHONUNBUFFERED'}
+                if not buffered:
+                    environment['PYTHONUNBUFFERED'] = '1'
+                reader, writer = pty.openpty() if stream == 'terminal' else os.pipe()
+                os.close(reader)  # nobody reads its stderr
+                process = subprocess.Popen([sys.executable, *argv], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=writer,
+                                           env=environment)
+                os.close(writer)
+                # Not 120: the usage message or traceback is still buffered when Python's final flush fails.
+                self.assertEqual(expected, process.wait(60))
+
+    def test_a_full_non_blocking_stderr_keeps_the_status_lines_and_the_commands_stderr(self):
+        for buffered in (True, False):
+            with self.subTest(buffered=buffered):
+                environment = {key: value for key, value in os.environ.items() if key != 'PYTHONUNBUFFERED'}
+                if not buffered:
+                    environment['PYTHONUNBUFFERED'] = '1'
+                reader, writer = os.pipe()
+                self.addCleanup(os.close, reader)
+                os.set_blocking(writer, False)  # as a parent that shares its non-blocking stderr would leave it
+                filled = 0
+                try:
+                    while True:
+                        filled += os.write(writer, b'x' * 4096)
+                except BlockingIOError:
+                    pass
+                process = subprocess.Popen([sys.executable, '-c', FULL_STREAM, str(HERE)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                           stderr=writer, env=environment, text=True)
+                os.close(writer)
+                self.assertEqual('said', process.stdout.readline().strip())  # its first status line met the full pipe
+                drained = 0
+                while drained < filled:
+                    drained += len(os.read(reader, filled - drained))
+                process.stdin.write('go\n')
+                process.stdin.close()
+                process.stdout.read()
+                process.stdout.close()
+                self.assertEqual(0, process.wait(60))
+                text = b''
+                for chunk in iter(lambda: os.read(reader, 65536), b''):
+                    text += chunk
+                # The reader is still there, so nothing may silence stderr. Unbuffered, Python itself drops line 1.
+                expected = ['status line 1'] * buffered + ['status line 2', 'status line 3', 'command stderr line']
+                self.assertEqual(expected, text.decode().splitlines())
+
+    def test_at_exit_a_full_non_blocking_stderr_gets_time_to_take_the_last_line(self):
+        reader, writer = os.pipe()
+        self.addCleanup(os.close, reader)
+        os.set_blocking(writer, False)
+        filled = 0
+        try:
+            while True:
+                filled += os.write(writer, b'x' * 4096)
+        except BlockingIOError:
+            pass
+        environment = {key: value for key, value in os.environ.items() if key != 'PYTHONUNBUFFERED'}  # buffered
+        process = subprocess.Popen([sys.executable, '-c', FULL_AT_EXIT, str(HERE)], stdout=subprocess.PIPE, stderr=writer,
+                                   env=environment, text=True)
+        os.close(writer)
+        self.assertEqual('exiting', process.stdout.readline().strip())
+        time.sleep(0.3)  # the reader is slow, not gone: it drains the pipe well within EXIT_FLUSH_GRACE
+        drained = 0
+        while drained < filled:
+            drained += len(os.read(reader, filled - drained))
+        self.assertEqual(0, process.wait(60))
+        process.stdout.close()
+        text = b''
+        for chunk in iter(lambda: os.read(reader, 65536), b''):
+            text += chunk
+        self.assertEqual('last status line\n', text.decode())
+
+    def test_a_signal_held_while_a_start_fails_stops_the_run_instead_of_the_failure(self):
+        restore_signals(self)
+        for signum in SIGNALS:
+            signal.signal(signum, launcher.interrupted)
+        launcher.HELD.update(starting=False, signum=None)
+
+        class Signalled(subprocess.Popen):
+            def __init__(self, *arguments, **options):
+                os.kill(os.getpid(), signal.SIGTERM)  # held: no process is known yet
+                super().__init__(*arguments, **options)
+        with patch.object(launcher.subprocess, 'Popen', Signalled), self.assertRaises(KeyboardInterrupt) as stop:
+            launcher.start(['/nonexistent-synthetic-command'])
+        self.assertEqual((signal.SIGTERM,), stop.exception.args)
+        self.assertFalse(launcher.HELD['starting'])
+
+    def test_a_step_signalled_just_as_its_popen_returns_is_still_supervised(self):
+        restore_signals(self)
+        for signum in SIGNALS:
+            signal.signal(signum, launcher.interrupted)
+        launcher.HELD.update(starting=False, signum=None)
+        started = []
+
+        class Signalled(subprocess.Popen):
+            def __init__(self, *arguments, **options):
+                super().__init__(*arguments, **options)
+                started.append(self)
+                os.kill(os.getpid(), signal.SIGTERM)  # handled before run() has bound the process
+        self.addCleanup(lambda: [process.kill() for process in started if process.poll() is None])
+        step = [sys.executable, '-c', 'import sys; sys.stdin.read()']  # like tee: it ends only when its input ends
+        with patch.object(launcher.subprocess, 'Popen', Signalled), self.assertRaises(KeyboardInterrupt):
+            launcher.run(step, stdin='synthetic settings\n')
+        self.assertEqual(1, len(started))
+        # Supervised: its input was closed and it was waited for, so it ended; unsupervised it would wait for more.
+        self.assertEqual(0, started[0].returncode, 'the step was left waiting for its input')
+
 
 @unittest.skipUnless(os.name == 'posix', 'needs POSIX')
 class StepTests(unittest.TestCase):
@@ -344,9 +526,21 @@ class StepTests(unittest.TestCase):
             return True
         return False
 
-    def kill_later(self, pids):
-        for pid in pids:
-            self.addCleanup(lambda pid=pid: self.gone(pid) or os.kill(pid, signal.SIGKILL))
+    def kill_later(self, pids=None, marker=None):
+        """Once the test is over, SIGKILL what the pids file names and every process whose command line
+        holds the marker. Registered before the run, so a check that fails early leaves no step behind."""
+        def kill():
+            found = set()
+            if pids is not None and pids.exists():
+                found.update(int(pid) for pid in pids.read_text().split())
+            if marker is not None:
+                found.update(int(entry.name) for entry in Path('/proc').glob('[0-9]*') if marker.encode() in _cmdline(entry))
+            for pid in found:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+        self.addCleanup(kill)
 
     def scratch(self):
         root = Path(tempfile.mkdtemp(prefix='launcher-step-'))
@@ -357,34 +551,44 @@ class StepTests(unittest.TestCase):
         pids = self.scratch() / 'pids'
         step = ("import os, signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
                 "open(%r, 'w').write('%%d\\n' %% os.getpid())\ntime.sleep(30)\n" % str(pids))
+        self.kill_later(pids, marker=str(pids))
         elapsed = self.interrupted_run([sys.executable, '-c', step])
-        self.kill_later(self.pids(pids))
         self.assertLess(elapsed, 15, 'run() waited for the step instead of stopping it')
         self.assertTrue(self.gone(self.pids(pids)[0]), 'the step was left running')
 
+    def test_a_step_that_finishes_within_the_grace_is_left_to_finish(self):
+        done = self.scratch() / 'done'
+        step = "import time; time.sleep(1.5); open(%r, 'w').write('finished')" % str(done)
+        self.kill_later(marker=str(done))
+        elapsed = self.interrupted_run([sys.executable, '-c', step], step_grace=launcher.STEP_GRACE, term_grace=launcher.TERM_GRACE)
+        self.assertTrue(done.exists(), 'the interrupted step was stopped instead of left to finish')
+        self.assertLess(elapsed, 15)
+
     def test_the_wait_ends_even_when_another_process_still_holds_the_steps_output(self):
         pids = self.scratch() / 'pids'
-        holder = "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"
+        holder = "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)  # " + str(pids)
         step = ("import os, signal, subprocess, sys, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
                 "holder = subprocess.Popen([sys.executable, '-c', %r])\n"
                 "open(%r, 'w').write('%%d %%d\\n' %% (os.getpid(), holder.pid))\ntime.sleep(30)\n" % (holder, str(pids)))
+        self.kill_later(pids, marker=str(pids))
         elapsed = self.interrupted_run([sys.executable, '-c', step])
         step_pid, holder_pid = self.pids(pids)
-        self.kill_later([holder_pid, step_pid])
         self.assertLess(elapsed, 15, 'run() kept reading output that another process still held')
         self.assertTrue(self.gone(step_pid), 'the step was left running')
 
-    @unittest.skipUnless(ROOT and sys.platform.startswith('linux') and shutil.which('runuser'), 'needs Linux, root and runuser')
+    @unittest.skipUnless(ROOT and sys.platform.startswith('linux') and os.path.exists('/proc/self/cmdline') and shutil.which('runuser'),
+                         'needs Linux with /proc, root and runuser')
     def test_as_root_runuser_stops_the_step_itself(self):
         interpreter = os.path.realpath(sys.executable)
         if subprocess.run(['runuser', '-u', 'postgres', '--', 'test', '-x', interpreter]).returncode:
             self.skipTest('the postgres account cannot run %s' % interpreter)
         marker = 'launcher-step-under-runuser-%d' % os.getpid()
         step = 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)  # ' + marker
-        # runuser kills its child 2 s after a SIGTERM; a SIGKILL would end runuser alone.
-        elapsed = self.interrupted_run(['runuser', '-u', 'postgres', '--', interpreter, '-c', step], term_grace=5)
+        self.kill_later(marker=marker)
+        # runuser kills its child 2 s after a SIGTERM; a SIGKILL any earlier would end runuser alone, so the
+        # launcher's own TERM_GRACE must leave it that long.
+        elapsed = self.interrupted_run(['runuser', '-u', 'postgres', '--', interpreter, '-c', step], term_grace=launcher.TERM_GRACE)
         left = [entry.name for entry in Path('/proc').glob('[0-9]*') if marker.encode() in _cmdline(entry)]
-        self.kill_later([int(pid) for pid in left])
         self.assertLess(elapsed, 15, 'run() waited for the step under runuser')
         self.assertEqual([], left, 'the step under runuser was left running')
 
@@ -406,20 +610,24 @@ class SetupTests(unittest.TestCase):
         return cluster, base
 
     def test_a_signal_while_the_short_socket_directory_is_made_waits_until_cluster_json_names_it(self):
-        cluster, base = self.long_cluster()
         restore_signals(self)
-        signal.signal(signal.SIGTERM, interrupt)
-        made, mkdtemp = [], tempfile.mkdtemp
-        def signalled(*arguments, **options):
-            made.append(mkdtemp(*arguments, **options))
-            os.kill(os.getpid(), signal.SIGTERM)
-            return made[-1]
-        with patch.object(launcher.tempfile, 'mkdtemp', signalled), self.assertRaises(KeyboardInterrupt):
-            launcher.create(cluster, Path('/usr/lib/postgresql/16/bin'), None, 'c')
-        self.assertEqual(1, len(made))
-        self.assertEqual(base, Path(made[0]).parent)
-        self.assertTrue((cluster / 'cluster.json').exists(), 'interrupted before cluster.json named the socket directory')
-        self.assertEqual(made[0], json.loads((cluster / 'cluster.json').read_text())['sockets'])
+        mkdtemp = tempfile.mkdtemp
+        for signum in SIGNALS:
+            with self.subTest(signal=signum.name):
+                cluster, base = self.long_cluster()
+                signal.signal(signum, interrupt)
+                made = []
+
+                def signalled(*arguments, **options):
+                    made.append(mkdtemp(*arguments, **options))
+                    os.kill(os.getpid(), signum)
+                    return made[-1]
+                with patch.object(launcher.tempfile, 'mkdtemp', signalled), self.assertRaises(KeyboardInterrupt):
+                    launcher.create(cluster, Path('/usr/lib/postgresql/16/bin'), None, 'c')
+                self.assertEqual(1, len(made))
+                self.assertEqual(base, Path(made[0]).parent)
+                self.assertTrue((cluster / 'cluster.json').exists(), 'interrupted before cluster.json named the socket directory')
+                self.assertEqual(made[0], json.loads((cluster / 'cluster.json').read_text())['sockets'])
 
     def test_a_cluster_json_that_cannot_be_written_takes_the_short_socket_directory_with_it(self):
         cluster, base = self.long_cluster()
@@ -523,21 +731,80 @@ class LauncherChecks(unittest.TestCase):
                 self.assertNothingLeft(root, fixtures, sockets, ''.join(seen) + errors)
 
     def test_a_signal_while_the_command_starts_still_stops_the_command(self):
-        for when in ('after', 'before'):
-            with self.subTest(signal=when + ' Popen starts the command'):
+        for when, startable in (('after', True), ('before', True), ('before', False)):
+            with self.subTest(signal=when + ' Popen starts the command', command='runs' if startable else 'cannot be started'):
                 root, script, fixtures = private_copy(self)
                 wrapper = root / 'signal_while_starting.py'
                 wrapper.write_text(SIGNAL_WHILE_STARTING)
-                marker = 'signalled command %s' % root  # names root, so assertNothingLeft also looks for the command
+                if startable:
+                    marker = 'signalled command %s' % root  # names root, so assertNothingLeft also looks for the command
+                    command, command_line = 'import time  # %s\ntime.sleep(30)\n' % marker, None
+                else:
+                    marker = str(root / 'missing-command')
+                    command, command_line = None, [marker]
                 started = time.monotonic()
-                process = self.launch(script, 'import time  # %s\ntime.sleep(30)\n' % marker, wrapper=[str(wrapper), when, marker])
+                process = self.launch(script, command, wrapper=[str(wrapper), when, marker], command_line=command_line)
                 seen = []
                 sockets = self.socket_directory(read_until(process.stderr, SOCKETS, seen))
                 _, errors = finish(process, timeout=90)
+                # Also when Popen then fails: the held signal, not the failure to start, decides the exit status.
                 self.assertEqual(143, process.returncode, errors)
+                self.assertIn('Interrupted by signal 15', errors)
                 # Not the 30 s that terminate() would wait for a command that inherited an ignored SIGTERM.
                 self.assertLess(time.monotonic() - started, 25, errors)
                 self.assertNothingLeft(root, fixtures, sockets, ''.join(seen) + errors)
+
+    def test_a_signal_just_as_a_setup_step_starts_still_lets_the_step_finish(self):
+        for step, marker in (('tee', "'tee'"), ('initdb', "bin/initdb'")):
+            for when in ('after', 'before'):
+                with self.subTest(step=step, signal=when + ' Popen starts it'):
+                    root, script, fixtures = private_copy(self)
+                    wrapper = root / 'signal_while_starting.py'
+                    wrapper.write_text(SIGNAL_WHILE_STARTING)
+                    started = time.monotonic()
+                    process = self.launch(script, WAITING, wrapper=[str(wrapper), when, marker])
+                    seen = []
+                    sockets = self.socket_directory(read_until(process.stderr, SOCKETS, seen))
+                    _, errors = finish(process, timeout=120)
+                    self.assertEqual(143, process.returncode, errors)
+                    # Supervised like any interrupted step: tee's input is closed, initdb finishes before the stop.
+                    self.assertNotIn('Command failed', errors)
+                    self.assertLess(time.monotonic() - started, 25, errors)  # not STOP_GRACE spent on a tee left waiting
+                    self.assertNothingLeft(root, fixtures, sockets, ''.join(seen) + errors)
+
+    def test_a_command_ended_by_a_signal_gives_128_plus_its_number(self):
+        for signum in (signal.SIGTERM, signal.SIGKILL):
+            with self.subTest(signal=signum.name):
+                root, script, fixtures = private_copy(self)
+                process = self.launch(script, 'import os, signal; os.kill(os.getpid(), signal.%s)' % signum.name)
+                seen = []
+                sockets = self.socket_directory(read_until(process.stderr, SOCKETS, seen))
+                _, errors = finish(process)
+                self.assertEqual(128 + signum, process.returncode, errors)
+                self.assertNotIn('Interrupted by signal', errors)  # the command was, not the launcher
+                self.assertNothingLeft(root, fixtures, sockets, ''.join(seen) + errors)
+
+    def test_a_process_that_names_the_cluster_only_as_pgdata_is_waited_for(self):
+        root, script, fixtures = private_copy(self)
+        release = root / 'release'
+        self.addCleanup(release.touch)  # after a failed check too: the waiter then ends before the copy goes
+        process = self.launch(script, LEAVES_A_PROCESS % str(release))
+        seen = []
+        sockets = self.socket_directory(read_until(process.stderr, SOCKETS, seen))
+        line = read_until(process.stderr, STARTED, seen)
+        self.assertIsNotNone(line, 'the launcher never reported its cluster')
+        data = Path(line.rsplit(': ', 1)[1]) / 'data'
+        waiter = int(process.stdout.readline())
+        deadline = time.monotonic() + 60
+        while processes_naming(data) and time.monotonic() < deadline:  # until the cleanup has stopped the server
+            time.sleep(0.05)
+        time.sleep(2)  # a cleanup that overlooked the waiter would have reported and exited by now
+        self.assertTrue(Path('/proc/%d' % waiter).exists())
+        self.assertIsNone(process.poll(), 'the cleanup ended while a process still had the cluster as PGDATA')
+        release.touch()
+        _, errors = finish(process)
+        self.assertEqual(0, process.returncode, errors)
+        self.assertNothingLeft(root, fixtures, sockets, ''.join(seen) + errors)
 
     def test_a_failed_setup_leaves_nothing_behind(self):
         runs = [('as the calling account', None)]
@@ -594,7 +861,7 @@ class LauncherChecks(unittest.TestCase):
                 if child:
                     self.assertFalse(Path('/proc/%d' % child).exists(), 'the command was left running')
 
-    def test_a_signal_during_initdb_lets_it_finish_and_leaves_nothing_behind(self):
+    def test_a_signal_during_initdb_leaves_nothing_behind(self):
         for signum, whole_group in ((signal.SIGTERM, False), (signal.SIGHUP, False), (signal.SIGINT, True)):
             with self.subTest(signal=signum.name, whole_group=whole_group):
                 root, script, fixtures = private_copy(self)
@@ -609,7 +876,8 @@ class LauncherChecks(unittest.TestCase):
                 (os.killpg if whole_group else os.kill)(process.pid, signum)
                 _, errors = finish(process)
                 self.assertEqual(128 + signum, process.returncode, errors)
-                # initdb was left to finish, so the cleanup never met its single-user backend.
+                # run() waited for initdb (StepTests pin that a step within STEP_GRACE is left to finish), so the
+                # cleanup's stop never met its single-user backend.
                 self.assertNotIn('Command failed', errors)
                 self.assertNothingLeft(root, fixtures, sockets, ''.join(seen) + errors)
 
