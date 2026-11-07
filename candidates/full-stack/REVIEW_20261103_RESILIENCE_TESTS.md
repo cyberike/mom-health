@@ -1,6 +1,6 @@
 # Resilience and real-browser test review — November 3, 2026
 
-Review branch `claude/mom-health-test-coverage-ggkdxz`, started from `567c0e1ce6bdbe92bfddd1c8631c4e78e32420d0` (the handoff commit on `main`). All work used the current candidate under `candidates/full-stack`; the root README describes an older version and was not used as a guide. Nothing was merged; the branch awaits owner review.
+Review branch `claude/mom-health-test-coverage-ggkdxz`, started from `567c0e1ce6bdbe92bfddd1c8631c4e78e32420d0` (the handoff commit on `main`). All work used the current candidate under `candidates/full-stack`; the root README describes an older version and was not used as a guide. [cyberike/mom-health#1](https://github.com/cyberike/mom-health/pull/1) merged the branch through `b4e918d` into `main` as `7911545` (November 7, UTC). The corrections after that merge (from `5577105`) await owner review and are not merged.
 
 This is local synthetic testing in a cloud Linux container. Nothing was deployed or published, and no phone, watch, ADB, emulator, Docker, Railway, Caddy, Cosign/Rekor, credential store or real health data was touched. **Cloud testing does not validate the physical watch, the phone, Bluetooth, Android storage, real phone-to-server networking or unattended reliability.**
 
@@ -98,7 +98,7 @@ These were measured or demonstrated but are documented limitations, design choic
 9. **Small HTTP inconsistencies.** `/dashboard` without the trailing slash returns a JSON 401 when a token is configured (the shell itself is public). `HEAD` on the shell returns 405 because FastAPI GET routes do not register HEAD. Neither leaks data.
 10. **Direct candidate clock handling.** Any wall-clock regression returns 503 for every role, even with no previous credential configured, and a forward jump followed by a correction keeps it unavailable until real time catches up. This is documented; it is now pinned.
 11. **More than 50 devices.** Refresh still reloads only the first device page. It now announces when the chosen watch had to be replaced, but it does not page on to keep the selection.
-12. **Timeouts and page lifecycle.** The 12-second timeout is per request, so a connect or refresh of up to four requests can stay busy for about 48 s against a wedged backend. `pagehide` clears the session without an announcement; Chromium does not restore the page from the back/forward cache (it is `no-store`), and other engines were not tested.
+12. **Timeouts and page lifecycle.** The 12-second timeout is per request, so a connect or refresh of up to four requests can stay busy for about 48 s against a backend that answers each request just inside the timeout. One that never answers ends the operation after 12 s, because the first timeout cancels all of it. `pagehide` clears the session without an announcement; Chromium does not restore the page from the back/forward cache (it is `no-store`), and other engines were not tested.
 13. **Operational notes.** A writer killed before its first page spill leaves a non-hot journal stub that `durability_probe` refuses (a fail-closed false alarm on a healthy database). Uvicorn re-raises SIGTERM, so a graceful stop exits with status -15.
 14. **Accessibility observations.** At 320 px a partly visible focused link in the horizontally scrolling mobile nav is not scrolled fully into view (WCAG 2.4.11 AA is met, 2.4.12 AAA is not). Chromium makes the overflowing table container a keyboard stop without an accessible name. After the last "Load older" page the disabled pager cannot keep focus; Shift+Tab returns to the readings card, but forward Tab reaches the end of the page because nothing focusable follows. The chart's SVG axis labels scale with the chart width (about 3.7 CSS px at 320 px or 400% zoom, so browser zoom does not enlarge them); the table is the text equivalent.
 15. **Hero recency.** The hero card's latest value is the last record the server stored, as documented in `dashboard/README.md`; after a delayed upload of older history it can be older than the newest table row.
@@ -123,13 +123,13 @@ From `candidates/full-stack/backend`:
 | `cd dashboard && node core.test.js` | 39 passed |
 | `node app.test.js` | 10 passed |
 | `node hosted.test.js` | 6 passed |
-| `node lifecycle.test.js` | 51 passed |
+| `node lifecycle.test.js` | 54 passed |
 | `node integration.test.js` | 6 passed |
-| `node browser.test.js` (Playwright + Chromium) | 12 passed |
-| `node hosted-browser.test.js` (Playwright + Chromium) | 8 passed |
+| `node browser.test.js` (Playwright + Chromium) | 13 passed |
+| `node hosted-browser.test.js` (Playwright + Chromium) | 9 passed |
 | `node --check app.js && node --check core.js && node --check ../railway_candidate/dashboard-app.js && node --check browser-support.js` | OK |
 
-Counts include the November 7 follow-up and its corrections. The full backend run takes about 27 s and both browser suites about 50 s on four shared CPUs. New fixture directories accumulate under `candidates/full-stack/build/` (gitignored), as with the existing suites.
+Counts include the November 7 follow-up and both rounds of corrections. The full backend run takes about 27 s and both browser suites about 50 s on four shared CPUs. New fixture directories accumulate under `candidates/full-stack/build/` (gitignored), as with the existing suites.
 
 ## Blocked or not run
 
@@ -141,13 +141,14 @@ Counts include the November 7 follow-up and its corrections. The full backend ru
 
 ## Remaining acceptance checklist
 
-- [ ] Owner review of this branch; merge decision (not merged).
+- [x] Owner review and merge of the branch through `b4e918d` ([cyberike/mom-health#1](https://github.com/cyberike/mom-health/pull/1), `7911545`).
+- [ ] Owner review of the corrections after the merge (`5577105` onward); merge decision (not merged).
 - [ ] Choose the ingress candidate in light of the measured `gateway.py` sign-in lockout. Review the follow-up's defaults for items 2, 5, 6 and 7, and decide what remains of items 2, 5 and 6. For item 2, that means whether each kind of status report should follow `reported_at` rather than arrival order.
 - [ ] Resolve the Rekor/Caddy verification through legitimately applied, confirmed scoped access, then run the prepared Caddy loopback harness.
 - [ ] Resolve the rejected Railway public-domain action through the applicable review; only then a protected synthetic hosted test.
 - [x] PostgreSQL parity, concurrency, rollback and crash recovery, including the status lock, on throwaway local PostgreSQL 16 clusters (follow-up below).
-- [ ] If PostgreSQL is chosen over the Railway SQLite volume: the same suite against the intended instance's settings (TLS, connection limits, its locale and default isolation), and a server-side `idle_in_transaction_session_timeout` decision (follow-up below).
-- [ ] Browser QA beyond headless Chromium: Firefox and Safari, real phones, VoiceOver/TalkBack/NVDA, real 200%/400% zoom, the native sign-in prompt and its cache.
+- [ ] If PostgreSQL is chosen over the Railway SQLite volume: the same suite against the intended instance's settings (TLS, connection limits, its locale, default isolation and any `statement_timeout`), and a server-side `idle_in_transaction_session_timeout` decision (follow-up below).
+- [ ] Browser QA beyond headless Chromium: Firefox and Safari, real phones, VoiceOver/TalkBack/NVDA (including what is spoken when a Refresh mode change moves focus to the Connect form), real 200%/400% zoom, the native sign-in prompt and its cache.
 - [ ] Supervised phone acceptance per `PHONE_ACCEPTANCE_0.8.3.md`, with the user's participation and approvals.
 - [ ] Real phone-to-server HTTPS upload to an approved destination; caregiver login and role isolation over real HTTPS; synthetic end-to-end result.
 - [ ] Hands-off acceptance on Pixel/Fold and the S25 Ultra: screen-off, reconnect, process and reboot recovery, offline buffering, charging and range loss, without Mom tapping controls.
@@ -175,8 +176,12 @@ After reviewing the branch, the owner approved three follow-ups: a pull request 
   - One fictional non-superuser role owns one `mom_health_synthetic_*` database. The suite refuses any database with another name.
   - Every libpq `PG*` variable is removed from the environment of the launcher's own clients and of the command it runs, so no client can be redirected off the private socket.
 - PostgreSQL refuses to run as root, so the server ran as the container's existing `postgres` account through `runuser`. The cluster directory and its `cluster.json` stay root-owned; only `data/`, `log/` and the socket directory belong to that account, so it cannot change what root later runs.
-- After each run the launcher stops the server and confirms that it exited: `pg_ctl status` reports it stopped, `postmaster.pid` is gone, and no process names the data directory. With `--discard`, it then deletes the cluster. The same happens when the launcher is interrupted or terminated (SIGINT, SIGTERM or SIGHUP; a command still running is stopped first) or when setup fails part-way.
-- The launcher needs Linux. When the checkout path is too long for a Unix socket, the socket goes in a short private directory in the system temporary directory, which is removed after the stop. Its own behavior is checked by the opt-in `tests/postgresql_launcher_checks.py`.
+- After each run the launcher stops the server and confirms that it exited: `pg_ctl status` reports it stopped, `postmaster.pid` is gone, and no process names the data directory. With `--discard`, it then deletes the cluster. The same happens when setup fails part-way, and when the launcher is interrupted or terminated (SIGINT, SIGTERM or SIGHUP):
+  - A setup step still running (initdb, `pg_ctl`, `psql`) may finish first, so none is left running on its own. A command still running is sent SIGTERM.
+  - Further signals are ignored until the cleanup is done, and the cleanup's server commands run in their own session, so a repeated group signal cannot cut them short. A signal already ignored at start (under `nohup`) stays ignored.
+  - A closed terminal or broken pipe does not stop the cleanup.
+  - Only the command's own process is signalled. Programs it started stop too only when the signal reaches the whole process group (Ctrl-C, `timeout`, a closed terminal), so interactive commands keep the terminal.
+- The launcher needs Linux. When the checkout path is too long for a Unix socket, the socket goes in a private directory under `/tmp`, named on stderr and removed after the stop. It is not put under `TMPDIR`, which can be long or closed to the server account. If the server does not start, the error includes the end of its log, which `--discard` would delete. The launcher's own behavior is checked by the opt-in `tests/postgresql_launcher_checks.py`.
 - Each test works in its own schema, which is dropped afterwards.
 - No password, network listener or persistent credential was created, and all data was fictional.
 
@@ -198,7 +203,7 @@ New checks:
   - The open transaction leaves nothing behind.
   - Writes and reads during the outage get 503; `/v1/health` still says "ready" (finding 5).
   - Retries commit exactly once.
-- **Locks.** A brief and a persistent lock holder, for both uploads and status reports. Reads behind a persistent table lock. Every connection's own settings, whatever the server defaults: exactly a 5 s lock timeout, no statement timeout, and READ COMMITTED.
+- **Locks.** A brief and a persistent lock holder, for both uploads and status reports. Reads behind a persistent table lock. Every connection's own settings, whatever the server defaults: exactly a 5 s lock timeout and READ COMMITTED. The backend sets no statement timeout of its own, so one set for the server, database or role still applies; the check gives the connection one and expects it unchanged.
 - **Status reports.** A report held between `connect()` and the status lock must still carry the later receipt time, which pins lock 7240090003 deterministically. Delayed and 32-way concurrent reports are checked too. The delayed one stalls before both the clock read and the lock, so it does not test the lock on its own.
 - **Status order.** With index scans disabled, the real report still wins although the synthetic one is stored first.
 - **Isolation settings.** The same races run under stricter default isolation levels.
@@ -223,7 +228,7 @@ New checks:
 | `python tests/postgresql_throwaway.py --run-as postgres -- python -m unittest tests.postgresql_parity -v` | 41 OK in about 45 s (C locale), server stopped and exited |
 | `python tests/postgresql_throwaway.py --run-as postgres --locale icu-en-US -- python -m unittest tests.postgresql_parity -v` | 41 OK in about 45 s (ICU `en-US`), server stopped and exited |
 | The suite as committed in `9039d45`, against the code before the fixes | C: 7 failures (4 lock-wait subtests, 2 isolation subtests, the forced-collation check). ICU `en-US`: 8 (also the inherited listing-order check). Re-measured after the verification. |
-| `python -m unittest tests.postgresql_launcher_checks -v` | 5 OK. Against the launcher as merged in `7911545`: 4 failures and 2 errors |
+| `python -m unittest tests.postgresql_launcher_checks -v` | 16 OK, as root (the failed-setup check also runs once as the `postgres` account). Each fix from the second verification, reverted on its own, makes a check fail (15 of 15). The first 5 checks, against the launcher as merged in `7911545`: 4 failures and 2 errors |
 | `python -m unittest tests.postgresql_parity` without a database | exits 1: `POSTGRESQL PARITY CHECKS NOT RUN` |
 | `python -m unittest discover -s tests -v` | 174 OK (1 Windows-only skip) after all follow-up changes; the parity and launcher modules are not discovered |
 
@@ -239,23 +244,23 @@ Run as a non-root account, the launcher needs no `--run-as`. The two cluster dir
 
 ### Design defaults chosen
 
-The owner asked for the open choices in "Findings not changed" to be settled conservatively. Each default below is its own commit, with tests that fail without it. The corrections after the independent verification (below) touch the Refresh, range and `Retry-After` defaults, so dropping one of those also means reverting its part of the correction commits. `gateway.py` and `direct_candidate.py` are unchanged.
+The owner asked for the open choices in "Findings not changed" to be settled conservatively. Each default below is its own commit, with tests that fail without it. The corrections after the two independent verifications (below) add tests that need the provenance, Refresh and `Retry-After` defaults: `fa6ccb8`'s status-order checks, the mode-change checks of `42d2ecd` and the second round, and the date checks of `fdf7381`. `2f06582`'s status-card label also assumes the provenance default. Dropping one of those defaults therefore also means reverting its part of those commits. `54cb4af`'s range test holds without the range default. `gateway.py` and `direct_candidate.py` are unchanged.
 
 | Finding | Default chosen | Why it is the conservative choice | Tests |
 | --- | --- | --- | --- |
 | 2, status provenance | In real-data mode, `GET /v1/gateway-status` serves the real gateway's report whenever one exists. The synthetic test report is served only when there is no real one, and both dashboards label it synthetic. A real report is shown as the "Last real gateway report received by backend". Synthetic-only mode is unchanged. | A fresh synthetic test report can no longer hide the real watch's state. The real report may be older; its receipt time and age are shown. | `test_device_isolation...serves_the_real_gateway_report_over_a_synthetic_one` and `...whatever_order_the_store_returns_rows`, on SQLite and on PostgreSQL |
 | 7, boundary rejections | 400, 401, 403 and 413 rejections carry the same `no-store`, `nosniff`, `no-referrer`, `DENY` and Content-Security-Policy headers as every other response the application sends. Status codes and bodies are unchanged. An unhandled-exception 500 and Uvicorn's own 400 for malformed HTTP are produced outside the application and carry none. | It only adds restrictions: an error response can no longer be cached or framed. | `test_auth_failures...every_rejection_carries_the_security_headers` (all five rejection kinds) |
-| 5, Refresh never re-read `/v1/health` | Refresh re-reads `/v1/health` first. If the backend's data mode changed since Connect, the dashboard clears the session, requests nothing under the new mode and moves keyboard focus to the Connect form. The message names what was removed (in the local copy, the token too); the hosted copy says it requires a synthetic-only backend. The caregiver connects again deliberately. | Refresh never requests or shows records after the mode changed, and switching into real-data mode always takes a deliberate Connect, because a synthetic-only session rejects real records everywhere. A watch change, Load older or Load more devices does not re-check the mode until the next Refresh. The cost is one more request per Refresh, so against a wedged backend a Refresh can stay busy for up to about 48 s instead of about 36 s, as long as a Connect (finding 12). | `lifecycle.test.js`: both dashboards, and both directions in the local copy |
+| 5, Refresh never re-read `/v1/health` | Refresh re-reads `/v1/health` first. If that read shows the backend's data mode changed since Connect, the dashboard clears the session and requests nothing more. Keyboard focus that was lost (with the disabled Refresh button, or on the emptied table) moves to the Connect form, and the message then describes that control for screen readers; focus the user moved to another control stays there. The message names what was removed (in the local copy, the token too); the hosted copy says it requires a synthetic-only backend and to connect again once the backend is synthetic-only. The caregiver connects again deliberately. | Once the health read shows the change, Refresh requests and shows no records, and switching into real-data mode always takes a deliberate Connect, because a synthetic-only session rejects real records everywhere. A change after that read, or during a watch change, Load older or Load more devices, is seen only at the next Refresh. A local session without a token cannot see a switch to real-data mode, because `app.py` then requires a token: its Refresh is refused (401) and, like any failed Refresh (item 6), keeps the loaded synthetic rows. The cost is one more request per Refresh. Against a backend that answers each request just inside the 12-second timeout, a Refresh can stay busy for up to about 48 s instead of about 36 s, as long as a Connect; one that never answers ends it after 12 s (finding 12). | `lifecycle.test.js`: both dashboards, both directions in the local copy, and where focus goes; `browser.test.js` and `hosted-browser.test.js` in real Chromium |
 | 6, time-range filter | Every new session (Connect, preview or Clear session) starts with "All loaded data". | That is the widest range, so a filter from an earlier session can no longer hide loaded records. A range chosen before Connect is reset. | `lifecycle.test.js`, both dashboards |
-| 6, `Retry-After` | Both dashboards state the wait a response asks for with `Retry-After`. Only delta-seconds or a valid IMF-fixdate HTTP date are read; anything else, including an impossible date, is ignored. A 429 reads "Too many requests or sign-in attempts (HTTP 429). No current data was confirmed. The backend asked to wait about N seconds before trying again; no automatic retry occurs." Other errors that carry the header get the same final sentence. | It tells the caregiver when a retry can work, without retrying automatically. | `core.test.js`, `lifecycle.test.js`, and `hosted-browser.test.js` in real Chromium through the unmodified `gateway.py` lockout |
+| 6, `Retry-After` | Both dashboards state the wait a response asks for with `Retry-After`. Only delta-seconds or a valid IMF-fixdate HTTP date are read; anything else, including an impossible date, is ignored. A 429 reads "Too many requests or sign-in attempts (HTTP 429). No current data was confirmed. The backend asked to wait about N seconds before trying again; no automatic retry occurs." Other errors that carry the header get the same final sentence. Waits round up, in seconds, minutes and hours. | It tells the caregiver when a retry can work, without retrying automatically. | `core.test.js`, `lifecycle.test.js`, and `hosted-browser.test.js` in real Chromium through the unmodified `gateway.py` lockout |
 
 Still open:
 
 - Item 1: `gateway.py` must stay intact.
 - Item 3: the budgeted-SQLite 503s are in the path of `direct_candidate.py`, the inactive candidate. This review deliberately left it unchanged, although only the original `gateway.py` is required to stay intact.
 - Item 4.
-- The rest of item 5: health reports process readiness only, and cursors carry no store identity.
-- The rest of item 6: a failed Refresh keeps the loaded rows and token.
+- The rest of item 5: health reports process readiness only, cursors carry no store identity, and a watch change, Load older or Load more devices does not re-check the mode until the next Refresh.
+- The rest of item 6: a failed Refresh keeps the loaded rows, count, badge and token, and Refresh does not use a newly typed token.
 - Items 8 to 15.
 - Within item 2, each of a device's two reports is still last-received-wins, regardless of `reported_at`.
 
@@ -269,18 +274,18 @@ Outcome: 38 items. 33 were confirmed (some overlap across reviewers) and 5 were 
 
 | Area | Confirmed problem | Correction |
 | --- | --- | --- |
-| Launcher | SIGTERM or SIGHUP (for example from `timeout` or a closed session) left the server running and the cluster behind, even with `--discard` | Signals now run the cleanup; a command still running is stopped first |
+| Launcher | SIGTERM or SIGHUP (for example from `timeout` or a closed session) left the server running and the cluster behind, even with `--discard` | Signals now run the cleanup; a command still running is stopped first (completed in the second verification) |
 | Launcher | As root, it ran `pg_ctl` from a `cluster.json` that the server account could replace, so that account could run code as root. Root also appended to a file inside that account's directory | The cluster directory and `cluster.json` are root-owned; the server account writes its own config |
 | Launcher | A failed setup left the cluster directory behind, even with `--discard` | Cleanup no longer depends on setup finishing |
 | Launcher | Version directories sorted as strings, so 9.6 would be chosen over 16 | Numeric sort |
 | Launcher | `PG*` variables (for example `PGHOSTADDR`) could send its clients off the private socket. Judged design, adopted | Removed from every client's environment |
-| Launcher | Deep checkouts exceeded the Unix socket path limit. Judged design, adopted | Short private socket directory, removed after the stop |
+| Launcher | Deep checkouts exceeded the Unix socket path limit. Judged design, adopted | Short private socket directory, removed after the stop (moved under `/tmp` in the second verification) |
 | Parity suite | Imported the Linux-only launcher at load time, so it could not run elsewhere even with only a DSN (critic) | Imported only inside the crash check |
 | Tests | The status lock's receipt-time rule, the lock bound on reads, the 5 s value and mechanism, and the status `ORDER BY` were not pinned | New tests on both backends (the SQLite one reverses unordered results); every corresponding mutant now fails |
-| Dashboards | After a mode change, "Connect again" did not say the token was removed too (local), and led to a Connect that always fails (hosted). Focus dropped to the page body | Per-copy wording; focus moves to the Connect form; real-browser checks for both copies |
+| Dashboards | After a mode change, "Connect again" did not say the token was removed too (local), and led to a Connect that always fails (hosted). Focus dropped to the page body | Per-copy wording; focus moves to the Connect form (refined in the second verification); real-browser checks for both copies |
 | Dashboards | Impossible `Retry-After` dates were read through `Date.parse` | A date counts only if it round-trips to the same IMF-fixdate text |
 | Dashboards | The status card called an older real report the "Last report received by backend", although a newer synthetic one had arrived. Judged design; adopted, since the provenance default caused it | "Last real gateway report received by backend" |
-| Tests | Keeping a chosen range within a session, no retry scheduled after a 429, the `Retry-After` wording boundaries and rounding, the null-health guard and the mode-change error styling were not pinned; the `Retry-After` test also depended on the Refresh default | New and corrected lifecycle and core checks; every corresponding mutant fails (10 of 10, including both real-browser checks) |
+| Tests | Keeping a chosen range within a session, no retry scheduled after a 429, the `Retry-After` wording boundaries and rounding, the null-health guard and the mode-change error styling were not pinned; the `Retry-After` test also depended on the Refresh default | New and corrected lifecycle and core checks; every corresponding mutant fails (10 of 10, including both real-browser checks). Minute- and hour-level rounding was still unpinned; see the second verification |
 | Documentation | 14 inaccurate statements: wrong before-fix counts, the Refresh timing, overstated claims about the mode re-check, revertibility, the operational note, item 2 and item 3, the libpq version, the merge state, the security-header scope, the Railway README's `Retry-After` note, "anything else is ignored", and the stale "24 backend tests" line. The critic added the README's "latest report" wording | All corrected here and in the READMEs |
 
 Left as documented design: the PostgreSQL comment no longer claims pooler safety, and psycopg's statement preparation is unchanged, since no pooler is used. A preview Refresh still starts a new preview, and so resets the range.
@@ -296,3 +301,45 @@ Results after the corrections:
 | PostgreSQL launcher checks | 5 OK |
 | Dashboard `core` / `app` / `hosted` / `lifecycle` / `integration` | 39 / 10 / 6 / 51 / 6 passed |
 | `browser` / `hosted-browser` (real Chromium) | 12 / 8 passed |
+
+### Second independent verification, and corrections
+
+The seven correction commits (`5577105`..`5d9fd1b`) were checked the same way: a read-only workflow ran three reviewers (launcher and PostgreSQL, dashboards, documentation), one adversarial verifier per reviewer and a completeness critic. It used fictional data, throwaway clusters and copies under the gitignored `build/` only.
+
+Outcome: 28 items. 25 were confirmed (some overlap across reviewers), 2 were judged deliberate design and 1 was refuted. The critic found 2 more gaps. Every confirmed item and both gaps were corrected, as follows.
+
+| Area | Confirmed problem | Correction |
+| --- | --- | --- |
+| Launcher | When the terminal closed or the output pipe died (`... \| tee log`, then Ctrl-C), the status lines raised. The cleanup then stopped before removing the temporary socket directory and, with `--discard`, the cluster | Status lines can no longer fail. Checks with a closed pipe and a closed terminal |
+| Launcher | Run as an ordinary account with a wrong `--bindir`, the cleanup's status check raised, so a failed setup left its cluster. The check passed only as root | A missing `pg_ctl` means no server is running. The failed-setup check also runs as the `postgres` account |
+| Launcher | A signal to the launcher alone during initdb killed only `runuser` (or initdb itself). The orphaned initdb kept writing, `pg_ctl stop` refused its single-user backend and the cleanup was skipped. Very early group signals could hit the same window | An interrupted setup step may finish (it is killed after 2 minutes). A failed stop is reported and retried, and the cleanup waits up to 60 s until no process names the cluster |
+| Launcher | As root, a repeated group SIGTERM made `runuser` kill `pg_ctl stop`, so the cleanup aborted | The cleanup's server commands run in their own session |
+| Launcher | Under `nohup`, the launcher replaced the ignored SIGHUP with its own handler, so a closed terminal ended the run. A regression | Signals ignored at start stay ignored |
+| Launcher | The short socket directory followed `TMPDIR`, which can be long or closed to the server account. The server then could not start, and `--discard` deleted the only log that said why (critic) | Always under `/tmp`, and named on stderr. A failed start reports the end of the server log |
+| Launcher | On a signal to the launcher alone, only the command's own process is stopped; programs it started keep running. Judged a trade-off | Documented. The command stays in the launcher's process group, so interactive commands keep the terminal |
+| Launcher checks | Four fixes were not pinned: who appends the configuration, a second signal, the temporary socket directory after a failed setup, and its mode. Two checks shared fixed paths and failed when runs overlapped. One needed `build/` to exist | 16 checks. Each launch check uses its own copy in a unique directory, and the unit checks need no `build/`. Each launcher fix, reverted on its own, makes a check fail (15 of 15) |
+| Parity suite | The settings check's "no statement timeout" read the server's default, not the backend's | The check gives the connection a statement timeout and expects it unchanged |
+| Dashboards | If the user had moved focus to the readings table while a Refresh waited, focus still ended on the page body after a mode change | Focus on the emptied table also moves to the Connect form |
+| Dashboards | Nothing pinned that focus the user moved to another control stays there; the simulated DOM had no focused element | The simulated DOM tracks focus. Lifecycle and real-Chromium checks cover both cases in both copies |
+| Dashboards | A screen reader might speak the newly focused control and drop the polite status update (critic; not demonstrated, since no screen reader is available here) | While the message is current, it is the accessible description of the control that received focus, as Chromium's accessibility tree shows. The next message removes it |
+| Dashboards | The hosted message gave no next step. Judged design; adopted | "Connect again once the backend is synthetic-only." |
+| Tests | Minute- and hour-level `Retry-After` rounding was not pinned: every case read the same when rounded to the nearest unit | Cases where the two differ. `24:00:00`, which `Date.parse` reads as the next midnight, is the rollover example; `Date.parse` already rejects 24:30 and 12:61 |
+| Documentation | The merge state in the opening line and the checklist; revertibility, which omitted the provenance default; the rounding claims; the statement timeout; the "wedged backend" timing in findings 5 and 12; the dashboard README's counts; the "Still open" list. The dashboard reviewer added the unqualified focus statements, the tokenless case and the check-then-request window | Corrected here and in the dashboard README |
+
+Commit messages are not rewritten: `5577105` says its checks "pin all of this", and `fdf7381` names 24:30 among dates that `Date.parse` misread. The table above corrects both. Left unchanged by design: after a switch to real-data mode the hosted copy still puts focus on Connect, the control that works once the backend is synthetic-only again. The refuted item said `5d9fd1b` claimed a code fix it does not contain; it carries the documentation for both critic gaps, and `fa6ccb8`'s message credits the code fix.
+
+**Mutants.** Each fix, reverted on its own, makes at least one test fail: 15 of 15 for the launcher (each closed-stream, missing-`pg_ctl`, setup-step, session, ignored-signal, socket-directory, failed-stop, log-tail, configuration-append, socket-mode and stderr-naming change), and 12 of 12 for the dashboards (no hand-over from the emptied table, focus moved unconditionally, no description link, a stale description, no hosted next step, minutes or hours rounded to nearest, dates not round-tripped; each copy where the change applies to both). The focus and description mutants fail in the simulated DOM and in real Chromium.
+
+Results after these corrections:
+
+| Suite | Result |
+| --- | --- |
+| Backend `unittest discover` | 174 OK (1 Windows-only skip) |
+| `test_gateway` | 12 OK |
+| `integration_contract_android` | 5 OK |
+| PostgreSQL parity | 41 OK under both locales (about 44 s each), server stopped and exited |
+| PostgreSQL launcher checks | 16 OK, as root |
+| Dashboard `core` / `app` / `hosted` / `lifecycle` / `integration` | 39 / 10 / 6 / 54 / 6 passed |
+| `browser` / `hosted-browser` (real Chromium) | 13 / 9 passed |
+
+No PostgreSQL process, temporary socket directory or launcher copy was left after these runs; the two retained clusters from the first runs are unchanged.
