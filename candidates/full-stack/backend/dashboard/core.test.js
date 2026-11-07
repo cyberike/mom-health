@@ -45,10 +45,15 @@ test("rendering avoids HTML injection and browser persistence", () => { const ap
 test("API requests are same-origin GET only", () => { const app = fs.readFileSync(path.join(__dirname, "app.js"), "utf8"); assert(app.includes('method: "GET"')); assert(!/https?:\/\//.test(app.replace("http://www.w3.org/2000/svg", ""))); assert(!/setInterval|sendBeacon|WebSocket/.test(app)); });
 test("Retry-After waits are worded plainly and never invented", () => {
   const at = Date.parse("2026-11-07T12:00:00Z");
-  const cases = [[null, ""], ["", ""], ["soon", ""], ["-5", ""], ["0", "a moment"], ["45", "about 45 seconds"], ["90", "about 2 minutes"],
-    ["5400", "about 2 hours"], ["86401", "more than a day"], ["Sat, 07 Nov 2026 12:00:30 GMT", "about 30 seconds"],
-    ["Sat, 07 Nov 2026 11:00:00 GMT", "a moment"], ["Saturday, 07-Nov-26 12:00:30 GMT", ""]];
+  const cases = [[null, ""], ["", ""], ["soon", ""], ["-5", ""], ["0", "a moment"], ["1", "a moment"], ["2", "about 2 seconds"], ["45", "about 45 seconds"],
+    ["89", "about 89 seconds"], ["90", "about 2 minutes"], ["5399", "about 90 minutes"], ["5400", "about 2 hours"], ["86400", "about 24 hours"], ["86401", "more than a day"],
+    ["Sat, 07 Nov 2026 12:00:30 GMT", "about 30 seconds"], ["Sat, 07 Nov 2026 11:00:00 GMT", "a moment"], ["Saturday, 07-Nov-26 12:00:30 GMT", ""],
+    // Date-shaped but impossible, wrong weekday or misread by Date.parse: ignored, never rolled over.
+    ["Sat, 31 Feb 2026 12:00:00 GMT", ""], ["Sat, 07 Nov 2026 24:30:00 GMT", ""], ["Sat, 07 Nov 2026 12:61:00 GMT", ""], ["Sun, 07 Nov 2026 12:00:30 GMT", ""],
+    ["Thu, 01 Jan 0049 00:00:00 GMT", ""]];
   for (const [value, label] of cases) assert.equal(core.retryAfterLabel(value, at), label, String(value));
+  // Waits round up: 89.4 s is "about 2 minutes", never fewer seconds than asked.
+  assert.equal(core.retryAfterLabel("Sat, 07 Nov 2026 12:01:30 GMT", at + 600), "about 2 minutes");
 });
 test("clear session and lifecycle cancel outstanding work", () => { const app = fs.readFileSync(path.join(__dirname, "app.js"), "utf8"); assert(app.includes('window.addEventListener("pagehide"')); assert(app.includes("controller.abort()")); assert(app.includes('token = ""')); assert(app.includes("epoch === generation")); });
 test("honest missing telemetry and explicit preview labels", () => { const html = fs.readFileSync(path.join(__dirname, "index.html"), "utf8"); assert((html.match(/Not reported/g) || []).length >= 3); assert(html.includes("Try synthetic preview")); assert(html.includes("Accuracy is unverified")); assert(html.includes("Hands-off collection is still being built")); });

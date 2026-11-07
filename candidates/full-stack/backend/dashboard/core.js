@@ -111,9 +111,11 @@
   function retryAfterLabel(value, now = Date.now()) {
     const text = typeof value === "string" ? value.trim() : "";
     if (!text) return "";
-    // Only the IMF-fixdate form servers must send is read as a date.
-    const date = /^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT$/.test(text);
-    const seconds = Math.ceil(/^\d+$/.test(text) ? Number(text) : date ? (Date.parse(text) - now) / 1000 : NaN);
+    // Only the IMF-fixdate form servers must send is read as a date, and only when it
+    // names a real moment: V8's Date.parse silently rolls impossible fields over.
+    const at = /^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT$/.test(text) ? Date.parse(text) : NaN;
+    const date = Number.isFinite(at) && new Date(at).toUTCString() === text;
+    const seconds = Math.ceil(/^\d+$/.test(text) ? Number(text) : date ? (at - now) / 1000 : NaN);
     if (!Number.isFinite(seconds)) return "";
     if (seconds <= 1) return "a moment";
     if (seconds < 90) return "about " + seconds + " seconds";
