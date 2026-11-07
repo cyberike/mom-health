@@ -404,6 +404,24 @@ async function test(name, action) { await action(); passed++; console.log("PASS 
       assert.equal(shown(ui), 24);
     });
 
+    await test(variant + ": a chosen time range stays in place for the rest of the session", async () => {
+      const api = backend(); const ui = setup(api.handler, fixture);
+      const choose = value => { ui.elements.rangeSelect.value = value; ui.elements.rangeSelect.listeners.change(); };
+      // Watch A's first page offers an older page, so Load older runs too.
+      api.override = url => url.startsWith("/v1/samples?") && url.includes("device_id=" + A)
+        ? json(url.includes("cursor=") ? { samples: rows[A].slice(2), next_cursor: null } : { samples: rows[A].slice(0, 2), next_cursor: "synthetic-older-page" }) : null;
+      connect(ui); await idle(ui);
+      choose("24h");
+      ui.elements.refreshButton.click(); await idle(ui);
+      assert.equal(ui.elements.rangeSelect.value, "24h");
+      ui.elements.loadMore.click(); await idle(ui);
+      assert.equal(ui.elements.rangeSelect.value, "24h");
+      assert.equal(shown(ui), 3);
+      ui.elements.deviceSelect.value = B; ui.elements.deviceSelect.listeners.change(); await idle(ui);
+      assert.equal(ui.elements.rangeSelect.value, "24h");
+      assert.equal(shown(ui), 2);
+    });
+
     await test(variant + ": Refresh re-checks the data mode and requests no records after it changed", async () => {
       const api = backend(); const ui = setup(api.handler, fixture);
       const flags = []; ui.elements.announcement.classList = { toggle: (name, on) => flags.push([name, on]) };
