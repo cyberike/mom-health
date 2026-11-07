@@ -101,6 +101,7 @@ if (require.main === module) (async () => {
       assert.equal(ui.elements.modeBadge.textContent, "Private backend data");
       assert.equal(/Synthetic test record/.test(ui.elements.latestLabel.textContent), synthetic, ui.elements.latestLabel.textContent);
       assert.equal(/Synthetic test report/.test(ui.elements.statusReportTime.textContent), synthetic, ui.elements.statusReportTime.textContent);
+      assert.match(ui.elements.statusReportTime.textContent, synthetic ? /^Synthetic test report, not from a real gateway\. Last report received by backend: / : /^Last real gateway report received by backend: /);
       assert.equal(ui.elements.historyRows.children[0].children[2].textContent.includes(synthetic ? "synthetic" : "watch-reported"), true);
     }
   });
