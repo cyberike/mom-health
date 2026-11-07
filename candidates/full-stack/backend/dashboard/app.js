@@ -19,10 +19,12 @@
     if (active && active !== document.body && !active.disabled && !(active.closest && active.closest(".table-scroll"))) return;
     described = control; control.setAttribute("aria-describedby", "announcement"); control.focus();
   }
-  // A table scroller with nothing left to scroll: its scroll sizes, which Chromium rounds to whole pixels, are
-  // within its client sizes. Chromium moves focus from it to <body> at its next frame, except where the rows
-  // still overflow by under half a pixel: it then keeps the table as a Tab stop although nothing scrolls, and
-  // focus on it is handed on all the same.
+  // A table scroller whose scroll sizes, which Chromium rounds to whole pixels, are within its client sizes (also
+  // rounded). Chromium moves focus from such an emptied table to <body> at its next frame, unless the rows still
+  // overflow it by a fraction of a pixel: it then keeps the table as a Tab stop, and focus on it is handed on all
+  // the same. At 100 % zoom that fraction is under half a pixel and nothing scrolls; at fractional zoom the
+  // rounding can go either way, so a table that cannot scroll may keep focus and one that scrolls by a device
+  // pixel may be handed on.
   function emptiedScroller(element) {
     const scroller = element && element.closest && element.closest(".table-scroll");
     return Boolean(scroller) && scroller.scrollHeight <= scroller.clientHeight && scroller.scrollWidth <= scroller.clientWidth;
@@ -32,7 +34,8 @@
   function setBusy(value) {
     // Disabling the focused control drops keyboard focus to <body>. Remember the
     // control that started an operation and return focus to it afterwards when
-    // focus was lost, or is on a table with nothing left to scroll, and the control is usable again.
+    // focus was lost, or is on a table whose rounded scroll sizes are within its client sizes, and the control is
+    // usable again.
     const starting = value && !busy, ending = busy && !value;
     if (starting) { const current = document.activeElement; focusReturn = current && current !== document.body ? current : null; }
     busy = value; ui.connectButton.disabled = value; ui.refreshButton.disabled = value || mode === "none";

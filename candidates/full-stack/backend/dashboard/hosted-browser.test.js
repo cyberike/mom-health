@@ -105,6 +105,15 @@ async function holdRequest(page, pathname) {
   return { seen, release };
 }
 
+// The sample page is sent only two frames after its request, so Chromium renders the emptied table at least once.
+function sendSamplesTwoFramesLate(page) {
+  return page.evaluate(() => {
+    const real = window.fetch;
+    window.fetch = (input, init) => new URL(input, location.href).pathname !== "/v1/samples" ? real(input, init)
+      : new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve(real(input, init)))));
+  });
+}
+
 // Enough fictional rows (15 with the seeded 3) for the table to scroll, which makes it a keyboard stop in Chromium.
 async function seedRows(backend) {
   const samples = Array.from({ length: 12 }, (_, i) => ({ sample_id: randomUUID(), device_id: DEVICE, session_id: randomUUID(), model: "V8", source: "live",
@@ -307,7 +316,7 @@ async function check(name, action) { await action(); passed++; console.log("PASS
       const view = await signIn(browser, "direct", CAREGIVER, { viewport: { width, height } });
       const page = view.page;
       assert.equal((await connected(view)).count, "15");
-      // Held at the device list, which every Refresh requests, so the check does not rely on Refresh re-reading the mode.
+      // Held at the device list, which Refresh requests whether or not it re-reads the mode first, so this does not rely on that re-read.
       const release = await holdAnswer(page, "/v1/devices", { devices: [], next_cursor: null });
       await page.focus("#refreshButton");
       await page.keyboard.press("Enter");
@@ -338,6 +347,26 @@ async function check(name, action) { await action(); passed++; console.log("PASS
       held.release(); await idle(page); await frames(page);
       assert.equal(await page.locator("#historyRows tr").count(), 15);
       assert.equal(await active(page), "table-scroll", width + " px: focus on the full table after Refresh");
+      await finish(view);
+    }
+  }));
+
+  await check("direct_candidate.py: a Refresh that keeps the watch empties the table while it reloads: focus on it returns to Refresh, except where the empty table still scrolls", () => withHosted("direct", async (browser, backend) => {
+    await seedRows(backend);
+    for (const [width, height, expected] of [[1280, 720, "refreshButton"], [320, 640, "table-scroll"]]) {
+      const view = await signIn(browser, "direct", CAREGIVER, { viewport: { width, height } });
+      const page = view.page;
+      assert.equal((await connected(view)).count, "15");
+      await sendSamplesTwoFramesLate(page);
+      const held = await holdRequest(page, "/v1/devices");
+      await page.focus("#refreshButton");
+      await page.keyboard.press("Enter");
+      await held.seen;
+      for (let i = 0; i < 2; i++) await page.keyboard.press("Tab");
+      assert.equal(await active(page), "table-scroll", width + " px: Tab x2 to the full table while Refresh waits");
+      held.release(); await idle(page); await frames(page);
+      assert.equal(await page.locator("#historyRows tr").count(), 15, width + " px: the reloaded rows");
+      assert.equal(await active(page), expected, width + " px: focus after a Refresh that reloaded the same watch");
       await finish(view);
     }
   }));

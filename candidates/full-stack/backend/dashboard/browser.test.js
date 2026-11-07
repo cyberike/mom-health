@@ -133,6 +133,15 @@ async function hold(page, matcher) {
   return { seen, release, stop: () => page.unroute("**/v1/**", handler) };
 }
 
+// The sample page is sent only two frames after its request, so Chromium renders the emptied table at least once.
+function sendSamplesTwoFramesLate(page) {
+  return page.evaluate(() => {
+    const real = window.fetch;
+    window.fetch = (input, init) => new URL(input, location.href).pathname !== "/v1/samples" ? real(input, init)
+      : new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve(real(input, init)))));
+  });
+}
+
 async function overflow(page) {
   return page.evaluate(() => {
     const width = window.innerWidth;
@@ -485,7 +494,7 @@ async function check(name, action) { await action(); passed++; console.log("PASS
       for (const [width, height, expected] of [[1280, 900, "refreshButton"], [320, 640, "table-scroll"]]) {
         const view = await open(seeded, { viewport: { width, height } });
         await connect(view.page);
-        // Held at the device list, which every Refresh requests, so the check does not rely on Refresh re-reading the mode.
+        // Held at the device list, which Refresh requests whether or not it re-reads the mode first, so this does not rely on that re-read.
         const release = await holdAnswer(view.page, "/v1/devices", { devices: [], next_cursor: null });
         await view.page.focus("#refreshButton");
         await view.page.keyboard.press("Enter");
@@ -514,6 +523,24 @@ async function check(name, action) { await action(); passed++; console.log("PASS
         held.release(); await idle(view.page); await frames(view.page); await held.stop();
         assert.equal(await view.page.locator("#historyRows tr").count(), 50);
         assert.equal(await active(view.page), "table-scroll", width + " px: focus on the full table after Refresh");
+        await close(view);
+      }
+    });
+
+    await check("a Refresh that keeps the watch empties the table while it reloads: focus on it returns to Refresh, except where the empty table still scrolls", async () => {
+      for (const [width, height, expected] of [[1280, 900, "refreshButton"], [320, 640, "table-scroll"]]) {
+        const view = await open(seeded, { viewport: { width, height } });
+        await connect(view.page);
+        await sendSamplesTwoFramesLate(view.page);
+        const held = await hold(view.page, url => url.pathname === "/v1/devices");
+        await view.page.focus("#refreshButton");
+        await view.page.keyboard.press("Enter");
+        await held.seen;
+        for (let i = 0; i < 2; i++) await view.page.keyboard.press("Tab");
+        assert.equal(await active(view.page), "table-scroll", width + " px: Tab x2 to the full table while Refresh waits");
+        held.release(); await idle(view.page); await frames(view.page); await held.stop();
+        assert.equal(await view.page.locator("#historyRows tr").count(), 50, width + " px: the reloaded rows");
+        assert.equal(await active(view.page), expected, width + " px: focus after a Refresh that reloaded the same watch");
         await close(view);
       }
     });

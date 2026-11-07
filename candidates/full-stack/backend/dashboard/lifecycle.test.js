@@ -358,6 +358,34 @@ async function test(name, action) { await action(); passed++; console.log("PASS 
       assert.doesNotMatch(ui.elements.announcement.textContent, /another watch/);
     });
 
+    await test(variant + ": a Refresh that keeps the watch and fails at its sample request has emptied the table", async () => {
+      const api = backend(); const ui = setup(api.handler, fixture);
+      connect(ui); await idle(ui);
+      assert.equal(shown(ui), 3);
+      api.override = url => url.startsWith("/v1/samples?") ? json({ detail: "synthetic storage failure" }, 500) : null;
+      ui.elements.refreshButton.click(); await idle(ui);
+      assert.equal(ui.elements.deviceSelect.value, A);
+      assert.match(ui.elements.announcement.textContent, /Backend request failed \(HTTP 500\)/);
+      // The reload set the old rows aside before its request, so none of them is left on screen as if current.
+      assert.equal(shown(ui), 0);
+      assert.match(ui.elements.loadedStatus.textContent, /^0 shown · 0 loaded/);
+      assert.equal(ui.elements.pageNote.textContent, "Observations for this watch are not loaded.");
+    });
+
+    await test(variant + ": a Refresh that fails at its gateway-status request shows the newly loaded rows", async () => {
+      const api = backend(); const ui = setup(api.handler, fixture);
+      connect(ui); await idle(ui);
+      assert.equal(shown(ui), 3);
+      const newest = sample(A, "V8", 0, 99);
+      api.override = url => url.startsWith("/v1/samples?") ? json({ samples: [newest, ...rows[A]], next_cursor: null })
+        : url.startsWith("/v1/gateway-status?") ? json({ detail: "synthetic status failure" }, 500) : null;
+      ui.elements.refreshButton.click(); await idle(ui);
+      assert.match(ui.elements.announcement.textContent, /Backend request failed \(HTTP 500\)/);
+      assert.equal(shown(ui), 4);
+      assert.match(ui.elements.historyRows.children[0].children[1].textContent, /^99\b/, "the newest row is the newly loaded one");
+      assert.match(ui.elements.statusReportTime.textContent, /not loaded/);
+    });
+
     if (variant === "local") await test("local: a second Connect with the emptied token field never wipes a token session", async () => {
       const token = "synthetic-lifecycle-token-one-0000000000001";
       const api = backend(); const ui = setup(api.handler, fixture);
