@@ -85,7 +85,7 @@ A separate adversarial verifier per area then tried to refute every reported ite
 
 ## Findings not changed (decisions for the owner)
 
-These were measured or demonstrated but are documented limitations, design choices or wording questions rather than clear defects. None was changed.
+These were measured or demonstrated but are documented limitations, design choices or wording questions rather than clear defects. None was changed on November 3. The November 7 follow-up (end of this report) settled item 2, item 7, the Refresh part of item 5, and the range and `Retry-After` parts of item 6 with conservative defaults. The rest remain open.
 
 1. **gateway.py sign-in lockout.** Requests without an Authorization header count as failures, and a browser sends two during each ordinary Basic sign-in, so in headless Chromium the fourth fresh legitimate sign-in within a minute was refused with 429 (no wrong password); reloads in an already signed-in browser cost nothing. Its lockout 429 carries no challenge, so a browser that is not yet signed in sees a bare JSON page until the window expires. Role-wide lockout is documented; this browser cost is now recorded in `railway_candidate/README.md`. `direct_candidate.py` does not count header-less requests: ten fresh sign-ins were never throttled, and a repeated wrong password was throttled without locking out the caregiver.
 2. **Status provenance in real-data mode.** `status()` returns whichever of a device's synthetic and real reports arrived last, so a fresh synthetic test report hides the real watch's report. Status is also last-received-wins regardless of `reported_at`, so a delayed older report replaces a newer one. A per-upsert sequence would also survive backward clock steps.
@@ -117,19 +117,19 @@ From `candidates/full-stack/backend`:
 
 | Command | Result |
 | --- | --- |
-| `python -m unittest discover -s tests -v` | 172 tests OK (1 Windows-only skip) |
+| `python -m unittest discover -s tests -v` | 173 tests OK (1 Windows-only skip) |
 | `python -m unittest railway_candidate.test_gateway -v` | 12 OK |
 | `cd tests && python -m unittest integration_contract_android -v` | 5 OK |
-| `cd dashboard && node core.test.js` | 38 passed |
+| `cd dashboard && node core.test.js` | 39 passed |
 | `node app.test.js` | 10 passed |
 | `node hosted.test.js` | 6 passed |
-| `node lifecycle.test.js` | 40 passed |
+| `node lifecycle.test.js` | 47 passed |
 | `node integration.test.js` | 6 passed |
 | `node browser.test.js` (Playwright + Chromium) | 11 passed |
-| `node hosted-browser.test.js` (Playwright + Chromium) | 6 passed |
+| `node hosted-browser.test.js` (Playwright + Chromium) | 7 passed |
 | `node --check app.js && node --check core.js && node --check ../railway_candidate/dashboard-app.js && node --check browser-support.js` | OK |
 
-The full backend run takes about 27 s and both browser suites about 50 s on four shared CPUs. New fixture directories accumulate under `candidates/full-stack/build/` (gitignored), as with the existing suites.
+Counts include the November 7 follow-up. The full backend run takes about 27 s and both browser suites about 50 s on four shared CPUs. New fixture directories accumulate under `candidates/full-stack/build/` (gitignored), as with the existing suites.
 
 ## Blocked or not run
 
@@ -142,7 +142,7 @@ The full backend run takes about 27 s and both browser suites about 50 s on four
 ## Remaining acceptance checklist
 
 - [ ] Owner review of this branch; merge decision (not merged).
-- [ ] Choose the ingress candidate in light of the measured `gateway.py` sign-in lockout, and decide items 2, 5, 6 and 7 above.
+- [ ] Choose the ingress candidate in light of the measured `gateway.py` sign-in lockout. Review the follow-up's defaults for items 2, 5, 6 and 7, and decide what remains of items 5 and 6.
 - [ ] Resolve the Rekor/Caddy verification through legitimately applied, confirmed scoped access, then run the prepared Caddy loopback harness.
 - [ ] Resolve the rejected Railway public-domain action through the applicable review; only then a protected synthetic hosted test.
 - [x] PostgreSQL parity, concurrency, rollback and crash recovery, including the status lock, on throwaway local PostgreSQL 16 clusters (follow-up below).
@@ -232,3 +232,38 @@ Run as a non-root account, the launcher needs no `--run-as`. The two cluster dir
 - PostgreSQL versions other than 16.15, and psycopg versions other than 3.3.8.
 
 **Operational note for the owner.** If the app host disappears mid-transaction (power loss or a network partition), PostgreSQL keeps that session's locks until it notices the dead connection, which with default TCP keepalives can take hours. Until then, every write is answered 503 after 5 s. A server-side `idle_in_transaction_session_timeout` of about a minute would bound this. That is a server-configuration choice and was not made here.
+
+### Design defaults chosen
+
+The owner asked for the open choices in "Findings not changed" to be settled conservatively. Each default below is its own commit, with tests that fail without it, so any one can be reverted on its own. `gateway.py` and `direct_candidate.py` are unchanged.
+
+| Finding | Default chosen | Why it is the conservative choice | Tests |
+| --- | --- | --- | --- |
+| 2, status provenance | In real-data mode, `GET /v1/gateway-status` serves the real gateway's report whenever one exists. The synthetic test report is served only when there is no real one, and both dashboards label it synthetic. Synthetic-only mode is unchanged. | A fresh synthetic test report can no longer hide the real watch's state. The real report may be older; its receipt time and age are shown. | `test_device_isolation...serves_the_real_gateway_report_over_a_synthetic_one`, on SQLite and on PostgreSQL |
+| 7, boundary rejections | 400, 401, 403 and 413 rejections carry the same `no-store`, `nosniff`, `no-referrer`, `DENY` and Content-Security-Policy headers as every other response. Status codes and bodies are unchanged. | It only adds restrictions: an error response can no longer be cached or framed. | `test_auth_failures...every_rejection_carries_the_security_headers` (all five rejection kinds) |
+| 5, Refresh never re-read `/v1/health` | Refresh re-reads `/v1/health` first. If the backend's data mode changed since Connect, the dashboard clears the session and requests nothing under the new mode; the caregiver connects again deliberately. | Records are never shown under a mode other than the one the session connected with, and switching into real-data mode always takes a deliberate Connect. The cost is one more request per Refresh, so against a wedged backend a Refresh can stay busy for up to about 60 s instead of about 48 s (finding 12). | `lifecycle.test.js`: both dashboards, and both directions in the local copy |
+| 6, time-range filter | Every new session (Connect, preview or Clear session) starts with "All loaded data". | That is the widest range, so a filter from an earlier session can no longer hide loaded records. A range chosen before Connect is reset. | `lifecycle.test.js`, both dashboards |
+| 6, `Retry-After` | Both dashboards state the wait a response asks for with `Retry-After`. Only delta-seconds or an IMF-fixdate HTTP date are read; anything else is ignored. A 429 reads "Too many requests or sign-in attempts (HTTP 429). No current data was confirmed. The backend asked to wait about N seconds before trying again; no automatic retry occurs." Other errors that carry the header get the same final sentence. | It tells the caregiver when a retry can work, without retrying automatically. | `core.test.js`, `lifecycle.test.js`, and `hosted-browser.test.js` in real Chromium through the unmodified `gateway.py` lockout |
+
+Still open:
+
+- Item 1: `gateway.py` must stay intact.
+- Item 3: the budgeted-SQLite 503s are in `direct_candidate.py`'s path, which must stay unchanged.
+- Item 4.
+- The rest of item 5: health reports process readiness only, and cursors carry no store identity.
+- The rest of item 6: a failed Refresh keeps the loaded rows and token.
+- Items 8 to 15.
+- Within item 2, each of a device's two reports is still last-received-wins, regardless of `reported_at`.
+
+Status selection no longer compares receipt times, so defect 2's fix now only keeps the receipt-time format sortable. The test still checks that format.
+
+Results after these defaults:
+
+| Suite | Result |
+| --- | --- |
+| Backend `unittest discover` | 173 OK (1 Windows-only skip) |
+| `test_gateway` | 12 OK |
+| `integration_contract_android` | 5 OK |
+| PostgreSQL parity | 37 OK under both locales |
+| Dashboard `core` / `app` / `hosted` / `lifecycle` / `integration` | 39 / 10 / 6 / 47 / 6 passed |
+| `browser` / `hosted-browser` (real Chromium) | 11 / 7 passed |
