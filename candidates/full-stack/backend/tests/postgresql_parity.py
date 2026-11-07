@@ -451,6 +451,16 @@ class PostgreSQLWriteLockTests(PostgreSQLFixture, unittest.TestCase):
                 "SELECT current_setting('transaction_isolation'), current_setting('lock_timeout'), current_setting('statement_timeout')").fetchone())
         finally:
             connection.close()
+        # Nor one of its own when the connection brings none: the backend's connection then sees
+        # what a plain connection with the same settings sees (the server, database or role default).
+        dsn = self.fresh_dsn()
+        with admin(dsn) as plain:
+            expected = plain.execute("SELECT current_setting('statement_timeout')").fetchone()[0]
+        connection = PostgreSQLRepository(dsn).connect()
+        try:
+            self.assertEqual(expected, connection.execute("SELECT current_setting('statement_timeout')").fetchone()[0])
+        finally:
+            connection.close()
 
     def test_writes_wait_for_a_brief_lock_holder(self):
         client = self.client()
