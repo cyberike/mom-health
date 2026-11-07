@@ -64,9 +64,12 @@ print('SIGHUP ignored:', signal.getsignal(signal.SIGHUP) == signal.SIG_IGN, flus
 time.sleep(3)
 print('finished normally', flush=True)
 '''
+# Waits until the file exists, or 120 s, so an interrupted check (whose cleanups do not run) cannot keep it, and
+# with it the launcher and its server, running for good.
 UNTIL = r'''
 import os, time
-while not os.path.exists(%r):
+end = time.monotonic() + 120
+while not os.path.exists(%r) and time.monotonic() < end:
     time.sleep(0.05)
 '''
 # Runs the launcher with a SIGTERM to itself just before or just after Popen has started the command,
