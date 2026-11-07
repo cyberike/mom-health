@@ -86,13 +86,14 @@ async function focusedDescription(page) {
   } finally { await client.detach(); }
 }
 
-// Answers /v1/health only when released, so keys can be pressed while a Refresh waits.
-async function holdHealth(page, body) {
+// Answers requests for one path with body only when released, so keys can be pressed while a Refresh waits.
+async function holdAnswer(page, pathname, body) {
   let release;
   const held = new Promise(resolve => { release = resolve; });
-  await page.route("**/v1/health", async route => { await held; await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) }); });
+  await page.route(url => url.pathname === pathname, async route => { await held; await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) }); });
   return release;
 }
+const holdHealth = (page, body) => holdAnswer(page, "/v1/health", body);
 const frames = page => page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
 
 async function connect(page, token = TOKEN) {
@@ -484,9 +485,8 @@ async function check(name, action) { await action(); passed++; console.log("PASS
       for (const [width, height, expected] of [[1280, 900, "refreshButton"], [320, 640, "table-scroll"]]) {
         const view = await open(seeded, { viewport: { width, height } });
         await connect(view.page);
-        const release = await holdHealth(view.page, { status: "ready", schema_version: 1, synthetic_only: true });
-        await view.page.route(url => url.pathname === "/v1/devices", route => route.fulfill({ status: 200, contentType: "application/json",
-          body: JSON.stringify({ devices: [], next_cursor: null }) }));
+        // Held at the device list, which every Refresh requests, so the check does not rely on Refresh re-reading the mode.
+        const release = await holdAnswer(view.page, "/v1/devices", { devices: [], next_cursor: null });
         await view.page.focus("#refreshButton");
         await view.page.keyboard.press("Enter");
         for (let i = 0; i < 2; i++) await view.page.keyboard.press("Tab");
@@ -495,6 +495,25 @@ async function check(name, action) { await action(); passed++; console.log("PASS
         assert.match(await text(view.page, "announcement"), /The previously selected watch is no longer listed, so no watch is shown\.$/);
         assert.equal(await text(view.page, "sampleCount"), "—");
         assert.equal(await active(view.page), expected, width + " px: focus after a Refresh that emptied the table");
+        await close(view);
+      }
+    });
+
+    await check("focus moved to the full table while a Refresh finishes stays there, at any width", async () => {
+      // Only the gateway status is outstanding: the new rows are in, and the table scrolls (vertically at 1280 px).
+      for (const [width, height] of [[1280, 900], [320, 640]]) {
+        const view = await open(seeded, { viewport: { width, height } });
+        await connect(view.page);
+        const held = await hold(view.page, url => url.pathname === "/v1/gateway-status");
+        await view.page.focus("#refreshButton");
+        await view.page.keyboard.press("Enter");
+        await held.seen; await frames(view.page);
+        assert.equal(await view.page.locator("#historyRows tr").count(), 50);
+        for (let i = 0; i < 2; i++) await view.page.keyboard.press("Tab");
+        assert.equal(await active(view.page), "table-scroll", width + " px: Tab x2 to the full table while Refresh waits");
+        held.release(); await idle(view.page); await frames(view.page); await held.stop();
+        assert.equal(await view.page.locator("#historyRows tr").count(), 50);
+        assert.equal(await active(view.page), "table-scroll", width + " px: focus on the full table after Refresh");
         await close(view);
       }
     });

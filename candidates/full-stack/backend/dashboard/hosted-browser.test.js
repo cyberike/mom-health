@@ -52,8 +52,8 @@ async function seed(backend, mode) {
   assert.equal(JSON.parse(result.body).accepted_ids.length, 3);
 }
 
-async function signIn(browser, mode, credentials) {
-  const context = await browser.newContext({ httpCredentials: credentials, extraHTTPHeaders: mode === "gateway" ? { "x-forwarded-proto": "https" } : {} });
+async function signIn(browser, mode, credentials, contextOptions = {}) {
+  const context = await browser.newContext({ httpCredentials: credentials, extraHTTPHeaders: mode === "gateway" ? { "x-forwarded-proto": "https" } : {}, ...contextOptions });
   const page = await context.newPage();
   const view = { context, page, problems: [], requests: [] };
   page.on("console", message => { if (message.type() === "error" || message.type() === "warning") view.problems.push(message.text()); });
@@ -83,6 +83,33 @@ async function focusedDescription(page) {
     const focused = nodes.filter(node => (node.properties || []).some(property => property.name === "focused" && property.value.value)).pop();
     return focused && focused.description ? focused.description.value : "";
   } finally { await client.detach(); }
+}
+
+// Answers requests for one path with body only when released, so keys can be pressed while a Refresh waits.
+async function holdAnswer(page, pathname, body) {
+  let release;
+  const held = new Promise(resolve => { release = resolve; });
+  await page.route(url => url.pathname === pathname, async route => { await held; await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) }); });
+  return release;
+}
+
+// Holds requests for one path until released, then lets them reach the loopback backend; seen resolves on arrival.
+async function holdRequest(page, pathname) {
+  let release, arrived;
+  const released = new Promise(resolve => { release = resolve; });
+  const seen = new Promise(resolve => { arrived = resolve; });
+  await page.route(url => url.pathname === pathname, async route => {
+    arrived(); await released;
+    try { await route.continue(); } catch (_) { /* the page already aborted this request */ }
+  });
+  return { seen, release };
+}
+
+// Enough fictional rows (15 with the seeded 3) for the table to scroll, which makes it a keyboard stop in Chromium.
+async function seedRows(backend) {
+  const samples = Array.from({ length: 12 }, (_, i) => ({ sample_id: randomUUID(), device_id: DEVICE, session_id: randomUUID(), model: "V8", source: "live",
+    received_at: new Date(Date.now() - (i + 5) * 60000).toISOString(), measured_at: null, heart_rate_bpm: 70 + i, missing_reason: null, synthetic: true }));
+  assert.equal((await phonePost(backend, "direct", "/v1/batches", { schema_version: 1, batch_id: randomUUID(), samples })).status, 200);
 }
 
 async function connected(view) {
@@ -228,10 +255,7 @@ async function check(name, action) { await action(); passed++; console.log("PASS
   }));
 
   await check("direct_candidate.py: after a mode change on Refresh, focus moved to the range selector stays and focus on the emptied table goes to Connect", () => withHosted("direct", async (browser, backend) => {
-    // Enough fictional rows for the table to scroll, which makes it a keyboard stop in Chromium.
-    const samples = Array.from({ length: 12 }, (_, i) => ({ sample_id: randomUUID(), device_id: DEVICE, session_id: randomUUID(), model: "V8", source: "live",
-      received_at: new Date(Date.now() - (i + 5) * 60000).toISOString(), measured_at: null, heart_rate_bpm: 70 + i, missing_reason: null, synthetic: true }));
-    assert.equal((await phonePost(backend, "direct", "/v1/batches", { schema_version: 1, batch_id: randomUUID(), samples })).status, 200);
+    await seedRows(backend);
     for (const [tabs, moved, expected] of [[1, "rangeSelect", "rangeSelect"], [2, "table-scroll", "connectButton"]]) {
       const view = await signIn(browser, "direct", CAREGIVER);
       const page = view.page;
@@ -254,28 +278,68 @@ async function check(name, action) { await action(); passed++; console.log("PASS
     }
   }));
 
-  await check("direct_candidate.py: a Refresh after which no watch is listed returns focus from the emptied table to Refresh", () => withHosted("direct", async (browser, backend) => {
-    // Enough fictional rows for the table to scroll, which makes it a keyboard stop in Chromium.
-    const samples = Array.from({ length: 12 }, (_, i) => ({ sample_id: randomUUID(), device_id: DEVICE, session_id: randomUUID(), model: "V8", source: "live",
-      received_at: new Date(Date.now() - (i + 5) * 60000).toISOString(), measured_at: null, heart_rate_bpm: 70 + i, missing_reason: null, synthetic: true }));
-    assert.equal((await phonePost(backend, "direct", "/v1/batches", { schema_version: 1, batch_id: randomUUID(), samples })).status, 200);
+  await check("direct_candidate.py: a mode change answered before Chromium's next frame still moves focus from the disabled Refresh button to Connect", () => withHosted("direct", async browser => {
     const view = await signIn(browser, "direct", CAREGIVER);
     const page = view.page;
-    assert.equal((await connected(view)).count, "15");
-    let release;
-    const held = new Promise(resolve => { release = resolve; });
-    await page.route("**/v1/health", async route => { await held; await route.fulfill({ status: 200, contentType: "application/json",
-      body: JSON.stringify({ status: "ready", schema_version: 1, synthetic_only: true }) }); });
-    await page.route(url => url.pathname === "/v1/devices", route => route.fulfill({ status: 200, contentType: "application/json",
-      body: JSON.stringify({ devices: [], next_cursor: null }) }));
-    await page.focus("#refreshButton");
-    await page.keyboard.press("Enter");
-    for (let i = 0; i < 2; i++) await page.keyboard.press("Tab");
-    assert.equal(await active(page), "table-scroll", "Tab x2 while Refresh waits");
-    release(); await idle(page); await frames(page);
-    assert.match(await text(page, "announcement"), /The previously selected watch is no longer listed, so no watch is shown\.$/);
-    assert.equal(await active(page), "refreshButton", "focus after a Refresh that emptied the table");
+    assert.equal((await connected(view)).count, "3");
+    // Refresh activated without an input event (as an assistive technology's default action can be) and
+    // answered at once, so the answer is handled while the just-disabled button still has focus.
+    const first = await page.evaluate(() => new Promise(resolve => {
+      const real = window.fetch, refresh = document.getElementById("refreshButton");
+      window.fetch = (input, init) => new URL(input, location.href).pathname !== "/v1/health" ? real(input, init)
+        : Promise.resolve(new Response(JSON.stringify({ status: "ready", schema_version: 1, synthetic_only: false }), { status: 200, headers: { "content-type": "application/json" } }));
+      refresh.addEventListener("focusout", event => resolve(event.relatedTarget ? event.relatedTarget.id : "BODY"), { once: true });
+      refresh.focus(); refresh.click();
+      setTimeout(() => resolve("still on Refresh after 5 s"), 5000);
+    }));
+    await idle(page); await frames(page);
+    assert.match(await text(page, "announcement"), /requires a synthetic-only backend/);
+    // Focus went straight from the Refresh button to Connect, not to <body> first.
+    assert.equal(first, "connectButton", "focus left the Refresh button for");
+    assert.equal(await active(page), "connectButton");
+    assert.match(await focusedDescription(page), /Connect again once the backend is synthetic-only/);
     await finish(view);
+  }));
+
+  await check("direct_candidate.py: a Refresh after which no watch is listed returns focus from the emptied table to Refresh, except where the empty table still scrolls", () => withHosted("direct", async (browser, backend) => {
+    await seedRows(backend);
+    for (const [width, height, expected] of [[1280, 720, "refreshButton"], [320, 640, "table-scroll"]]) {
+      const view = await signIn(browser, "direct", CAREGIVER, { viewport: { width, height } });
+      const page = view.page;
+      assert.equal((await connected(view)).count, "15");
+      // Held at the device list, which every Refresh requests, so the check does not rely on Refresh re-reading the mode.
+      const release = await holdAnswer(page, "/v1/devices", { devices: [], next_cursor: null });
+      await page.focus("#refreshButton");
+      await page.keyboard.press("Enter");
+      for (let i = 0; i < 2; i++) await page.keyboard.press("Tab");
+      assert.equal(await active(page), "table-scroll", width + " px: Tab x2 while Refresh waits");
+      release(); await idle(page); await frames(page);
+      assert.match(await text(page, "announcement"), /The previously selected watch is no longer listed, so no watch is shown\.$/);
+      assert.equal(await text(page, "sampleCount"), "—");
+      assert.equal(await active(page), expected, width + " px: focus after a Refresh that emptied the table");
+      await finish(view);
+    }
+  }));
+
+  await check("direct_candidate.py: focus moved to the full table while a Refresh finishes stays there, at any width", () => withHosted("direct", async (browser, backend) => {
+    await seedRows(backend);
+    for (const [width, height] of [[1280, 720], [320, 640]]) {
+      const view = await signIn(browser, "direct", CAREGIVER, { viewport: { width, height } });
+      const page = view.page;
+      assert.equal((await connected(view)).count, "15");
+      // Only the gateway status is outstanding: the new rows are in, and the table scrolls (vertically at 1280 px).
+      const held = await holdRequest(page, "/v1/gateway-status");
+      await page.focus("#refreshButton");
+      await page.keyboard.press("Enter");
+      await held.seen; await frames(page);
+      assert.equal(await page.locator("#historyRows tr").count(), 15);
+      for (let i = 0; i < 2; i++) await page.keyboard.press("Tab");
+      assert.equal(await active(page), "table-scroll", width + " px: Tab x2 to the full table while Refresh waits");
+      held.release(); await idle(page); await frames(page);
+      assert.equal(await page.locator("#historyRows tr").count(), 15);
+      assert.equal(await active(page), "table-scroll", width + " px: focus on the full table after Refresh");
+      await finish(view);
+    }
   }));
 
   console.log(passed + " hosted real-browser checks passed. Headless Chromium with real Basic sign-in against loopback gateway.py and direct_candidate.py; fictional host, credentials and records. Not TLS, proxy, Railway edge, public-domain or deployment validation.");

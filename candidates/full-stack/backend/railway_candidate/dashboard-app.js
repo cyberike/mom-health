@@ -19,8 +19,10 @@
     if (active && active !== document.body && !active.disabled && !(active.closest && active.closest(".table-scroll"))) return;
     described = control; control.setAttribute("aria-describedby", "announcement"); control.focus();
   }
-  // A table scroller that its rows no longer overflow is no longer a keyboard stop: Chromium moves focus from
-  // it to <body> at its next frame.
+  // A table scroller with nothing left to scroll: its scroll sizes, which Chromium rounds to whole pixels, are
+  // within its client sizes. Chromium moves focus from it to <body> at its next frame, except where the rows
+  // still overflow by under half a pixel: it then keeps the table as a Tab stop although nothing scrolls, and
+  // focus on it is handed on all the same.
   function emptiedScroller(element) {
     const scroller = element && element.closest && element.closest(".table-scroll");
     return Boolean(scroller) && scroller.scrollHeight <= scroller.clientHeight && scroller.scrollWidth <= scroller.clientWidth;
@@ -30,7 +32,7 @@
   function setBusy(value) {
     // Disabling the focused control drops keyboard focus to <body>. Remember the
     // control that started an operation and return focus to it afterwards when
-    // focus was lost (or is about to be, on an emptied table) and the control is usable again.
+    // focus was lost, or is on a table with nothing left to scroll, and the control is usable again.
     const starting = value && !busy, ending = busy && !value;
     if (starting) { const current = document.activeElement; focusReturn = current && current !== document.body ? current : null; }
     busy = value; ui.connectButton.disabled = value; ui.refreshButton.disabled = value || mode === "none";

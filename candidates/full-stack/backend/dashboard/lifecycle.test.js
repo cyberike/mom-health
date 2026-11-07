@@ -344,6 +344,20 @@ async function test(name, action) { await action(); passed++; console.log("PASS 
       assert.doesNotMatch(ui.elements.announcement.textContent, /another watch/);
     });
 
+    await test(variant + ": Refresh that finds no watch on a first device page with more says no watch is shown and offers Load more devices", async () => {
+      const api = backend(); const ui = setup(api.handler, fixture);
+      connect(ui); await idle(ui);
+      assert.equal(ui.elements.deviceSelect.value, A);
+      // Not a page this repository's backends send (they give a cursor only with a full page), but the message must still hold.
+      api.override = url => url.startsWith("/v1/devices?") && !url.includes("cursor=") ? json({ devices: [], next_cursor: "synthetic-watch-z" }) : null;
+      ui.elements.refreshButton.click(); await idle(ui);
+      assert.equal(ui.elements.deviceSelect.value, "");
+      assert.equal(ui.elements.moreDevices.hidden, false);
+      assert.equal(ui.elements.moreDevices.disabled, false);
+      assert.match(ui.elements.announcement.textContent, /The previously selected watch is not on the first page of sources, so no watch is shown; use Load more devices to find it\.$/);
+      assert.doesNotMatch(ui.elements.announcement.textContent, /another watch/);
+    });
+
     if (variant === "local") await test("local: a second Connect with the emptied token field never wipes a token session", async () => {
       const token = "synthetic-lifecycle-token-one-0000000000001";
       const api = backend(); const ui = setup(api.handler, fixture);
