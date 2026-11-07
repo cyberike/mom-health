@@ -414,7 +414,7 @@ async function check(name, action) { await action(); passed++; console.log("PASS
       } finally { await stopBackend(own); }
     });
 
-    await check("a data-mode change on Refresh clears the session, names the removed token and returns focus to the token field", async () => {
+    await check("a data-mode change on Refresh clears the session, names the removed token and returns focus to the token field, described by that message only", async () => {
       const view = await open(seeded);
       await connect(view.page);
       // A backend restarted in real-data mode: only /v1/health changes.
@@ -429,6 +429,11 @@ async function check(name, action) { await action(); passed++; console.log("PASS
       assert.equal(await active(view.page), "accessToken");
       assert.match(await focusedDescription(view.page), /Loaded records and the token were removed from this page/, "the token field is described by the message");
       assert.equal(await text(view.page, "modeBadge"), "Not connected");
+      await view.page.click("#clearSession");  // the next message
+      assert.match(await text(view.page, "announcement"), /^Session cleared\./);
+      assert.equal(await view.page.locator("#accessToken").getAttribute("aria-describedby"), null);
+      await view.page.focus("#accessToken");
+      assert.equal(await focusedDescription(view.page), "", "a later message does not describe the token field");
       await close(view);
     });
 
@@ -448,6 +453,48 @@ async function check(name, action) { await action(); passed++; console.log("PASS
         const description = await focusedDescription(view.page);
         if (expected === "accessToken") assert.match(description, /Enter the token and connect again/);
         else assert.doesNotMatch(description, /connect again/);
+        await close(view);
+      }
+    });
+
+    await check("a mode change answered before Chromium's next frame still moves focus from the disabled Refresh button to the token field", async () => {
+      const view = await open(seeded);
+      await connect(view.page);
+      // Refresh activated without an input event (as an assistive technology's default action can be) and
+      // answered at once, so the answer is handled while the just-disabled button still has focus.
+      const first = await view.page.evaluate(() => new Promise(resolve => {
+        const real = window.fetch, refresh = document.getElementById("refreshButton");
+        window.fetch = (input, init) => new URL(input, location.href).pathname !== "/v1/health" ? real(input, init)
+          : Promise.resolve(new Response(JSON.stringify({ status: "ready", schema_version: 1, synthetic_only: false }), { status: 200, headers: { "content-type": "application/json" } }));
+        refresh.addEventListener("focusout", event => resolve(event.relatedTarget ? event.relatedTarget.id : "BODY"), { once: true });
+        refresh.focus(); refresh.click();
+        setTimeout(() => resolve("still on Refresh after 5 s"), 5000);
+      }));
+      await idle(view.page); await frames(view.page);
+      assert.match(await text(view.page, "announcement"), /now accepts real watch data/);
+      // Focus went straight from the Refresh button to the token field, not to <body> first.
+      assert.equal(first, "accessToken", "focus left the Refresh button for");
+      assert.equal(await active(view.page), "accessToken");
+      assert.match(await focusedDescription(view.page), /Enter the token and connect again/);
+      await close(view);
+    });
+
+    await check("a Refresh that empties the table returns focus to Refresh, except where the empty table still scrolls", async () => {
+      // No watch is listed any more (a backend restarted on a fresh database, say) while the user is on the table.
+      for (const [width, height, expected] of [[1280, 900, "refreshButton"], [320, 640, "table-scroll"]]) {
+        const view = await open(seeded, { viewport: { width, height } });
+        await connect(view.page);
+        const release = await holdHealth(view.page, { status: "ready", schema_version: 1, synthetic_only: true });
+        await view.page.route(url => url.pathname === "/v1/devices", route => route.fulfill({ status: 200, contentType: "application/json",
+          body: JSON.stringify({ devices: [], next_cursor: null }) }));
+        await view.page.focus("#refreshButton");
+        await view.page.keyboard.press("Enter");
+        for (let i = 0; i < 2; i++) await view.page.keyboard.press("Tab");
+        assert.equal(await active(view.page), "table-scroll", width + " px: Tab x2 while Refresh waits");
+        release(); await idle(view.page); await frames(view.page);
+        assert.match(await text(view.page, "announcement"), /The previously selected watch is no longer listed, so no watch is shown\.$/);
+        assert.equal(await text(view.page, "sampleCount"), "—");
+        assert.equal(await active(view.page), expected, width + " px: focus after a Refresh that emptied the table");
         await close(view);
       }
     });

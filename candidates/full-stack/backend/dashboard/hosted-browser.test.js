@@ -206,7 +206,7 @@ async function check(name, action) { await action(); passed++; console.log("PASS
     await finish(view);
   }));
 
-  await check("direct_candidate.py: a switch to real-data mode on Refresh clears the hosted session and returns focus to Connect", () => withHosted("direct", async browser => {
+  await check("direct_candidate.py: a switch to real-data mode on Refresh clears the hosted session and returns focus to Connect, described by that message only", () => withHosted("direct", async browser => {
     const view = await signIn(browser, "direct", CAREGIVER);
     const page = view.page;
     assert.equal((await connected(view)).count, "3");
@@ -219,6 +219,11 @@ async function check(name, action) { await action(); passed++; console.log("PASS
     assert.match(await text(page, "announcement"), /This hosted candidate requires a synthetic-only backend, so loaded records were removed from this page and no records were requested\. Connect again once the backend is synthetic-only\./);
     assert.equal(await page.evaluate(() => document.activeElement.id), "connectButton");
     assert.match(await focusedDescription(page), /Connect again once the backend is synthetic-only/, "the Connect button is described by the message");
+    await page.click("#clearSession");  // the next message
+    assert.match(await text(page, "announcement"), /^Displayed session cleared\./);
+    assert.equal(await page.locator("#connectButton").getAttribute("aria-describedby"), null);
+    await page.focus("#connectButton");
+    assert.equal(await focusedDescription(page), "", "a later message does not describe the Connect button");
     await finish(view);
   }));
 
@@ -247,6 +252,30 @@ async function check(name, action) { await action(); passed++; console.log("PASS
       else assert.doesNotMatch(description, /Connect again/);
       await finish(view);
     }
+  }));
+
+  await check("direct_candidate.py: a Refresh after which no watch is listed returns focus from the emptied table to Refresh", () => withHosted("direct", async (browser, backend) => {
+    // Enough fictional rows for the table to scroll, which makes it a keyboard stop in Chromium.
+    const samples = Array.from({ length: 12 }, (_, i) => ({ sample_id: randomUUID(), device_id: DEVICE, session_id: randomUUID(), model: "V8", source: "live",
+      received_at: new Date(Date.now() - (i + 5) * 60000).toISOString(), measured_at: null, heart_rate_bpm: 70 + i, missing_reason: null, synthetic: true }));
+    assert.equal((await phonePost(backend, "direct", "/v1/batches", { schema_version: 1, batch_id: randomUUID(), samples })).status, 200);
+    const view = await signIn(browser, "direct", CAREGIVER);
+    const page = view.page;
+    assert.equal((await connected(view)).count, "15");
+    let release;
+    const held = new Promise(resolve => { release = resolve; });
+    await page.route("**/v1/health", async route => { await held; await route.fulfill({ status: 200, contentType: "application/json",
+      body: JSON.stringify({ status: "ready", schema_version: 1, synthetic_only: true }) }); });
+    await page.route(url => url.pathname === "/v1/devices", route => route.fulfill({ status: 200, contentType: "application/json",
+      body: JSON.stringify({ devices: [], next_cursor: null }) }));
+    await page.focus("#refreshButton");
+    await page.keyboard.press("Enter");
+    for (let i = 0; i < 2; i++) await page.keyboard.press("Tab");
+    assert.equal(await active(page), "table-scroll", "Tab x2 while Refresh waits");
+    release(); await idle(page); await frames(page);
+    assert.match(await text(page, "announcement"), /The previously selected watch is no longer listed, so no watch is shown\.$/);
+    assert.equal(await active(page), "refreshButton", "focus after a Refresh that emptied the table");
+    await finish(view);
   }));
 
   console.log(passed + " hosted real-browser checks passed. Headless Chromium with real Basic sign-in against loopback gateway.py and direct_candidate.py; fictional host, credentials and records. Not TLS, proxy, Railway edge, public-domain or deployment validation.");

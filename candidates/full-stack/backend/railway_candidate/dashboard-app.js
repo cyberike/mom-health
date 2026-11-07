@@ -11,19 +11,26 @@
   const timeFormat = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" });
   function say(message, error = false) { if (described) { described.removeAttribute("aria-describedby"); described = null; } ui.announcement.textContent = message; ui.announcement.classList.toggle("error", error); errorShown = error; }
   // Keyboard focus that was lost continues at the Connect form, which the current message then describes
-  // for screen readers. The disabled Refresh button drops focus to <body>, and an emptied table scroller
-  // stays focused until Chromium moves focus to <body> later. Focus the user moved elsewhere stays put.
+  // for screen readers. Focus is lost on <body>, and on a disabled control: the Refresh button that started
+  // the operation keeps focus until Chromium's next frame. Focus on the readings table, which the mode change
+  // has just emptied, continues there too, at any width. Focus the user moved elsewhere stays put.
   function continueAtConnect(control) {
     const active = document.activeElement;
-    if (active && active !== document.body && !(active.closest && active.closest(".table-scroll"))) return;
+    if (active && active !== document.body && !active.disabled && !(active.closest && active.closest(".table-scroll"))) return;
     described = control; control.setAttribute("aria-describedby", "announcement"); control.focus();
+  }
+  // A table scroller that its rows no longer overflow is no longer a keyboard stop: Chromium moves focus from
+  // it to <body> at its next frame.
+  function emptiedScroller(element) {
+    const scroller = element && element.closest && element.closest(".table-scroll");
+    return Boolean(scroller) && scroller.scrollHeight <= scroller.clientHeight && scroller.scrollWidth <= scroller.clientWidth;
   }
   function localTime(value) { return dateFormat.format(new Date(value)); }
   function currentDevice() { return devices.find(d => d.device_id === selectedId) || null; }
   function setBusy(value) {
     // Disabling the focused control drops keyboard focus to <body>. Remember the
     // control that started an operation and return focus to it afterwards when
-    // focus was lost and the control is usable again.
+    // focus was lost (or is about to be, on an emptied table) and the control is usable again.
     const starting = value && !busy, ending = busy && !value;
     if (starting) { const current = document.activeElement; focusReturn = current && current !== document.body ? current : null; }
     busy = value; ui.connectButton.disabled = value; ui.refreshButton.disabled = value || mode === "none";
@@ -33,7 +40,7 @@
     ui.connectForm.setAttribute("aria-busy", String(value));
     if (ending) {
       const target = focusReturn, current = document.activeElement; focusReturn = null;
-      if (target && target.isConnected && !target.disabled && !target.hidden && (!current || current === document.body)) target.focus();
+      if (target && target.isConnected && !target.disabled && !target.hidden && (!current || current === document.body || emptiedScroller(current))) target.focus();
     }
   }
   function clearSession(notify = true) {
@@ -218,7 +225,7 @@
         continueAtConnect(ui.connectButton);
         return;
       }
-      seenDeviceCursors.clear(); await loadDevices(epoch, true); const moved = previous && selectedId !== previous; if (selectedId) { await loadSamplePage(epoch, true); await loadGatewayStatus(epoch); } ui.sourceStatus.textContent = "Backend checked: " + localTime(new Date().toISOString()) + " · No automatic polling"; say("Refreshed saved backend records and any gateway status report. Reported status is not proof of a current connection." + (moved ? (deviceCursor ? " The previously selected watch is not on the first page of sources, so another watch is shown; use Load more devices to find it." : " The previously selected watch is no longer listed, so another watch is shown.") : "")); });
+      seenDeviceCursors.clear(); await loadDevices(epoch, true); const moved = previous && selectedId !== previous, shown = selectedId ? "another watch is shown" : "no watch is shown"; if (selectedId) { await loadSamplePage(epoch, true); await loadGatewayStatus(epoch); } ui.sourceStatus.textContent = "Backend checked: " + localTime(new Date().toISOString()) + " · No automatic polling"; say("Refreshed saved backend records and any gateway status report. Reported status is not proof of a current connection." + (moved ? (deviceCursor ? " The previously selected watch is not on the first page of sources, so " + shown + "; use Load more devices to find it." : " The previously selected watch is no longer listed, so " + shown + ".") : "")); });
   });
   ui.moreDevices.addEventListener("click", () => { if (mode === "backend" && deviceCursor) operation(epoch => loadDevices(epoch, false)); });
   ui.loadMore.addEventListener("click", () => { if (mode === "backend" && sampleCursor && rows.length < core.MAX_SAMPLES) operation(epoch => loadSamplePage(epoch, false)); });

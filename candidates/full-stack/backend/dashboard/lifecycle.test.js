@@ -330,7 +330,18 @@ async function test(name, action) { await action(); passed++; console.log("PASS 
       ui.elements.refreshButton.click(); await idle(ui);
       assert.equal(ui.elements.deviceSelect.value, A);
       assert.match(ui.elements.announcement.textContent, /previously selected watch/);
-      assert.match(ui.elements.announcement.textContent, /Load more devices/);
+      assert.match(ui.elements.announcement.textContent, /so another watch is shown; use Load more devices/);
+    });
+
+    await test(variant + ": Refresh never claims another watch is shown when none is listed any more", async () => {
+      const api = backend(); const ui = setup(api.handler, fixture);
+      connect(ui); await idle(ui);
+      assert.equal(ui.elements.deviceSelect.value, A);
+      api.override = url => url.startsWith("/v1/devices?") ? json({ devices: [], next_cursor: null }) : null;
+      ui.elements.refreshButton.click(); await idle(ui);
+      assert.equal(ui.elements.deviceSelect.value, "");
+      assert.match(ui.elements.announcement.textContent, /The previously selected watch is no longer listed, so no watch is shown\.$/);
+      assert.doesNotMatch(ui.elements.announcement.textContent, /another watch/);
     });
 
     if (variant === "local") await test("local: a second Connect with the emptied token field never wipes a token session", async () => {
@@ -447,11 +458,13 @@ async function test(name, action) { await action(); passed++; console.log("PASS 
       assert.equal(form.getAttribute("aria-describedby"), null, "a later message no longer describes it");
     });
 
-    await test(variant + ": after a mode change, focus the user moved stays put and an emptied table scroller hands it on", async () => {
-      // The user moves focus while Refresh waits for /v1/health: to the range selector (still usable), or to
-      // the table scroller that clearSession then empties (Chromium moves focus off it only later).
+    await test(variant + ": after a mode change, focus the user moved stays put; on the emptied table or the disabled Refresh button it is handed on", async () => {
+      // While Refresh waits for /v1/health, focus is on the range selector (the user moved it; still usable), on
+      // the table scroller that clearSession then empties, or still on the disabled Refresh button, which
+      // Chromium blurs only at its next frame: a fast answer can be handled before that.
       for (const [where, moved] of [["range selector", ui => ui.elements.rangeSelect],
-                                    ["table scroller", ui => Object.assign(ui.document.createElement("div"), { className: "table-scroll" })]]) {
+                                    ["table scroller", ui => Object.assign(ui.document.createElement("div"), { className: "table-scroll" })],
+                                    ["disabled Refresh button", ui => ui.elements.refreshButton]]) {
         const api = backend(); const ui = setup(api.handler, fixture);
         connect(ui, variant === "local" ? "synthetic-lifecycle-token-mode-00000000000002" : ""); await idle(ui);
         api.override = url => url === "/v1/health" ? json({ status: "ready", schema_version: 1, synthetic_only: false }) : null;
@@ -459,6 +472,7 @@ async function test(name, action) { await action(); passed++; console.log("PASS 
         ui.elements.refreshButton.click(); await ticks();
         assert.equal(api.held.length, 1, where);
         const target = moved(ui); ui.document.activeElement = target;
+        if (where === "disabled Refresh button") assert.equal(target.disabled, true, where);
         api.hold = () => false; api.held.shift().release(); await idle(ui);
         const form = variant === "local" ? ui.elements.accessToken : ui.elements.connectButton;
         assert.match(ui.elements.announcement.textContent, /real watch data/, where);
