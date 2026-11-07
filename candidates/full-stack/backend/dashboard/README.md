@@ -12,6 +12,7 @@ Buildless original HTML/CSS/JavaScript, served by the existing FastAPI backend a
 - Explicit last-reported gateway status from `/v1/gateway-status`: connection state, nullable battery, pending/uploaded phone counts, recording flag, gateway report time and backend receipt time. Absent reports remain unavailable. In real-data mode the backend serves the real gateway's report whenever one exists; a synthetic test report appears only without one and is labeled as synthetic. A report never becomes a current-online claim; receipt age is not a clinical freshness threshold or proof of wear.
 - Explicit synthetic preview generated locally, marked in the banner and metrics. It makes no API call and is never sent to the server. Initial state is empty, not a fabricated patient overview.
 - Clear session removes loaded records/token and cancels outstanding requests. Leaving the page clears the in-memory session. No automatic polling, upload, background activity or browser persistence.
+- Refresh first re-checks `/v1/health`. If the backend's data mode changed since Connect (synthetic-only or real data), the session is cleared and nothing is requested under the new mode; connect again deliberately.
 
 The backend enforces loopback and API authorization. Static HTML/JS/CSS shell can be served without the token so a caregiver can enter it; the shell contains no health data. This is not public hosting or a production multi-user identity system. No ongoing-access credential has been generated or configured.
 

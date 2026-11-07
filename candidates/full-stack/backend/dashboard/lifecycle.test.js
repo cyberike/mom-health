@@ -364,6 +364,37 @@ async function test(name, action) { await action(); passed++; console.log("PASS 
         assert.equal(ui.elements.watchBattery.textContent, "47% - last reported");
       });
     }
+
+    await test(variant + ": Refresh re-checks the data mode and requests no records after it changed", async () => {
+      const api = backend(); const ui = setup(api.handler, fixture);
+      connect(ui); await idle(ui);
+      assert.equal(shown(ui), 3);
+      api.override = url => url === "/v1/health" ? json({ status: "ready", schema_version: 1, synthetic_only: false }) : null;
+      const before = ui.calls.length;
+      ui.elements.refreshButton.click(); await idle(ui);
+      assert.deepEqual(ui.calls.slice(before).map(c => c.url), ["/v1/health"]);
+      assert.match(ui.elements.announcement.textContent, /data mode changed since you connected: it now accepts real watch data\. Loaded records were removed/);
+      assert.equal(ui.elements.modeBadge.textContent, "Not connected");
+      assert.equal(shown(ui), 0);
+      assert.equal(ui.elements.watchLink.textContent, "Not reported");
+      assert.equal(ui.elements.refreshButton.disabled, true);
+    });
+
+    if (variant === "local") await test("local: Refresh after the backend left real-data mode ends the session too", async () => {
+      const api = backend(); const ui = setup(api.handler, fixture);
+      let synthetic = false;
+      api.override = url => url === "/v1/health" ? json({ status: "ready", schema_version: 1, synthetic_only: synthetic }) : null;
+      connect(ui); await idle(ui);
+      assert.equal(ui.elements.modeBadge.textContent, "Private backend data");
+      assert.equal(shown(ui), 3);
+      ui.elements.refreshButton.click(); await idle(ui);
+      assert.match(ui.elements.announcement.textContent, /Refreshed saved backend records/, "an unchanged mode refreshes as before");
+      synthetic = true;
+      ui.elements.refreshButton.click(); await idle(ui);
+      assert.match(ui.elements.announcement.textContent, /it now accepts synthetic test data only/);
+      assert.equal(ui.elements.modeBadge.textContent, "Not connected");
+      assert.equal(shown(ui), 0);
+    });
   }
   console.log("\n" + passed + " simulated lifecycle checks passed across the local and hosted dashboards. Not a browser; no network or real data.");
 })().catch(error => { console.error(error); process.exitCode = 1; });

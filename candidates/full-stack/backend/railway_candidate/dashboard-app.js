@@ -68,6 +68,11 @@
     catch (error) { if (epoch === generation) say(error.name === "AbortError" ? (mode === "backend" ? "Request timed out or was cancelled. Refresh explicitly to try again; no automatic retry occurs." : "Request timed out or was cancelled. Connect again to retry; no automatic retry occurs.") : error.message || "Data could not be loaded.", true); }
     finally { if (epoch === generation) setBusy(false); }
   }
+  async function readHealth(epoch) {
+    const health = await request("/v1/health", epoch);
+    if (!health || health.schema_version !== 1 || typeof health.synthetic_only !== "boolean" || health.status !== "ready") throw new Error("Backend contract is not supported.");
+    return health;
+  }
   function renderDevices() {
     ui.deviceSelect.replaceChildren();
     if (!devices.length) { const option = document.createElement("option"); option.value = ""; option.textContent = "No watch data loaded"; ui.deviceSelect.append(option); }
@@ -163,8 +168,7 @@
     // wipe the session and retry without the token.
     if (!entered && token && mode === "backend") { say("Already connected with the token entered earlier. Use Refresh to check for new records, or Clear session before connecting with another token."); return; }
     clearSession(false); if (entered && !/^[A-Za-z0-9._~+/=-]{32,4096}$/.test(entered)) { say("Token format is invalid. No request was made.", true); return; } token = entered;
-    operation(async epoch => { const health = await request("/v1/health", epoch);
-      if (health.schema_version !== 1 || typeof health.synthetic_only !== "boolean" || health.status !== "ready") throw new Error("Backend contract is not supported.");
+    operation(async epoch => { const health = await readHealth(epoch);
       // This hosted candidate is explicitly synthetic-only. Never request device
       // records if a backend advertises that it accepts real health data.
       if (!health.synthetic_only) throw new Error("This candidate requires a synthetic-only backend; no records were requested.");
@@ -187,7 +191,11 @@
   ui.refreshButton.addEventListener("click", () => {
     if (mode === "demo") { ui.demoButton.click(); return; }
     if (mode !== "backend") return;
-    operation(async epoch => { const previous = selectedId; gateway = null; statusLoaded = false; render(); seenDeviceCursors.clear(); await loadDevices(epoch, true); const moved = previous && selectedId !== previous; if (selectedId) { await loadSamplePage(epoch, true); await loadGatewayStatus(epoch); } ui.sourceStatus.textContent = "Backend checked: " + localTime(new Date().toISOString()) + " · No automatic polling"; say("Refreshed saved backend records and any gateway status report. Reported status is not proof of a current connection." + (moved ? (deviceCursor ? " The previously selected watch is not on the first page of sources, so another watch is shown; use Load more devices to find it." : " The previously selected watch is no longer listed, so another watch is shown.") : "")); });
+    operation(async epoch => { const previous = selectedId; gateway = null; statusLoaded = false; render();
+      // Re-check the data mode first: records are never shown under a mode other than the one this session connected with.
+      const health = await readHealth(epoch);
+      if (health.synthetic_only !== syntheticOnly) { clearSession(false); say("The backend's data mode changed since you connected: it now " + (health.synthetic_only ? "accepts synthetic test data only" : "accepts real watch data") + ". Loaded records were removed from this page. Connect again to continue.", true); return; }
+      seenDeviceCursors.clear(); await loadDevices(epoch, true); const moved = previous && selectedId !== previous; if (selectedId) { await loadSamplePage(epoch, true); await loadGatewayStatus(epoch); } ui.sourceStatus.textContent = "Backend checked: " + localTime(new Date().toISOString()) + " · No automatic polling"; say("Refreshed saved backend records and any gateway status report. Reported status is not proof of a current connection." + (moved ? (deviceCursor ? " The previously selected watch is not on the first page of sources, so another watch is shown; use Load more devices to find it." : " The previously selected watch is no longer listed, so another watch is shown.") : "")); });
   });
   ui.moreDevices.addEventListener("click", () => { if (mode === "backend" && deviceCursor) operation(epoch => loadDevices(epoch, false)); });
   ui.loadMore.addEventListener("click", () => { if (mode === "backend" && sampleCursor && rows.length < core.MAX_SAMPLES) operation(epoch => loadSamplePage(epoch, false)); });
