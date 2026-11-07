@@ -13,6 +13,7 @@ Original implementation staged independently from the working Android release. N
 - POST /v1/batches: malformed requests receive 422 before mutation; oversized body 413; unavailable storage 503 without acknowledgment. Collision reason: sample_id_collision.
 - GET /v1/samples?device_id=opaque-id&limit=25&cursor=... returns {samples:[contract samples], next_cursor:string|null}. Pagination follows insertion order, not inferred measurement time. Concurrent appends may appear on later pages.
 - GET /v1/health returns readiness after schema initialization, schema_version and synthetic_only. This is process readiness, not a continuous database probe.
+- POST /v1/gateway-status stores the latest synthetic and the latest real report per device; GET /v1/gateway-status?device_id=... serves the real gateway's report whenever one exists in real-data mode (a synthetic test report never hides it) and synthetic reports only in synthetic-only mode.
 - Loopback-only launcher and request boundary. Proxy forwarding headers disabled. Synthetic-only default. Real-data mode refuses startup without an explicitly supplied access token; all endpoints require that token when configured. Remote peers always rejected even with a token. No credentials generated or configured. No CORS enabled.
 
 ## Local test and service commands

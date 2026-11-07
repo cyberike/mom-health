@@ -126,10 +126,12 @@ class DeviceIsolationTests(unittest.TestCase):
             with self.subTest(opaque=opaque):
                 self.ok(client.post('/v1/batches', json=batch(sample(device_id=opaque))))
 
-    def test_gateway_status_returns_the_newest_report_even_at_a_whole_second(self):
-        # Real-data mode keeps one synthetic and one real report per device and
-        # must return whichever arrived last. A report saved at an exact second
-        # previously serialized without a fraction and sorted as "newer".
+    def test_real_data_mode_serves_the_real_gateway_report_over_a_synthetic_one(self):
+        # Real-data mode keeps one synthetic and one real report per device. A
+        # synthetic test report, even one received later, must not hide the
+        # real gateway's report. Receipt times stay fixed-width, so a report
+        # saved at an exact second still sorts before a later one (it once
+        # serialized without a fraction and sorted as "newer").
         whole = datetime(2026, 11, 3, 12, 0, 0, 0, tzinfo=timezone.utc)
         later = datetime(2026, 11, 3, 12, 0, 0, 500000, tzinfo=timezone.utc)
         for first, second in ((True, False), (False, True)):
@@ -140,10 +142,15 @@ class DeviceIsolationTests(unittest.TestCase):
                     saved = [self.ok(client.post('/v1/gateway-status', json=status(device, battery_percent=battery, synthetic=flag)))
                              for flag, battery in ((first, 11), (second, 99))]
                 self.assertLess(saved[0]['server_received_at'], saved[1]['server_received_at'])
+                real = 1 if first else 0
                 current = self.ok(client.get('/v1/gateway-status', params={'device_id': device}))
-                self.assertEqual((99, second), (current['status']['battery_percent'], current['status']['synthetic']))
-                self.assertEqual(saved[1]['server_received_at'], current['server_received_at'])
-
+                self.assertEqual(((11, 99)[real], False), (current['status']['battery_percent'], current['status']['synthetic']))
+                self.assertEqual(saved[real]['server_received_at'], current['server_received_at'])
+        # Without a real report, the synthetic one is served and marked synthetic.
+        client = self.open(allow_real_data=True)
+        self.ok(client.post('/v1/gateway-status', json=status('synthetic-test-only', battery_percent=5)))
+        current = self.ok(client.get('/v1/gateway-status', params={'device_id': 'synthetic-test-only'}))['status']
+        self.assertEqual((5, True), (current['battery_percent'], current['synthetic']))
 
 if __name__ == '__main__':
     unittest.main()

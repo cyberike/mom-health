@@ -183,7 +183,11 @@ class Repository:
         connection=self.connect()
         try:
             policy="" if allow_real else " AND synthetic=1"
-            row=self.execute(connection,"SELECT canonical,server_received_at FROM gateway_status WHERE device_id=?"+policy+" ORDER BY server_received_at DESC LIMIT 1",(device,)).fetchone()
+            # A device has at most one real and one synthetic report. Real-data
+            # mode serves the real gateway's report whenever one exists, so a
+            # later synthetic test report never hides it; synthetic-only mode
+            # serves synthetic reports only.
+            row=self.execute(connection,"SELECT canonical,server_received_at FROM gateway_status WHERE device_id=?"+policy+" ORDER BY synthetic LIMIT 1",(device,)).fetchone()
             return dict(status=json.loads(row[0]),server_received_at=row[1]) if row else dict(status=None,server_received_at=None)
         finally:
             connection.close()
