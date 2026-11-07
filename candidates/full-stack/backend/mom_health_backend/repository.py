@@ -143,7 +143,10 @@ class Repository:
         try:
             policy = "" if allow_real else " AND synthetic=1"
             selection="" if allow_real else " WHERE synthetic=1"
-            groups=self.execute(connection,"SELECT device_id FROM (SELECT device_id FROM samples"+selection+" UNION SELECT device_id FROM gateway_status"+selection+") AS known_devices WHERE device_id>? ORDER BY device_id LIMIT ?",(cursor or "",limit+1)).fetchall()
+            # Byte order on both backends (SQLite's default), so the listing and
+            # its cursor do not depend on a PostgreSQL database's locale.
+            order=' COLLATE "C"' if self.postgres else ""
+            groups=self.execute(connection,"SELECT device_id FROM (SELECT device_id FROM samples"+selection+" UNION SELECT device_id FROM gateway_status"+selection+") AS known_devices WHERE device_id"+order+">? ORDER BY device_id"+order+" LIMIT ?",(cursor or "",limit+1)).fetchall()
             result=[]
             for (device,) in groups[:limit]:
                 count,seq=self.execute(connection,"SELECT COUNT(*),MAX(seq) FROM samples WHERE device_id=?"+policy,(device,)).fetchone()
@@ -156,9 +159,17 @@ class Repository:
     def save_status(self,status,allow_real=False):
         if not status.synthetic and not allow_real:
             raise ValueError("real_data_disabled")
-        now=datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
         connection=self.connect()
         try:
+            # Take the receipt time only while holding the write lock, so the
+            # stored report is always the latest one acknowledged. Fixed-width
+            # microseconds keep TEXT order chronological for status():
+            # isoformat() drops a zero fraction ("...:00Z" sorts after "...:00.5Z").
+            if self.postgres:
+                connection.execute("SELECT pg_advisory_xact_lock(7240090003)")
+            else:
+                connection.execute("BEGIN IMMEDIATE")
+            now=datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00","Z")
             self.execute(connection,"INSERT INTO gateway_status(device_id,synthetic,canonical,server_received_at) VALUES (?,?,?,?) ON CONFLICT(device_id,synthetic) DO UPDATE SET canonical=excluded.canonical,server_received_at=excluded.server_received_at",(status.device_id,int(status.synthetic),canonical(status.model_dump()),now))
             connection.commit()
             return dict(accepted=True,server_received_at=now)
@@ -172,7 +183,11 @@ class Repository:
         connection=self.connect()
         try:
             policy="" if allow_real else " AND synthetic=1"
-            row=self.execute(connection,"SELECT canonical,server_received_at FROM gateway_status WHERE device_id=?"+policy+" ORDER BY server_received_at DESC LIMIT 1",(device,)).fetchone()
+            # A device has at most one real and one synthetic report. Real-data
+            # mode serves the real gateway's report whenever one exists, so a
+            # later synthetic test report never hides it; synthetic-only mode
+            # serves synthetic reports only.
+            row=self.execute(connection,"SELECT canonical,server_received_at FROM gateway_status WHERE device_id=?"+policy+" ORDER BY synthetic LIMIT 1",(device,)).fetchone()
             return dict(status=json.loads(row[0]),server_received_at=row[1]) if row else dict(status=None,server_received_at=None)
         finally:
             connection.close()
@@ -199,4 +214,17 @@ class PostgreSQLRepository(Repository):
             import psycopg
         except ImportError as exc:
             raise RuntimeError("PostgreSQL requires the separately approved psycopg dependency") from exc
-        return psycopg.connect(self.dsn, connect_timeout=5)
+        connection = psycopg.connect(self.dsn, connect_timeout=5)
+        try:
+            # Every operation is one transaction on its own connection. READ
+            # COMMITTED whatever the server or role default, so each statement
+            # after an advisory lock sees the previous holder's commit; and lock
+            # waits bounded like SQLite's 5 s busy timeout, so a stuck holder is
+            # answered 503 instead of holding a worker indefinitely. SET LOCAL
+            # also works behind transaction-pooling proxies.
+            connection.isolation_level = psycopg.IsolationLevel.READ_COMMITTED
+            connection.execute("SET LOCAL lock_timeout = '5s'")
+        except BaseException:
+            connection.close()
+            raise
+        return connection

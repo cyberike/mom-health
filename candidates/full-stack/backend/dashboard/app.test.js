@@ -25,7 +25,8 @@ function setup(handler, fixture = {}) {
   elements.rangeSelect.value = "all";
   const calls = [], lifecycle = {};
   const window = { MomHealthDashboard: core, addEventListener(event, action) { lifecycle[event] = action; } };
-  const context = { window, document: { getElementById: id => elements[id], createElement: tag => new Element(tag), createElementNS: (namespace, tag) => new Element(tag) }, location: { protocol: "http:" }, URLSearchParams, AbortController, TextDecoder, Uint8Array, Intl, Date, setTimeout, clearTimeout,
+  const context = { window, document: { getElementById: id => elements[id], createElement: tag => new Element(tag), createElementNS: (namespace, tag) => new Element(tag) }, location: { protocol: "http:" }, URLSearchParams, AbortController, TextDecoder, Uint8Array, Intl, Date,
+    setTimeout: fixture.setTimeout || setTimeout, clearTimeout: fixture.clearTimeout || clearTimeout,
     fetch: async (url, options) => { calls.push({ url, options }); return handler(url, options); } };
   vm.runInNewContext(script, context, { filename: "app.js" });
   return { elements, calls, lifecycle };
@@ -83,6 +84,25 @@ if (require.main === module) (async () => {
   });
   await test("clear session aborts pending request and excludes late callbacks", async () => {
     let release; const ui = setup(() => new Promise(resolve => { release = resolve; })); connect(ui); assert(ui.elements.connectButton.disabled); const signal = ui.calls[0].options.signal; ui.elements.clearSession.click(); assert(signal.aborted); release(json({ status: "ready", schema_version: 1, synthetic_only: true })); await new Promise(resolve => setImmediate(resolve)); assert.equal(ui.elements.modeBadge.textContent, "Not connected"); assert.equal(ui.elements.latestBpm.textContent, "—"); assert.equal(ui.calls.length, 1);
+  });
+  await test("backend records and reports are labeled synthetic wherever they are shown", async () => {
+    // Real-data mode may hold both kinds; the table already labels each row, and
+    // the hero and status cards must not present a synthetic record as real.
+    const data = core.demoData(); const device = data.devices[0]; const now = new Date().toISOString();
+    for (const synthetic of [true, false]) {
+      const latest = { ...data.samples[23], synthetic };
+      const ui = setup(url => {
+        if (url === "/v1/health") return json({ status: "ready", schema_version: 1, synthetic_only: false });
+        if (url.startsWith("/v1/devices?")) return json({ devices: [{ ...device, latest }], next_cursor: null });
+        if (url.startsWith("/v1/samples?")) return json({ samples: [latest], next_cursor: null });
+        return json({ status: { schema_version: 1, device_id: device.device_id, model: "V8", connection: "connected", battery_percent: 50, pending_samples: 0, uploaded_samples: 1, reported_at: now, last_observation_at: null, synthetic, recording_enabled: true }, server_received_at: now });
+      });
+      connect(ui, "synthetic-fixture-token-not-a-secret"); await idle(ui);
+      assert.equal(ui.elements.modeBadge.textContent, "Private backend data");
+      assert.equal(/Synthetic test record/.test(ui.elements.latestLabel.textContent), synthetic, ui.elements.latestLabel.textContent);
+      assert.equal(/Synthetic test report/.test(ui.elements.statusReportTime.textContent), synthetic, ui.elements.statusReportTime.textContent);
+      assert.equal(ui.elements.historyRows.children[0].children[2].textContent.includes(synthetic ? "synthetic" : "watch-reported"), true);
+    }
   });
   process.stdout.write("\n" + passed + " simulated UI-flow checks passed. Not visual/browser QA; no network or real data.\n");
 })().catch(error => { console.error(error); process.exitCode = 1; });

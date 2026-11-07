@@ -106,6 +106,20 @@
     if (age < 86400000) return Math.floor(age / 3600000) + " hr ago";
     return Math.floor(age / 86400000) + " days ago";
   }
+  // Retry-After is delta-seconds or an HTTP date (RFC 9110). Returns a wait such
+  // as "about 45 seconds", or "" when the header is absent or unusable.
+  function retryAfterLabel(value, now = Date.now()) {
+    const text = typeof value === "string" ? value.trim() : "";
+    if (!text) return "";
+    // Only the IMF-fixdate form servers must send is read as a date.
+    const date = /^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT$/.test(text);
+    const seconds = Math.ceil(/^\d+$/.test(text) ? Number(text) : date ? (Date.parse(text) - now) / 1000 : NaN);
+    if (!Number.isFinite(seconds)) return "";
+    if (seconds <= 1) return "a moment";
+    if (seconds < 90) return "about " + seconds + " seconds";
+    if (seconds < 5400) return "about " + Math.ceil(seconds / 60) + " minutes";
+    return seconds <= 86400 ? "about " + Math.ceil(seconds / 3600) + " hours" : "more than a day";
+  }
   function demoData(now = Date.now()) {
     const deviceId = "synthetic-v8-preview";
     const rates = [74, 75, 76, 74, 73, 73, 72, null, 74, 75, 74, 73, 74, 76, 75, 74, 73, 72, 74, 74, 75, 74, 73, 74];
@@ -117,5 +131,5 @@
     }));
     return { devices: [{ device_id: deviceId, sample_count: samples.length, latest: samples[samples.length - 1] }], samples };
   }
-  return { MAX_SAMPLES, MAX_DEVICES, sample, samplePage, devicePage, gatewayStatus, appendUnique, filterRows, ageLabel, demoData };
+  return { MAX_SAMPLES, MAX_DEVICES, sample, samplePage, devicePage, gatewayStatus, appendUnique, filterRows, ageLabel, retryAfterLabel, demoData };
 }));

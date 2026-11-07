@@ -47,6 +47,9 @@ class Settings:
         return cls(sqlite_path=os.environ.get("MOM_HEALTH_SQLITE_PATH", "mom-health-synthetic.sqlite3"), database_url=os.environ.get("MOM_HEALTH_DATABASE_URL"), allow_real_data=raw == "true", access_token=os.environ.get("MOM_HEALTH_ACCESS_TOKEN"), hosted_hostname=os.environ.get("MOM_HEALTH_HOSTED_HOSTNAME") or None)
 
 
+SECURITY_HEADERS = [(b"cache-control", b"no-store"), (b"x-content-type-options", b"nosniff"), (b"referrer-policy", b"no-referrer"), (b"x-frame-options", b"DENY"), (b"content-security-policy", b"default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")]
+
+
 class Boundary:
     """Loopback-only, optional authorization, bounded body before JSON decoding."""
     def __init__(self, app, settings):
@@ -55,8 +58,14 @@ class Boundary:
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
+        async def private_send(message):
+            if message["type"] == "http.response.start":
+                message = dict(message, headers=list(message.get("headers", [])) + SECURITY_HEADERS)
+            await send(message)
         async def reject(code, detail):
-            await JSONResponse({"detail": detail}, status_code=code)(scope, receive, send)
+            # Rejections carry the same no-store, nosniff, framing and CSP
+            # headers as every other response.
+            await JSONResponse({"detail": detail}, status_code=code)(scope, receive, private_send)
         host = (scope.get("client") or ("",))[0]
         try:
             local = ipaddress.ip_address(host).is_loopback
@@ -98,12 +107,6 @@ class Boundary:
                 delivered = True
                 return {"type": "http.request", "body": bytes(body), "more_body": False}
             return await receive()
-        async def private_send(message):
-            if message["type"] == "http.response.start":
-                response_headers=list(message.get("headers", []))
-                response_headers.extend([(b"cache-control", b"no-store"), (b"x-content-type-options", b"nosniff"), (b"referrer-policy", b"no-referrer"), (b"x-frame-options", b"DENY"), (b"content-security-policy", b"default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")])
-                message=dict(message,headers=response_headers)
-            await send(message)
         await self.app(scope, bounded_receive, private_send)
 
 
