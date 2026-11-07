@@ -10,24 +10,30 @@ so no client can be redirected off the private socket.
 
 Afterwards it stops the server and checks that it exited, also when the
 launcher is interrupted or terminated (SIGINT, SIGTERM or SIGHUP): no process
-may still name the cluster's data directory, on its command line or as PGDATA
-in its environment (the helpers of initdb and pg_ctl and the server's backends
-inherit that). A setup step still running at that moment (initdb, tee, pg_ctl,
-psql) may finish first, so none of them is left running on its own; one still
+may still use the cluster's data directory, by naming it on its command line,
+having it as PGDATA in its environment (initdb and pg_ctl set that for their
+helpers, and programs the server starts inherit it) or running in it (every
+server process does; a backend overwrites the other two with its process
+title). A setup step still running at that moment (initdb, tee, pg_ctl, psql)
+may finish first, so none of them is left running on its own; one still
 running after STEP_GRACE seconds is stopped (see run()). A command still
 running is sent SIGTERM. A signal that arrives while a step or the command is
 being started is held until its process is known, and then handled the same
-way. Only the command's own process is signalled: programs it started stop too
-only when the signal went to the whole process group (Ctrl-C, timeout, a
-closed terminal). Further signals are ignored until the cleanup is done, and
-the cleanup's server commands run in their own session, out of reach of a
-repeated group signal. A signal already ignored when the launcher starts
-(under nohup, for example) stays ignored. The exit status is the command's
-(128+N if signal N ended it), 128+N if signal N interrupted the launcher, and
-non-zero if the setup failed or the server was not seen to exit. Status lines
-go to stderr; a closed terminal or a broken pipe neither stops the cleanup nor
-changes the exit status, also after an error that came before the first status
-line, and a non-blocking stderr that is full for a moment keeps its lines. If
+way (of two, the first decides). Only the command's own process is signalled:
+programs it started stop too only when the signal went to the whole process
+group (Ctrl-C, timeout, a closed terminal). Further signals are ignored until
+the cleanup is done, and the cleanup's server commands run in their own
+session, out of reach of a repeated group signal. A signal already ignored when
+the launcher starts (under nohup, for example) stays ignored. The exit status
+is the command's (128+N if signal N ended it), 128+N if signal N interrupted
+the launcher, and non-zero if the setup failed or the server was not seen to
+exit. Status lines go to stderr; a closed terminal or a broken pipe neither
+stops the cleanup nor changes the exit status, also after an error that came
+before the first status line. A non-blocking stderr that is full for a moment
+silences none of the lines after it. With stderr buffered (no PYTHONUNBUFFERED
+or -u), the line that met the full pipe is kept too, as far as Python's buffer
+holds it (4 KiB for a pipe); unbuffered, Python drops that line, and a
+traceback written into a full pipe keeps only its first line either way. If
 the server does not start, the end of its log is included in the error,
 because --discard deletes the log.
 
@@ -103,8 +109,9 @@ def private_environment(**extra):
 
 def say(message):
     """A status line on stderr. A closed terminal (EIO) or a broken pipe (EPIPE) must not cut the cleanup
-    short. A non-blocking stderr that is full for now (EAGAIN) keeps the line buffered: its reader is still
-    there, and the line goes out with a later one or with flush_stderr() at exit."""
+    short. A non-blocking stderr that is full for now (EAGAIN) is left as it is: its reader is still there.
+    With stderr buffered, the line then waits in Python's buffer (as far as that holds it) and goes out with
+    a later one or with flush_stderr() at exit; unbuffered, Python drops it without an error."""
     try:
         print(message, file=sys.stderr, flush=True)
     except BlockingIOError:
@@ -128,20 +135,25 @@ def silence_stderr():
 
 def flush_stderr():
     """Registered by main() with atexit, which runs before Python's own final flush: flush what is still
-    buffered for stderr (a traceback or a usage message from before the first status line, for example),
-    and silence stderr if that fails, so the final flush cannot fail and turn the exit status into 120.
-    A full non-blocking stderr gets EXIT_FLUSH_GRACE seconds to take it first."""
-    deadline = time.monotonic() + EXIT_FLUSH_GRACE
-    while True:
-        try:
-            sys.stderr.flush()
-            return
-        except BlockingIOError:
-            if time.monotonic() >= deadline:
+    buffered for stderr (a usage message, or a status line that met a full pipe, for example), and silence
+    stderr if that fails or is cut short, so the final flush cannot fail and turn the exit status into 120.
+    A full non-blocking stderr gets EXIT_FLUSH_GRACE seconds to take it first. A signal ends that wait:
+    before main() installs its handlers, Ctrl-C is still Python's KeyboardInterrupt."""
+    try:
+        deadline = time.monotonic() + EXIT_FLUSH_GRACE
+        while True:
+            try:
+                sys.stderr.flush()
+                return
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.05)
+            except (OSError, ValueError, AttributeError):  # nobody reads it, or no stream is left
                 break
-            time.sleep(0.05)
-        except (OSError, ValueError, AttributeError):  # nobody reads it, or no stream is left
-            break
+    except BaseException:
+        silence_stderr()
+        raise
     silence_stderr()
 
 
@@ -153,10 +165,12 @@ def ignore_signals():
 def interrupted(signum, frame):
     """Handler for SIGNALS: stop the run, and ignore further signals until the cleanup is done. While a
     step or the command is being started, the signal is held until its process is known (see start()),
-    so the cleanup can still stop it. Signals are not ignored (or blocked) meanwhile: the command would
-    inherit that, ignore the cleanup's SIGTERM and be stopped only by SIGKILL after the cleanup's 30 s."""
+    so the cleanup can still stop it; the first one held decides, as when none is held. Signals are not
+    ignored (or blocked) meanwhile: the command would inherit that, ignore the cleanup's SIGTERM and be
+    stopped only by SIGKILL after the cleanup's 30 s."""
     if HELD['starting']:
-        HELD['signum'] = signum
+        if HELD['signum'] is None:
+            HELD['signum'] = signum
         return
     ignore_signals()  # finish the cleanup even if signalled again
     raise KeyboardInterrupt(signum)
@@ -212,6 +226,9 @@ def run(command, stdin=None, detached=False):
                 process.stdin.close()  # input cut short: end it, so the step cannot wait for more
         except OSError:
             pass
+        # Closed: communicate() must not flush it. Before Python 3.13 it does when nothing was communicated
+        # yet (a signal held while the step started), and that ValueError would replace the interrupt.
+        process.stdin = None
         try:
             process.communicate(timeout=STEP_GRACE)
         except subprocess.TimeoutExpired:
@@ -269,14 +286,20 @@ def running(info):
 
 
 def leftover_processes(info):
-    """PIDs whose command line names this cluster's data directory, or whose environment has it as PGDATA
-    (Linux /proc). initdb and pg_ctl set PGDATA for what they start, so this also finds a helper of an
-    interrupted initdb (its sh -c and bootstrap backend name no directory) and a backend left by the
-    server. Another account's environment is not readable to an ordinary caller; root reads every one."""
-    data, variable, found = info['data'].encode(), b'PGDATA=' + info['data'].encode(), []
+    """PIDs of the processes that still use this cluster's data directory (Linux /proc): their command line
+    names it, their environment has it as PGDATA, or it is their working directory. initdb and pg_ctl set
+    PGDATA for what they start, so this finds a helper of an interrupted initdb (its sh -c and bootstrap
+    backend name no directory), and a program the server starts (archive_command, COPY ... TO PROGRAM)
+    inherits it. The server's own processes overwrite their command line and environment with their
+    process title but run in the data directory, so a backend left by a killed postmaster is found too.
+    Another account's environment and working directory are not readable to an ordinary caller; root reads
+    every one."""
+    data = info['data']
+    named, variable, where, found = data.encode(), b'PGDATA=' + data.encode(), os.path.realpath(data), []
     for entry in Path('/proc').glob('[0-9]*'):
         try:
-            if data in (entry / 'cmdline').read_bytes() or variable in (entry / 'environ').read_bytes().split(b'\0'):
+            if (named in (entry / 'cmdline').read_bytes() or variable in (entry / 'environ').read_bytes().split(b'\0')
+                    or os.readlink(entry / 'cwd') == where):
                 found.append(int(entry.name))
         except OSError:
             pass

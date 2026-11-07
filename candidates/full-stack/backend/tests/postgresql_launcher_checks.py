@@ -8,10 +8,12 @@ directory (under build/, deep enough that its socket goes in a private
 directory under /tmp; one layout of the ownership check uses a short copy under
 /tmp, whose socket stays in the cluster), with a small probe command and
 --discard, so every cluster is removed again and concurrent runs cannot disturb
-each other. The other checks need only POSIX, except two that read /proc and
-are skipped without it: the environment check of the cleanup (Linux) and the
-runuser step check (Linux, root and runuser). The module imports anywhere.
-From candidates/full-stack/backend:
+each other. The other checks need only POSIX, except three that read /proc and
+are skipped without it: the environment and working-directory checks of the
+cleanup (Linux) and the runuser step check (Linux, root and runuser). The
+checks that need no server also run under every other CPython 3 installed in
+/usr/bin or /usr/local/bin (before 3.13, communicate() flushes a stdin that
+run() has closed). The module imports anywhere. From candidates/full-stack/backend:
 
     python -m unittest tests.postgresql_launcher_checks -v
 """
@@ -19,6 +21,7 @@ import itertools
 import json
 import os
 from pathlib import Path
+import re
 import select
 import shutil
 import signal
@@ -89,9 +92,12 @@ subprocess.Popen = Popen
 sys.argv = sys.argv[3:]
 runpy.run_path(launcher, run_name='__main__')
 '''
-# The launcher with find_bindir() failing in one of two ways, so it fails before its first status line.
+# The launcher failing before its first status line: find_bindir() fails in one of two ways, or (usage) the
+# arguments are wrong. "failed" goes to stdout once main() has failed, just before the exit. SIGINT is Python's
+# KeyboardInterrupt, as at a terminal, whatever this test process inherited.
 EARLY_ERROR = r'''
-import sys
+import signal, sys
+signal.signal(signal.SIGINT, signal.default_int_handler)
 sys.path.insert(0, sys.argv[1])
 import postgresql_throwaway as launcher
 failure = sys.argv[2]
@@ -103,9 +109,13 @@ def find_bindir(explicit=None):
     raise PermissionError(13, 'Permission denied (synthetic)')
 
 
-launcher.find_bindir = find_bindir
+if failure != 'usage':
+    launcher.find_bindir = find_bindir
 sys.argv = ['postgresql_throwaway.py'] + sys.argv[3:]
-sys.exit(launcher.main())
+try:
+    sys.exit(launcher.main())
+finally:
+    print('failed', flush=True)
 '''
 # Status lines on a non-blocking stderr: the first meets a full pipe, the rest come after the parent drained it.
 FULL_STREAM = r'''
@@ -128,15 +138,55 @@ atexit.register(launcher.flush_stderr)
 launcher.say('last status line')
 print('exiting', flush=True)
 '''
-# A command that leaves a process behind which names the cluster only as PGDATA, until RELEASE exists.
+# A command that leaves a process behind which uses the cluster without naming it: it has the data directory as
+# PGDATA, or as its working directory. The process ends once RELEASE exists, or after 30 s: less than STOP_GRACE,
+# so an interrupted check (whose cleanups do not run) leaves no cluster behind.
 LEAVES_A_PROCESS = r'''
 import os, subprocess, sys
-release = %r
+release, how = %r, %r
 data = os.path.join(os.environ['MOM_HEALTH_TEST_POSTGRESQL_CLUSTER'], 'data')
-waiter = subprocess.Popen([sys.executable, '-c', 'import os, time\nwhile not os.path.exists(%%r):\n    time.sleep(0.05)' %% release],
-                          env=dict(os.environ, PGDATA=data), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+wait = 'import os, time\nend = time.monotonic() + 30\nwhile not os.path.exists(%%r) and time.monotonic() < end:\n    time.sleep(0.05)'
+waiter = subprocess.Popen([sys.executable, '-c', wait %% release], env=dict(os.environ, PGDATA=data) if how == 'PGDATA' else None,
+                          cwd=data if how == 'working directory' else None, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                           stderr=subprocess.DEVNULL, start_new_session=True)
 print(waiter.pid, flush=True)
+'''
+WAYS_TO_USE_THE_CLUSTER = ('PGDATA', 'working directory')
+# The launcher with a STOP_GRACE of 3 s, so a check can see what the cleanup does once that wait is over.
+SHORT_STOP_GRACE = r'''
+import sys
+sys.path.insert(0, sys.argv[1])
+import postgresql_throwaway as launcher
+launcher.STOP_GRACE = 3
+sys.argv = sys.argv[2:]
+sys.exit(launcher.main())
+'''
+# A command that asks the launcher's own leftover_processes() which processes of the running server it sees.
+# The postmaster's children (checkpointer, background writer, ...) overwrite their command line and environment.
+SEES_THE_SERVER = r'''
+import json, os, sys
+from pathlib import Path
+sys.path.insert(0, %r)
+import postgresql_throwaway as launcher
+info = launcher.describe(os.environ['MOM_HEALTH_TEST_POSTGRESQL_CLUSTER'])
+postmaster = int((Path(info['data']) / 'postmaster.pid').read_text().split()[0])
+
+
+def children():
+    found = set()
+    for entry in Path('/proc').glob('[0-9]*'):
+        try:
+            if int((entry / 'stat').read_text().rsplit(')', 1)[1].split()[1]) == postmaster:
+                found.add(int(entry.name))
+        except (OSError, IndexError, ValueError):
+            pass
+    return found
+
+
+before = children()
+found = launcher.leftover_processes(info)
+lasting = before & children()  # there throughout, unlike an autovacuum worker that came and went meanwhile
+print(json.dumps({'postmaster': postmaster, 'children': sorted(lasting), 'found': sorted(found)}))
 '''
 # A status line written after the reader went away, then an exit with the given status.
 CLOSED_STREAM = r'''
@@ -262,6 +312,38 @@ def finish(process, timeout=180):
     return output, errors
 
 
+def buffered_environment():
+    """This environment with stderr buffered, as an ordinary shell gives it (PYTHONUNBUFFERED makes it unbuffered)."""
+    return {name: value for name, value in os.environ.items() if name != 'PYTHONUNBUFFERED'}
+
+
+def full_pipe(test):
+    """A pipe whose write end is non-blocking and full, as a parent that shares its non-blocking stderr would leave
+    it. Returns the reader (closed after the test), the writer and how many bytes fill it."""
+    reader, writer = os.pipe()
+    test.addCleanup(os.close, reader)
+    os.set_blocking(writer, False)
+    filled = 0
+    try:
+        while True:
+            filled += os.write(writer, b'x' * 4096)
+    except BlockingIOError:
+        pass
+    return reader, writer, filled
+
+
+def other_pythons():
+    """Every other CPython 3 in /usr/bin and /usr/local/bin, one per version: {(3, 12): path, ...}."""
+    found = {}
+    for directory in ('/usr/bin', '/usr/local/bin'):
+        for path in sorted(Path(directory).glob('python3.*')):
+            match = re.fullmatch(r'python3\.(\d+)', path.name)
+            version = (3, int(match.group(1))) if match else None
+            if version and version != sys.version_info[:2] and version not in found and os.access(path, os.X_OK):
+                found[version] = path
+    return found
+
+
 class VersionChoiceTests(unittest.TestCase):
     def test_the_highest_installed_version_number_is_chosen(self):
         root = Path(tempfile.mkdtemp(prefix='versions-'))
@@ -325,6 +407,26 @@ class CleanupHelperTests(unittest.TestCase):
             with self.subTest(name):
                 self.assertIs(left, pids[name] in found)
 
+    @unittest.skipUnless(os.path.exists('/proc/self/cwd'), 'needs Linux /proc')
+    def test_a_process_working_in_the_data_directory_is_left_over_and_no_other(self):
+        root = Path(tempfile.mkdtemp(prefix='launcher-cwd-'))
+        self.addCleanup(shutil.rmtree, root)
+        (root / 'data').mkdir()
+        (root / 'data-other').mkdir()
+        (root / 'link').symlink_to(root / 'data')  # cluster.json may name the directory through a symlink
+        pids = {}
+        for name in ('data', 'data-other'):
+            process = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()'], stdin=subprocess.PIPE, cwd=root / name,
+                                       env={key: value for key, value in os.environ.items() if key != 'PGDATA'})
+            self.addCleanup(process.wait)
+            self.addCleanup(process.stdin.close)
+            pids[name] = process.pid
+        for named in ('data', 'link'):
+            with self.subTest(cluster_json_names=named):
+                found = launcher.leftover_processes(dict(data=str(root / named)))
+                self.assertIn(pids['data'], found, 'a process working in the data directory was overlooked')
+                self.assertNotIn(pids['data-other'], found, 'a directory that only starts the same was taken for it')
+
     def test_the_cleanup_waits_for_processes_that_still_name_the_cluster(self):
         left, slept = iter([[4242], [4242], []]), []
         with patch.object(launcher, 'running', lambda info: False), patch.object(launcher, 'leftover_processes', lambda info: next(left)), \
@@ -366,6 +468,18 @@ class SignalTests(unittest.TestCase):
         # Ignored now, the signals would stay ignored in the command, which could then not be stopped.
         self.assertEqual([launcher.interrupted] * len(SIGNALS), [signal.getsignal(signum) for signum in SIGNALS])
 
+    def test_of_two_signals_held_while_a_process_starts_the_first_decides(self):
+        restore_signals(self)  # release() ignores the signals from then on
+        for first, second in ((signal.SIGTERM, signal.SIGHUP), (signal.SIGHUP, signal.SIGTERM)):
+            with self.subTest(first=first.name, second=second.name):
+                launcher.HELD.update(starting=True, signum=None)
+                launcher.interrupted(first, None)
+                launcher.interrupted(second, None)
+                # As when none is held: the first stops the run, and its number is the one reported (128+N).
+                with self.assertRaises(KeyboardInterrupt) as stop:
+                    launcher.release()
+                self.assertEqual((first,), stop.exception.args)
+
     def test_a_status_line_nobody_reads_leaves_the_exit_status_alone(self):
         import pty  # POSIX only, like the termios module it needs
         for stream, buffered in itertools.product(('pipe', 'terminal'), (True, False)):
@@ -386,6 +500,8 @@ class SignalTests(unittest.TestCase):
     def test_an_error_before_the_first_status_line_keeps_its_exit_status_when_nobody_reads_stderr(self):
         import pty  # POSIX only, like the termios module it needs
         failures = (('usage error', [str(HERE / 'postgresql_throwaway.py'), '--discard'], 2),
+                    # Reported by argparse itself, from inside parse_args().
+                    ('invalid option', [str(HERE / 'postgresql_throwaway.py'), '--locale', 'synthetic-bogus', '--discard', '--', 'true'], 2),
                     ('error message', ['-c', EARLY_ERROR, str(HERE), 'message', *RUN_AS, '--discard', '--', 'true'], 1),
                     ('uncaught exception', ['-c', EARLY_ERROR, str(HERE), 'exception', *RUN_AS, '--discard', '--', 'true'], 1))
         for (name, argv, expected), stream, buffered in itertools.product(failures, ('pipe', 'terminal'), (True, False)):
@@ -401,24 +517,38 @@ class SignalTests(unittest.TestCase):
                 # Not 120: the usage message or traceback is still buffered when Python's final flush fails.
                 self.assertEqual(expected, process.wait(60))
 
-    def test_a_full_non_blocking_stderr_keeps_the_status_lines_and_the_commands_stderr(self):
+    def test_a_signal_while_the_exit_waits_for_a_full_stderr_keeps_an_early_errors_exit_status(self):
+        failures = (('invalid option', 'usage', ['--locale', 'synthetic-bogus'], 2), ('error message', 'message', RUN_AS, 1),
+                    ('uncaught exception', 'exception', RUN_AS, 1))
+        for name, failure, options, expected in failures:
+            with self.subTest(name):
+                _, writer, _ = full_pipe(self)  # and nobody drains it
+                process = subprocess.Popen([sys.executable, '-c', EARLY_ERROR, str(HERE), failure, *options, '--discard', '--', 'true'],
+                                           stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=writer, env=buffered_environment(),
+                                           text=True)
+                os.close(writer)
+                self.addCleanup(process.stdout.close)
+                self.addCleanup(process.kill)
+                self.assertTrue(select.select([process.stdout], [], [], 30)[0], 'the launcher did not fail')
+                self.assertEqual('failed', process.stdout.readline().strip())
+                time.sleep(0.5)  # well inside EXIT_FLUSH_GRACE: the exit is waiting for the full stderr
+                process.send_signal(signal.SIGINT)  # Ctrl-C: main() never got to install its handlers
+                # Not 120: the wait was cut short, so stderr was silenced before Python's final flush.
+                self.assertEqual(expected, process.wait(60))
+
+    def test_a_full_non_blocking_stderr_is_not_silenced_and_buffered_keeps_the_line_that_met_it(self):
         for buffered in (True, False):
             with self.subTest(buffered=buffered):
-                environment = {key: value for key, value in os.environ.items() if key != 'PYTHONUNBUFFERED'}
+                environment = buffered_environment()
                 if not buffered:
                     environment['PYTHONUNBUFFERED'] = '1'
-                reader, writer = os.pipe()
-                self.addCleanup(os.close, reader)
-                os.set_blocking(writer, False)  # as a parent that shares its non-blocking stderr would leave it
-                filled = 0
-                try:
-                    while True:
-                        filled += os.write(writer, b'x' * 4096)
-                except BlockingIOError:
-                    pass
+                reader, writer, filled = full_pipe(self)
                 process = subprocess.Popen([sys.executable, '-c', FULL_STREAM, str(HERE)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                            stderr=writer, env=environment, text=True)
                 os.close(writer)
+                self.addCleanup(process.kill)
+                # A launcher that waited for the reader here would never say this, as the pipe is drained only after it.
+                self.assertTrue(select.select([process.stdout], [], [], 10)[0], 'blocked on its full stderr')
                 self.assertEqual('said', process.stdout.readline().strip())  # its first status line met the full pipe
                 drained = 0
                 while drained < filled:
@@ -436,19 +566,12 @@ class SignalTests(unittest.TestCase):
                 self.assertEqual(expected, text.decode().splitlines())
 
     def test_at_exit_a_full_non_blocking_stderr_gets_time_to_take_the_last_line(self):
-        reader, writer = os.pipe()
-        self.addCleanup(os.close, reader)
-        os.set_blocking(writer, False)
-        filled = 0
-        try:
-            while True:
-                filled += os.write(writer, b'x' * 4096)
-        except BlockingIOError:
-            pass
-        environment = {key: value for key, value in os.environ.items() if key != 'PYTHONUNBUFFERED'}  # buffered
+        reader, writer, filled = full_pipe(self)
         process = subprocess.Popen([sys.executable, '-c', FULL_AT_EXIT, str(HERE)], stdout=subprocess.PIPE, stderr=writer,
-                                   env=environment, text=True)
+                                   env=buffered_environment(), text=True)  # unbuffered, the line would be dropped at once
         os.close(writer)
+        self.addCleanup(process.kill)
+        self.assertTrue(select.select([process.stdout], [], [], 10)[0], 'blocked on its full stderr')
         self.assertEqual('exiting', process.stdout.readline().strip())
         time.sleep(0.3)  # the reader is slow, not gone: it drains the pipe well within EXIT_FLUSH_GRACE
         drained = 0
@@ -460,6 +583,17 @@ class SignalTests(unittest.TestCase):
         for chunk in iter(lambda: os.read(reader, 65536), b''):
             text += chunk
         self.assertEqual('last status line\n', text.decode())
+
+    def test_at_exit_a_stderr_still_full_after_the_grace_is_silenced_and_the_exit_status_kept(self):
+        _, writer, _ = full_pipe(self)  # and nobody drains it
+        started = time.monotonic()
+        process = subprocess.Popen([sys.executable, '-c', FULL_AT_EXIT, str(HERE)], stdout=subprocess.DEVNULL, stderr=writer,
+                                   env=buffered_environment())
+        os.close(writer)
+        self.addCleanup(process.kill)
+        # Not 120: after EXIT_FLUSH_GRACE the line is given up and stderr silenced before Python's final flush.
+        self.assertEqual(0, process.wait(60))
+        self.assertGreaterEqual(time.monotonic() - started, launcher.EXIT_FLUSH_GRACE, 'the exit did not wait for the reader')
 
     def test_a_signal_held_while_a_start_fails_stops_the_run_instead_of_the_failure(self):
         restore_signals(self)
@@ -501,8 +635,12 @@ class SignalTests(unittest.TestCase):
 class StepTests(unittest.TestCase):
     """An interrupted setup step that outlives STEP_GRACE is stopped, and the wait for it stays bounded."""
     def interrupted_run(self, command, step_grace=0.3, term_grace=1):
+        """run() with a SIGTERM to this process 0.5 s in, while the step runs, handled by the launcher's own
+        handler: so a run() that still held signals while it waited for the step would wait it out."""
         restore_signals(self)
-        signal.signal(signal.SIGALRM, interrupt)
+        launcher.HELD.update(starting=False, signum=None)
+        signal.signal(signal.SIGTERM, launcher.interrupted)
+        signal.signal(signal.SIGALRM, lambda signum, frame: os.kill(os.getpid(), signal.SIGTERM))
         started = time.monotonic()
         with patch.object(launcher, 'STEP_GRACE', step_grace), patch.object(launcher, 'TERM_GRACE', term_grace):
             signal.setitimer(signal.ITIMER_REAL, 0.5)  # the step is running by then
@@ -676,6 +814,24 @@ class SetupTests(unittest.TestCase):
         self.assertNotIn('synthetic log line 5\n', str(failure.exception))
 
 
+@unittest.skipUnless(os.name == 'posix', 'needs POSIX')
+class OtherPythonTests(unittest.TestCase):
+    """The checks that need no server, under every other CPython 3 installed here. Python before 3.13 flushes a
+    closed stdin in communicate() and raises ValueError, which run() must not let replace an interrupt."""
+    def test_the_checks_without_a_server_pass_under_every_other_installed_python(self):
+        pythons = other_pythons()
+        if not pythons:
+            self.skipTest('no other CPython 3 in /usr/bin or /usr/local/bin')
+        names = ['tests.postgresql_launcher_checks.' + case for case in ('VersionChoiceTests', 'CleanupHelperTests', 'SignalTests',
+                                                                          'StepTests', 'SetupTests')]
+        for version, python in pythons.items():
+            with self.subTest(python='%d.%d' % version):
+                # These checks need the standard library only (-s: not even the caller's own site-packages).
+                result = subprocess.run([str(python), '-s', '-m', 'unittest', *names], cwd=HERE.parent, stdin=subprocess.DEVNULL,
+                                        capture_output=True, text=True, timeout=600)
+                self.assertEqual(0, result.returncode, result.stderr[-4000:])
+
+
 @unittest.skipUnless(sys.platform.startswith('linux') and binaries_available(), 'needs Linux and the PostgreSQL server binaries')
 class LauncherChecks(unittest.TestCase):
     def launch(self, *arguments, **options):
@@ -784,27 +940,64 @@ class LauncherChecks(unittest.TestCase):
                 self.assertNotIn('Interrupted by signal', errors)  # the command was, not the launcher
                 self.assertNothingLeft(root, fixtures, sockets, ''.join(seen) + errors)
 
-    def test_a_process_that_names_the_cluster_only_as_pgdata_is_waited_for(self):
+    def test_a_process_that_uses_the_cluster_without_naming_it_is_waited_for(self):
+        for how in WAYS_TO_USE_THE_CLUSTER:
+            with self.subTest(how=how):
+                root, script, fixtures = private_copy(self)
+                release = root / 'release'
+                self.addCleanup(release.touch)  # after a failed check too: the waiter then ends before the copy goes
+                process = self.launch(script, LEAVES_A_PROCESS % (str(release), how))
+                seen = []
+                sockets = self.socket_directory(read_until(process.stderr, SOCKETS, seen))
+                line = read_until(process.stderr, STARTED, seen)
+                self.assertIsNotNone(line, 'the launcher never reported its cluster')
+                data = Path(line.rsplit(': ', 1)[1]) / 'data'
+                waiter = int(process.stdout.readline())
+                deadline = time.monotonic() + 60
+                while processes_naming(data) and time.monotonic() < deadline:  # until the cleanup has stopped the server
+                    time.sleep(0.05)
+                time.sleep(2)  # a cleanup that overlooked the waiter would have reported and exited by now
+                self.assertTrue(Path('/proc/%d' % waiter).exists())
+                self.assertIsNone(process.poll(), 'the cleanup ended while a process still used the cluster (%s)' % how)
+                release.touch()
+                _, errors = finish(process)
+                self.assertEqual(0, process.returncode, errors)
+                self.assertNothingLeft(root, fixtures, sockets, ''.join(seen) + errors)
+
+    def test_a_process_still_using_the_cluster_after_the_wait_is_reported_and_the_cluster_kept(self):
+        for how in WAYS_TO_USE_THE_CLUSTER:
+            with self.subTest(how=how):
+                root, script, fixtures = private_copy(self)
+                release = root / 'release'
+                self.addCleanup(release.touch)
+                wrapper = root / 'short_stop_grace.py'
+                wrapper.write_text(SHORT_STOP_GRACE)
+                process = self.launch(script, LEAVES_A_PROCESS % (str(release), how), wrapper=[str(wrapper), str(script.parent)])
+                seen = []
+                sockets = self.socket_directory(read_until(process.stderr, SOCKETS, seen))
+                line = read_until(process.stderr, STARTED, seen)
+                self.assertIsNotNone(line, 'the launcher never reported its cluster')
+                cluster = Path(line.rsplit(': ', 1)[1])
+                waiter = int(process.stdout.readline())
+                _, errors = finish(process, timeout=120)
+                # The waiter outlives the 3 s wait: the cleanup must say so and must not delete what it still uses.
+                self.assertEqual(1, process.returncode, errors)
+                self.assertIn('Throwaway PostgreSQL stopped and exited: NO (pids [%d])' % waiter, errors)
+                self.assertNotIn('Discarded', errors)
+                self.assertTrue(cluster.exists(), 'the cluster was deleted while a process still used it')
+                self.assertTrue(Path(sockets).exists(), 'the socket directory was removed while the cluster is kept')
+
+    def test_the_cleanup_sees_every_process_of_the_server(self):
         root, script, fixtures = private_copy(self)
-        release = root / 'release'
-        self.addCleanup(release.touch)  # after a failed check too: the waiter then ends before the copy goes
-        process = self.launch(script, LEAVES_A_PROCESS % str(release))
-        seen = []
-        sockets = self.socket_directory(read_until(process.stderr, SOCKETS, seen))
-        line = read_until(process.stderr, STARTED, seen)
-        self.assertIsNotNone(line, 'the launcher never reported its cluster')
-        data = Path(line.rsplit(': ', 1)[1]) / 'data'
-        waiter = int(process.stdout.readline())
-        deadline = time.monotonic() + 60
-        while processes_naming(data) and time.monotonic() < deadline:  # until the cleanup has stopped the server
-            time.sleep(0.05)
-        time.sleep(2)  # a cleanup that overlooked the waiter would have reported and exited by now
-        self.assertTrue(Path('/proc/%d' % waiter).exists())
-        self.assertIsNone(process.poll(), 'the cleanup ended while a process still had the cluster as PGDATA')
-        release.touch()
-        _, errors = finish(process)
-        self.assertEqual(0, process.returncode, errors)
-        self.assertNothingLeft(root, fixtures, sockets, ''.join(seen) + errors)
+        output, errors = finish(self.launch(script, SEES_THE_SERVER % str(script.parent)))
+        sockets = next((line.rsplit(': ', 1)[1] for line in errors.splitlines() if line.startswith(SOCKETS)), None)
+        if sockets:
+            self.addCleanup(shutil.rmtree, sockets, ignore_errors=True)
+        seen = json.loads(output)
+        self.assertTrue(seen['children'], 'the server had no other process (checkpointer, background writer, ...)')
+        # Its children name neither the data directory nor PGDATA any more; they run in the data directory.
+        self.assertEqual([], sorted(set([seen['postmaster']] + seen['children']) - set(seen['found'])), seen)
+        self.assertNothingLeft(root, fixtures, sockets, errors)
 
     def test_a_failed_setup_leaves_nothing_behind(self):
         runs = [('as the calling account', None)]
