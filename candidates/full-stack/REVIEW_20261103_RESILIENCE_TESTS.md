@@ -117,19 +117,19 @@ From `candidates/full-stack/backend`:
 
 | Command | Result |
 | --- | --- |
-| `python -m unittest discover -s tests -v` | 174 tests OK (1 Windows-only skip) |
+| `python -m unittest discover -s tests -v` | 175 tests OK (1 Windows-only skip) |
 | `python -m unittest railway_candidate.test_gateway -v` | 12 OK |
 | `cd tests && python -m unittest integration_contract_android -v` | 5 OK |
 | `cd dashboard && node core.test.js` | 39 passed |
 | `node app.test.js` | 10 passed |
 | `node hosted.test.js` | 6 passed |
-| `node lifecycle.test.js` | 58 passed |
+| `node lifecycle.test.js` | 62 passed |
 | `node integration.test.js` | 6 passed |
-| `node browser.test.js` (Playwright + Chromium) | 16 passed |
-| `node hosted-browser.test.js` (Playwright + Chromium) | 12 passed |
+| `node browser.test.js` (Playwright + Chromium) | 17 passed |
+| `node hosted-browser.test.js` (Playwright + Chromium) | 13 passed |
 | `node --check app.js && node --check core.js && node --check ../railway_candidate/dashboard-app.js && node --check browser-support.js` | OK |
 
-Counts include the November 7 follow-up and all four rounds of corrections. The full backend run takes about 28 s and both browser suites about 62 s on four shared CPUs. New fixture directories accumulate under `candidates/full-stack/build/` (gitignored), as with the existing suites.
+Counts include the November 7 follow-up and all five rounds of corrections. The full backend run takes about 29 s and both browser suites about 55 s on four shared CPUs. New fixture directories accumulate under `candidates/full-stack/build/` (gitignored), as with the existing suites.
 
 ## Blocked or not run
 
@@ -230,9 +230,9 @@ New checks:
 | `python tests/postgresql_throwaway.py --run-as postgres -- python -m unittest tests.postgresql_parity -v` | 41 OK in about 45 s (C locale), server stopped and exited |
 | `python tests/postgresql_throwaway.py --run-as postgres --locale icu-en-US -- python -m unittest tests.postgresql_parity -v` | 41 OK in about 45 s (ICU `en-US`), server stopped and exited |
 | The suite as committed in `9039d45`, against the code before the fixes | C: 7 failures (4 lock-wait subtests, 2 isolation subtests, the forced-collation check). ICU `en-US`: 8 (also the inherited listing-order check). Re-measured after the verification. |
-| `python -m unittest tests.postgresql_launcher_checks -v` | 36 OK, as root, with and without `PYTHONUNBUFFERED` (the failed-setup check also runs once as the `postgres` account). Each of 41 launcher changes, reverted (or applied) on its own, makes a check fail (41 of 41; see the fourth verification). The first 5 checks, against the launcher as merged in `7911545`: 4 failures and 2 errors |
+| `python -m unittest tests.postgresql_launcher_checks -v` | 43 OK, as root, with and without `PYTHONUNBUFFERED` (the failed-setup check also runs once as the `postgres` account), and under Python 3.11 and 3.12; the checks that need no server also run under every other CPython 3 installed. Each of 51 launcher changes, reverted (or applied) on its own, makes a check fail (51 of 51; see the fifth verification). The first 5 checks, against the launcher as merged in `7911545`: 4 failures and 2 errors |
 | `python -m unittest tests.postgresql_parity` without a database | exits 1: `POSTGRESQL PARITY CHECKS NOT RUN` |
-| `python -m unittest discover -s tests -v` | 174 OK (1 Windows-only skip) after all follow-up changes; the parity and launcher modules are not discovered |
+| `python -m unittest discover -s tests -v` | 175 OK (1 Windows-only skip) after all follow-up changes; the parity and launcher modules are not discovered |
 
 Run as a non-root account, the launcher needs no `--run-as`. The two cluster directories from the first runs on unfixed code (stopped, fictional data, about 47 MB each) were retained under `build/postgresql-fixtures/`; the other runs used `--discard`. A verifier's cluster left by the container restart, and the reviewers' scratch copies, were removed.
 
@@ -443,5 +443,59 @@ Results after these corrections:
 | PostgreSQL launcher checks | 36 OK as root, with `PYTHONUNBUFFERED` unset and set (about 56 s each), none skipped |
 | Dashboard `core` / `app` / `hosted` / `lifecycle` / `integration` | 39 / 10 / 6 / 58 / 6 passed |
 | `browser` / `hosted-browser` (real Chromium) | 16 / 12 passed (about 62 s together) |
+
+No PostgreSQL process, temporary socket directory or launcher copy was left after these runs, and the two retained clusters are unchanged.
+
+### Fifth independent verification, and corrections
+
+The three commits of the fourth round of corrections (`f8a4568`..`21d774f`) were checked the same way: a read-only workflow ran four reviewers (launcher behavior, launcher checks, dashboards, documentation), one adversarial verifier per reviewer and a completeness critic. They used fictional data, throwaway clusters and copies under the gitignored `build/` only; their 784 recorded tool calls contain no network command, and the only host they name is 127.0.0.1. Their probes included a client backend stopped while its postmaster was killed, non-blocking pipes left full, Ctrl-C during the exit, fractional device scale factors in real Chromium, a keep-alive client against the test backend, and Python 3.11 and 3.12.
+
+Outcome: 20 items, all confirmed: 1 defect, 6 test gaps, 10 inaccurate statements and 3 design questions (15 rated low, 5 information; three repeat another reviewer's item). The critic found 1 more gap, a defect on Python before 3.13. Each was corrected, in `a622e0b`..`ecbf72d`, as follows.
+
+| Area | Confirmed problem | Correction |
+| --- | --- | --- |
+| Launcher (critic) | On Python 3.11 and 3.12, a signal held while `tee` started gave exit 1 and a chained `ValueError: I/O operation on closed file` instead of 128+N: `run()` closed the step's stdin, and `communicate()` before 3.13 flushes a stdin it has not used yet. For a signal just before `tee`'s Popen this was a regression (`bee99a8` exits 143 on both); two launcher checks failed on those versions, one of them in two subtests. New in `f8a4568` | `run()` drops the closed stdin before it waits for the step. The checks that need no server also run under every other CPython 3 installed in `/usr/bin` or `/usr/local/bin` (here 3.11 and 3.12), and the whole module passes under 3.11, 3.12 and 3.13 |
+| Launcher | Ctrl-C during the 2 s exit wait for a full non-blocking stderr, after an error that came before `main()` installs its handlers, made the exit status 120: the `KeyboardInterrupt` skipped the silencing. New in `f8a4568` | stderr is silenced whenever that wait is cut short. A check for an invalid option, an error message and an uncaught exception, each with SIGINT during the wait |
+| Launcher | The server's own processes overwrite their command line and environment with their process title, so `PGDATA` finds only the postmaster, initdb's and `pg_ctl`'s helpers, and programs a backend starts. A backend left by a killed postmaster was neither waited for nor listed ("NO" without pids after 3 s), although the docstrings and the report said it was found. The cluster was kept only because `postmaster.pid` remained. New in `f8a4568` (docstrings) and `21d774f` (report) | The cleanup also counts a process whose working directory is the data directory (compared resolved), which every server process has. A unit check (also through a symlink); a launch check that the cleanup's own scan sees every lasting process of the running server; the wait and its outcome for a process that uses the cluster only through its working directory. A probe with a stopped backend and a killed postmaster now reports "NO (pids [16432])" after the wait and keeps the cluster |
+| Launcher | Of two different signals held while a process started, the last decided the message and 128+N; without a hold the first does. The cleanup was unaffected (design question; adopted) | The first held signal decides. A unit check for both orders |
+| Launcher, checks, report | "A non-blocking stderr that is full for a moment keeps its lines" holds only with stderr buffered and up to Python's 4 KiB buffer. Unbuffered (`PYTHONUNBUFFERED`, this container's default) Python drops the line without an error, and a traceback written into a full pipe keeps only its first line either way. The check knew this but its name did not say so. New in `f8a4568` and `21d774f` (three reviewers) | Narrowed in the launcher docstrings and the report; the check is renamed to what it checks. The behavior is Python's and is left as it is |
+| Launcher checks | No check required that `run()` stops holding a launcher-handled signal before it waits for the step: holding it until the step ended passed all 36, and an interrupted hung step then kept the launcher waiting indefinitely | The step checks deliver their interrupt as a SIGTERM through the launcher's own handler |
+| Launcher checks | A `main()` that decided "stopped" without the leftovers passed all 36, and then reported "yes" and deleted the cluster under a process still using it: the `PGDATA` check released its waiter long before the wait ended | A launch check with a 3 s `STOP_GRACE`: a process that outlives the wait is reported with its pid, the exit status is 1, and the cluster and socket directory are kept; for `PGDATA` and for the working directory |
+| Launcher checks | Nothing exercised the end of the exit grace: returning there without silencing stderr passed, and the status became 120 | A check in which nobody drains the full stderr: the status is kept after at least `EXIT_FLUSH_GRACE` |
+| Launcher checks | The early-error check had no error that argparse reports itself: registering the exit flush after `parse_args()` passed, and an invalid option then exited 120 | An invalid `--locale` among the failures |
+| Launcher checks | The two full-stderr checks hung, instead of failing, under a launcher that waits for the reader: they read the child's first line without a timeout, and drained the pipe only after it | Each waits at most 10 s for that line; such a launcher now fails them in about 20 s |
+| Launcher checks | The `PGDATA` check's waiter had no time bound: an interrupted test run (whose cleanups do not run) left it running, and the launcher then kept the cluster and its `/tmp` socket directory (design question; adopted) | The waiter ends after 30 s, below `STOP_GRACE`. The verifier interrupted the check with that bound: after 70 s no process, cluster or socket directory was left, only the check's copy (a 90 s bound still left the cluster). Not rerun here (below) |
+| Dashboards | The emptied-table comments and the report's "band under half a CSS pixel" hold only at whole-pixel client sizes. At fractional zoom or device scale (110 to 133 %, and some phone-like factors, here) a table that cannot scroll can keep focus, and one that scrolls by a device pixel can be handed on. Focus always lands on a real Tab stop (information) | Corrected in both copies' comments, the README and the report; behavior unchanged |
+| Dashboards | The README's "focus on the table returns to Refresh at the end, also when the new rows fill the table again" needs a frame between the emptying and the new rows: a backend answering within a few milliseconds leaves focus on the table. No suite saw this, because the test backend sent every keep-alive response body about 42 ms after its headers: its listener was not an `IPPROTO_TCP` socket, so asyncio never set `TCP_NODELAY`, and Nagle's algorithm waited for the client's delayed ACK. The documented server answers within a few milliseconds | The README, "Still open" and the fourth-round row say so. The test backend's listener is an `IPPROTO_TCP` socket; `tests/test_browser_backend.py` requires a keep-alive response body to follow its headers within 20 ms (it trailed by 42 ms). Both browser suites then passed 10 of 10 runs each (17 and 13 checks), in about 15 % less time |
+| Dashboards | Nothing pinned that a Refresh empties the table while it reloads, or that one failing at its sample request has emptied it: keeping the old rows until the new page arrived passed every suite | Lifecycle cases for both copies: a Refresh failing at its sample request shows no rows ("not loaded"); one failing at its gateway-status request shows the new rows. A real-Chromium check in both copies sends the sample request two frames late and requires focus on Refresh at 1280 px and on the table at 320 px |
+| Dashboards | "The device list, which every Refresh requests": a Refresh that sees a mode change, or fails at its health read, stops before it (information) | Reworded in both checks and the report |
+| Documentation | The revertibility sentence omitted `42d2ecd`'s null-`/v1/health` check, whose Refresh half fails without the Refresh default | Added |
+| Documentation | The second-round row still said "reverted on its own" for the 15 launcher changes, one of which adds a change, although the fourth round said that wording was corrected (information) | "reverted (or applied)" |
+| Documentation | "Still open" filed the same-watch focus behavior under the Refresh default, but it is the same without it (design question) | Relabeled as independent of that default |
+
+Left as they are, by design: Python's handling of a full non-blocking stderr (above), and the sub-pixel and fractional-zoom rounding of the emptied table, which the code's comment now describes. Where focus lands after a same-watch Refresh remains the owner's design question in "Still open".
+
+Commit messages are not rewritten. `f8a4568` says a full non-blocking stderr "keeps the status lines and the command's stderr" and that such a line "now stays buffered" (only with stderr buffered), that its 36 checks all pass (on Python 3.13 only), and in its title that early and signal exit statuses are kept (not for Ctrl-C during the exit wait, nor, before Python 3.13, for a signal held while `tee` started); its docstrings said the server's backends are found through `PGDATA`. `a753930` says the emptied-table checks hold "the device list, which every Refresh requests". `21d774f`'s report lines are corrected above. The table above corrects each.
+
+**Mutants.** Each change below, reverted (or applied) on its own, makes at least one check fail.
+
+- Launcher: 51 of 51, run in a copy with no `build/` at first and with `PYTHONUNBUFFERED` unset. These are the 41 of the fourth round (rerun against the new code; two edits and two check names follow the code) and 10 new ones: no working-directory match; the working directory compared unresolved; a signal in the exit wait leaving stderr as it is; the last of two held signals deciding; a closed stdin left for `communicate()` (caught under Python 3.11 and 3.12); `run()` holding signals until the step ends; `main()` deciding without the leftovers; a stderr still full after the grace left as it is; the exit flush registered after `parse_args()`; and a `say()` that waits until a full stderr takes the line (now a failure in about 20 s, not a hang). The runner removed only its own copy and reported anything else a run left, without removing it; it reported nothing. One older mutant is now caught by fewer checks: an interrupted setup step killed at once fails the within-grace step check, but no longer the initdb check, whose detection depends on the cleanup meeting initdb's single-user backend.
+- Dashboards: 30 of 30. These are the 26 of the fourth round and 4 new ones, one per copy each: the reload keeping the old rows until its page arrives (it fails the new lifecycle case and the new real-Chromium check at 1280 px), and Refresh loading the gateway status before the samples (it fails the gateway-status lifecycle case). The edited files were checked byte for byte against their checksums afterwards.
+- Test backend: with its listener created without `IPPROTO_TCP` again, `tests/test_browser_backend.py` fails (42 ms).
+- Without the Refresh default (Refresh not re-reading `/v1/health`, in both copies): every check that is not about a mode change passed, in 5 of 5 runs of each real-Chromium suite (14 local and 10 hosted checks), and the emptied-table, full-table and same-watch checks in 20 of 20 more runs of them alone (3 per copy). The edited files matched their checksums afterwards.
+
+**Not run.** The PostgreSQL parity suite under Python 3.11 and 3.12: psycopg is installed only for 3.13 here, and nothing was installed. The launcher checks, which need only the standard library, ran under all three. A probe that interrupts the waiter check and then looks for what is left: this session's permission classifier refused it, because its cleanup killed processes and removed `/tmp/mhpg-*` directories by pattern, and it was not retried; the verifier's own run with the same 30 s bound is the evidence above.
+
+Results after these corrections:
+
+| Suite | Result |
+| --- | --- |
+| Backend `unittest discover` | 175 OK (1 Windows-only skip) |
+| `test_gateway` | 12 OK |
+| `integration_contract_android` | 5 OK |
+| PostgreSQL parity | 41 OK under both locales (about 45 s each), run from the real checkout, whose socket stays in the cluster; server stopped and exited |
+| PostgreSQL launcher checks | 43 OK as root, with `PYTHONUNBUFFERED` unset and set (about 106 s each), and under Python 3.11 and 3.12 (about 110 s each), none skipped |
+| Dashboard `core` / `app` / `hosted` / `lifecycle` / `integration` | 39 / 10 / 6 / 62 / 6 passed |
+| `browser` / `hosted-browser` (real Chromium) | 17 / 13 passed (about 55 s together) |
 
 No PostgreSQL process, temporary socket directory or launcher copy was left after these runs, and the two retained clusters are unchanged.
