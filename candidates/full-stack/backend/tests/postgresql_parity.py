@@ -439,12 +439,15 @@ class PostgreSQLWriteLockTests(PostgreSQLFixture, unittest.TestCase):
         return client
 
     def test_every_connection_runs_read_committed_with_a_5_second_lock_timeout(self):
-        # Whatever the server or role defaults are, the backend's own settings win:
-        # a lock timeout of exactly 5 s (not a statement timeout) and READ COMMITTED.
-        repository = PostgreSQLRepository(self.fresh_dsn(default_transaction_isolation='serializable', lock_timeout='0'))
+        # Whatever the server, database or role defaults are, the backend's own settings
+        # win: a lock timeout of exactly 5 s and READ COMMITTED. It sets no statement
+        # timeout of its own, so one that is already in force still applies (here the
+        # connection's own 45 s, which also overrides any database or role default).
+        repository = PostgreSQLRepository(self.fresh_dsn(default_transaction_isolation='serializable', lock_timeout='0',
+                                                         statement_timeout='45s'))
         connection = repository.connect()
         try:
-            self.assertEqual(('read committed', '5s', '0'), connection.execute(
+            self.assertEqual(('read committed', '5s', '45s'), connection.execute(
                 "SELECT current_setting('transaction_isolation'), current_setting('lock_timeout'), current_setting('statement_timeout')").fetchone())
         finally:
             connection.close()
