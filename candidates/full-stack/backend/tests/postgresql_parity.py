@@ -30,6 +30,7 @@ from pathlib import Path
 import sys
 import threading
 from threading import Barrier, Timer
+import time
 import unittest
 from unittest.mock import patch
 from uuid import uuid4
@@ -42,14 +43,13 @@ from mom_health_backend.models import Batch, GatewayStatus  # noqa: E402
 from mom_health_backend.repository import PostgreSQLRepository  # noqa: E402
 
 try:
-    import postgresql_throwaway
     import test_backend
     import test_concurrent_retries
     import test_device_isolation
     import test_restart_recovery
     from synthetic_support import LoopbackServer, TOKEN, batch, sample, status
 except ImportError:  # imported as tests.<module>
-    from tests import postgresql_throwaway, test_backend, test_concurrent_retries, test_device_isolation, test_restart_recovery
+    from tests import test_backend, test_concurrent_retries, test_device_isolation, test_restart_recovery
     from tests.synthetic_support import LoopbackServer, TOKEN, batch, sample, status
 
 try:
@@ -121,6 +121,19 @@ if psycopg is not None:
                     if not gate['release'].wait(30):
                         raise TimeoutError('synthetic test gate was never released')
             return cursor
+
+    class StallBeforeStatusLock(psycopg.Connection):
+        """Holds one armed status write after connect() but before it asks for the status lock."""
+        gate = None
+
+        def execute(self, query, params=None, **kwargs):
+            gate = StallBeforeStatusLock.gate
+            if gate is not None and 'pg_advisory_xact_lock(%d)' % LOCKS['status'] in str(query):
+                StallBeforeStatusLock.gate = None
+                gate['entered'].set()
+                if not gate['release'].wait(30):
+                    raise TimeoutError('synthetic test gate was never released')
+            return super().execute(query, params, **kwargs)
 
     class CommitThenFail(psycopg.Connection):
         """Commits durably, then raises once: the caller cannot know the outcome."""
@@ -276,6 +289,21 @@ class PostgreSQLDeviceIsolationTests(PostgreSQLFixture, test_device_isolation.De
         self.assertEqual(sorted(devices), seen)
         self.assertEqual(sorted(devices), [d['device_id'] for d in self.ok(client.get('/v1/devices', params={'limit': 100}))['devices']])
 
+    def test_real_report_is_served_whatever_order_the_store_returns_rows(self):
+        # PostgreSQL version: with index scans disabled the planner reads the
+        # table in storage order, where the synthetic report was stored first,
+        # so only the ORDER BY makes the real report win.
+        dsn = self.fresh_dsn(enable_indexscan='off', enable_bitmapscan='off', enable_indexonlyscan='off')
+        client = TestClient(create_app(Settings(database_url=dsn, access_token=TOKEN, allow_real_data=True)), client=('127.0.0.1', 50000))
+        client.__enter__()
+        self.addCleanup(client.__exit__, None, None, None)
+        client.headers['Authorization'] = 'Bearer ' + TOKEN
+        for flag, battery in ((True, 11), (False, 99)):
+            self.ok(client.post('/v1/gateway-status', json=status('synthetic-unordered', battery_percent=battery, synthetic=flag)))
+        self.assertEqual([(1,), (0,)], self.rows("SELECT synthetic FROM gateway_status WHERE device_id = 'synthetic-unordered'"))
+        current = self.ok(client.get('/v1/gateway-status', params={'device_id': 'synthetic-unordered'}))['status']
+        self.assertEqual((99, False), (current['battery_percent'], current['synthetic']))
+
 
 class PostgreSQLRestartTests(PostgreSQLFixture, test_restart_recovery.RestartRecoveryTests):
     """App restarts over one PostgreSQL store; the SQLite file and process checks are replaced below."""
@@ -366,6 +394,10 @@ class PostgreSQLRestartTests(PostgreSQLFixture, test_restart_recovery.RestartRec
             self.assertEqual(200, code)
             receipt = json.loads(payload)
             gate, pending, worker = self.interrupt(server, interrupted, after=25)
+            try:
+                import postgresql_throwaway  # Linux-only launcher, needed here only
+            except ImportError:  # imported as tests.<module>
+                from tests import postgresql_throwaway
             # Immediate mode: the postmaster and every backend quit without a
             # checkpoint, so the next start must recover from the WAL.
             postgresql_throwaway.control(CLUSTER, 'stop', mode='immediate')
@@ -406,6 +438,17 @@ class PostgreSQLWriteLockTests(PostgreSQLFixture, unittest.TestCase):
         client.headers['Authorization'] = 'Bearer ' + TOKEN
         return client
 
+    def test_every_connection_runs_read_committed_with_a_5_second_lock_timeout(self):
+        # Whatever the server or role defaults are, the backend's own settings win:
+        # a lock timeout of exactly 5 s (not a statement timeout) and READ COMMITTED.
+        repository = PostgreSQLRepository(self.fresh_dsn(default_transaction_isolation='serializable', lock_timeout='0'))
+        connection = repository.connect()
+        try:
+            self.assertEqual(('read committed', '5s', '0'), connection.execute(
+                "SELECT current_setting('transaction_isolation'), current_setting('lock_timeout'), current_setting('statement_timeout')").fetchone())
+        finally:
+            connection.close()
+
     def test_writes_wait_for_a_brief_lock_holder(self):
         client = self.client()
         for path, body, lock in self.WRITES:
@@ -421,15 +464,54 @@ class PostgreSQLWriteLockTests(PostgreSQLFixture, unittest.TestCase):
             with self.subTest(path=path):
                 submitted = body()
                 release = self.hold('SELECT pg_advisory_xact_lock(%s)', (LOCKS[lock],))
+                started = time.monotonic()
                 try:
                     kind, response = within(20, lambda: client.post(path, json=submitted))
                 finally:
                     release()
                 self.assertEqual('ok', kind, 'still waiting for the lock after 20 s' if kind == 'pending' else response)
                 self.assertEqual(503, response.status_code)
+                self.assertGreater(time.monotonic() - started, 4, 'the request gave up before the 5 s lock timeout')
                 self.assertEqual(200, client.post(path, json=submitted).status_code)
         self.assertEqual(1, self.count('SELECT count(*) FROM samples'))
         self.assertEqual(1, self.count('SELECT count(*) FROM gateway_status'))
+
+    def test_reads_behind_a_persistent_table_lock_yield_503_instead_of_hanging(self):
+        client = self.client()
+        self.assertEqual(200, client.post('/v1/batches', json=batch(sample())).status_code)
+        self.assertEqual(200, client.post('/v1/gateway-status', json=status()).status_code)
+        release = self.hold('LOCK TABLE samples, gateway_status IN ACCESS EXCLUSIVE MODE')
+        try:
+            for path in ('/v1/devices', '/v1/samples?device_id=synthetic-watch', '/v1/gateway-status?device_id=synthetic-watch'):
+                with self.subTest(path=path):
+                    kind, response = within(20, lambda: client.get(path))
+                    self.assertEqual('ok', kind, 'read still waiting for the lock after 20 s' if kind == 'pending' else response)
+                    self.assertEqual(503, response.status_code)
+        finally:
+            release()
+        self.assertEqual(1, client.get('/v1/devices').json()['devices'][0]['sample_count'])
+
+    def test_a_report_held_before_the_status_lock_still_gets_the_later_receipt_time(self):
+        # The receipt time must be read while holding the status lock. A report
+        # held between connect() and the lock is stored after a prompt one, so it
+        # must also carry the later receipt time and be the report served.
+        repository = PostgreSQLRepository(self.settings.database_url)
+        repository.initialize()
+        gate, acknowledged = dict(entered=threading.Event(), release=threading.Event()), {}
+        with patch.object(psycopg, 'connect', StallBeforeStatusLock.connect):
+            StallBeforeStatusLock.gate = gate
+            self.addCleanup(setattr, StallBeforeStatusLock, 'gate', None)
+            self.addCleanup(gate['release'].set)
+            held = threading.Thread(target=lambda: acknowledged.update(
+                held=repository.save_status(GatewayStatus.model_validate(status(battery_percent=1)))))
+            held.start()
+            self.assertTrue(gate['entered'].wait(10), 'the status write never reached the lock')
+            acknowledged['prompt'] = repository.save_status(GatewayStatus.model_validate(status(battery_percent=2)))
+            gate['release'].set()
+            held.join(15)
+        self.assertLess(acknowledged['prompt']['server_received_at'], acknowledged['held']['server_received_at'])
+        served = repository.status('synthetic-watch')
+        self.assertEqual((acknowledged['held']['server_received_at'], 1), (served['server_received_at'], served['status']['battery_percent']))
 
     def test_a_delayed_status_report_never_overwrites_a_later_acknowledged_one(self):
         # PostgreSQL version of test_concurrent_retries.StatusReportRaceTests.

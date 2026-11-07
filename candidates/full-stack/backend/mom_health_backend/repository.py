@@ -216,12 +216,15 @@ class PostgreSQLRepository(Repository):
             raise RuntimeError("PostgreSQL requires the separately approved psycopg dependency") from exc
         connection = psycopg.connect(self.dsn, connect_timeout=5)
         try:
-            # Every operation is one transaction on its own connection. READ
-            # COMMITTED whatever the server or role default, so each statement
-            # after an advisory lock sees the previous holder's commit; and lock
-            # waits bounded like SQLite's 5 s busy timeout, so a stuck holder is
-            # answered 503 instead of holding a worker indefinitely. SET LOCAL
-            # also works behind transaction-pooling proxies.
+            # Every operation is exactly one transaction on its own connection;
+            # a method that ran a second transaction would lose this SET LOCAL.
+            # READ COMMITTED whatever the server or role default, so each
+            # statement after an advisory lock sees the previous holder's
+            # commit; and lock waits bounded like SQLite's 5 s busy timeout, so
+            # a stuck holder is answered 503 instead of holding a worker
+            # indefinitely. (psycopg prepares statements it repeats, so a
+            # transaction-pooling proxy would also need prepared-statement
+            # support; none is used here.)
             connection.isolation_level = psycopg.IsolationLevel.READ_COMMITTED
             connection.execute("SET LOCAL lock_timeout = '5s'")
         except BaseException:

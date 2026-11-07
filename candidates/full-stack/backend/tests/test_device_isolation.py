@@ -152,5 +152,25 @@ class DeviceIsolationTests(unittest.TestCase):
         current = self.ok(client.get('/v1/gateway-status', params={'device_id': 'synthetic-test-only'}))['status']
         self.assertEqual((5, True), (current['battery_percent'], current['synthetic']))
 
+    def test_real_report_is_served_whatever_order_the_store_returns_rows(self):
+        # SQLite's primary-key index happens to return the real report first.
+        # Reversing the order of unordered results shows that only the ORDER BY,
+        # not storage order, makes the real report win.
+        plain = repository.SQLiteRepository.connect
+
+        def reversed_connect(store):
+            connection = plain(store)
+            connection.execute('PRAGMA reverse_unordered_selects=ON')
+            return connection
+        with patch.object(repository.SQLiteRepository, 'connect', reversed_connect):
+            client = self.open(allow_real_data=True)
+            for order in ((True, False), (False, True)):
+                device = 'synthetic-unordered-' + ('a' if order[0] else 'b')
+                for flag, battery in zip(order, (11, 99)):
+                    self.ok(client.post('/v1/gateway-status', json=status(device, battery_percent=battery, synthetic=flag)))
+                current = self.ok(client.get('/v1/gateway-status', params={'device_id': device}))['status']
+                real_battery = 99 if order[0] else 11
+                self.assertEqual((real_battery, False), (current['battery_percent'], current['synthetic']))
+
 if __name__ == '__main__':
     unittest.main()
