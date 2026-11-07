@@ -196,9 +196,16 @@
     if (mode === "demo") { ui.demoButton.click(); return; }
     if (mode !== "backend") return;
     operation(async epoch => { const previous = selectedId; gateway = null; statusLoaded = false; render();
-      // Re-check the data mode first: records are never shown under a mode other than the one this session connected with.
+      // Re-check the data mode first, so Refresh never requests or shows records after it changed. Watch changes
+      // and the pagers do not re-check until the next Refresh; a synthetic-only session still rejects real records.
       const health = await readHealth(epoch);
-      if (health.synthetic_only !== syntheticOnly) { clearSession(false); say("The backend's data mode changed since you connected: it now " + (health.synthetic_only ? "accepts synthetic test data only" : "accepts real watch data") + ". Loaded records were removed from this page. Connect again to continue.", true); return; }
+      if (health.synthetic_only !== syntheticOnly) {
+        const hadToken = Boolean(token); clearSession(false);
+        say("The backend's data mode changed since you connected: it now " + (health.synthetic_only ? "accepts synthetic test data only" : "accepts real watch data") + ". Loaded records" + (hadToken ? " and the token were removed from this page. Enter the token and connect again to continue." : " were removed from this page. Connect again to continue."), true);
+        // The disabled Refresh button dropped keyboard focus; continue at the Connect form.
+        if (!document.activeElement || document.activeElement === document.body) ui.accessToken.focus();
+        return;
+      }
       seenDeviceCursors.clear(); await loadDevices(epoch, true); const moved = previous && selectedId !== previous; if (selectedId) { await loadSamplePage(epoch, true); await loadGatewayStatus(epoch); } ui.sourceStatus.textContent = "Backend checked: " + localTime(new Date().toISOString()) + " · No automatic polling"; say("Refreshed saved backend records and any gateway status report. Reported status is not proof of a current connection." + (moved ? (deviceCursor ? " The previously selected watch is not on the first page of sources, so another watch is shown; use Load more devices to find it." : " The previously selected watch is no longer listed, so another watch is shown.") : "")); });
   });
   ui.moreDevices.addEventListener("click", () => { if (mode === "backend" && deviceCursor) operation(epoch => loadDevices(epoch, false)); });

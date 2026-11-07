@@ -394,6 +394,23 @@ async function check(name, action) { await action(); passed++; console.log("PASS
       } finally { await stopBackend(own); }
     });
 
+    await check("a data-mode change on Refresh clears the session, names the removed token and returns focus to the token field", async () => {
+      const view = await open(seeded);
+      await connect(view.page);
+      // A backend restarted in real-data mode: only /v1/health changes.
+      await view.page.route("**/v1/health", route => route.fulfill({ status: 200, contentType: "application/json",
+        body: JSON.stringify({ status: "ready", schema_version: 1, synthetic_only: false }) }));
+      const before = view.requests.length;
+      await view.page.focus("#refreshButton");
+      await view.page.keyboard.press("Enter"); await idle(view.page);
+      assert.deepEqual(view.requests.slice(before).map(url => new URL(url).pathname), ["/v1/health"]);
+      assert.match(await text(view.page, "announcement"), /Loaded records and the token were removed from this page\. Enter the token and connect again to continue\./);
+      assert.equal(await view.page.locator("#announcement.error").count(), 1);
+      assert.equal(await active(view.page), "accessToken");
+      assert.equal(await text(view.page, "modeBadge"), "Not connected");
+      await close(view);
+    });
+
     const phones = [[320, 640], [360, 740], [375, 812], [414, 896], [768, 1024]];
     await check("mobile and tablet layouts have no horizontal page overflow and usable targets", async () => {
       for (const [width, height] of phones) {

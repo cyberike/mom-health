@@ -15,6 +15,7 @@ class Element {
   addEventListener(event, handler) { this.listeners[event] = handler; }
   querySelector(selector) { this.parts ||= {}; return this.parts[selector] ||= new Element(selector); }
   click() { if (!this.disabled && this.listeners.click) this.listeners.click({ preventDefault() {} }); }
+  focus() { this.focusCount = (this.focusCount || 0) + 1; }
 }
 const html = fs.readFileSync(path.join(__dirname, "index.html"), "utf8");
 const source = fs.readFileSync(path.join(__dirname, "app.js"), "utf8");

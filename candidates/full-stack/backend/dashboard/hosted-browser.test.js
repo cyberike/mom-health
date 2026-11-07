@@ -193,5 +193,20 @@ async function check(name, action) { await action(); passed++; console.log("PASS
     await finish(view);
   }));
 
+  await check("direct_candidate.py: a switch to real-data mode on Refresh clears the hosted session and returns focus to Connect", () => withHosted("direct", async browser => {
+    const view = await signIn(browser, "direct", CAREGIVER);
+    const page = view.page;
+    assert.equal((await connected(view)).count, "3");
+    await page.route("**/v1/health", route => route.fulfill({ status: 200, contentType: "application/json",
+      body: JSON.stringify({ status: "ready", schema_version: 1, synthetic_only: false }) }));
+    const before = view.requests.length;
+    await page.focus("#refreshButton");
+    await page.keyboard.press("Enter"); await idle(page);
+    assert.deepEqual(view.requests.slice(before).map(url => new URL(url).pathname), ["/v1/health"]);
+    assert.match(await text(page, "announcement"), /This hosted candidate requires a synthetic-only backend, so loaded records were removed from this page and no records were requested\./);
+    assert.equal(await page.evaluate(() => document.activeElement.id), "connectButton");
+    await finish(view);
+  }));
+
   console.log(passed + " hosted real-browser checks passed. Headless Chromium with real Basic sign-in against loopback gateway.py and direct_candidate.py; fictional host, credentials and records. Not TLS, proxy, Railway edge, public-domain or deployment validation.");
 })().catch(error => { console.error(error); process.exitCode = 1; });

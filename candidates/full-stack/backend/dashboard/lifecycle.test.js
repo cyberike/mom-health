@@ -401,13 +401,18 @@ async function test(name, action) { await action(); passed++; console.log("PASS 
 
     await test(variant + ": Refresh re-checks the data mode and requests no records after it changed", async () => {
       const api = backend(); const ui = setup(api.handler, fixture);
-      connect(ui); await idle(ui);
+      const flags = []; ui.elements.announcement.classList = { toggle: (name, on) => flags.push([name, on]) };
+      connect(ui, variant === "local" ? "synthetic-lifecycle-token-mode-00000000000001" : ""); await idle(ui);
       assert.equal(shown(ui), 3);
       api.override = url => url === "/v1/health" ? json({ status: "ready", schema_version: 1, synthetic_only: false }) : null;
       const before = ui.calls.length;
       ui.elements.refreshButton.click(); await idle(ui);
       assert.deepEqual(ui.calls.slice(before).map(c => c.url), ["/v1/health"]);
-      assert.match(ui.elements.announcement.textContent, /data mode changed since you connected: it now accepts real watch data\. Loaded records were removed/);
+      assert.match(ui.elements.announcement.textContent, variant === "local"
+        ? /data mode changed since you connected: it now accepts real watch data\. Loaded records and the token were removed from this page\. Enter the token and connect again to continue\.$/
+        : /now reports that it accepts real watch data\. This hosted candidate requires a synthetic-only backend, so loaded records were removed from this page and no records were requested\.$/);
+      assert.deepEqual(flags[flags.length - 1], ["error", true], "the change is announced as an error");
+      assert.equal((variant === "local" ? ui.elements.accessToken : ui.elements.connectButton).focusCount, 1, "keyboard focus continues at the Connect form");
       assert.equal(ui.elements.modeBadge.textContent, "Not connected");
       assert.equal(shown(ui), 0);
       assert.equal(ui.elements.watchLink.textContent, "Not reported");
@@ -425,9 +430,23 @@ async function test(name, action) { await action(); passed++; console.log("PASS 
       assert.match(ui.elements.announcement.textContent, /Refreshed saved backend records/, "an unchanged mode refreshes as before");
       synthetic = true;
       ui.elements.refreshButton.click(); await idle(ui);
-      assert.match(ui.elements.announcement.textContent, /it now accepts synthetic test data only/);
+      assert.match(ui.elements.announcement.textContent, /it now accepts synthetic test data only\. Loaded records were removed from this page\. Connect again to continue\.$/);
+      assert.equal(ui.elements.accessToken.focusCount, 1);
       assert.equal(ui.elements.modeBadge.textContent, "Not connected");
       assert.equal(shown(ui), 0);
+    });
+
+    await test(variant + ": a null /v1/health body is refused on Connect and on Refresh", async () => {
+      const api = backend(); const ui = setup(api.handler, fixture);
+      let blank = true;
+      api.override = url => url === "/v1/health" && blank ? json(null) : null;
+      connect(ui); await idle(ui);
+      assert.match(ui.elements.announcement.textContent, /Backend contract is not supported/);
+      assert.equal(ui.calls.length, 1, "nothing else is requested");
+      blank = false; connect(ui); await idle(ui);
+      assert.equal(shown(ui), 3);
+      blank = true; ui.elements.refreshButton.click(); await idle(ui);
+      assert.match(ui.elements.announcement.textContent, /Backend contract is not supported/);
     });
   }
   console.log("\n" + passed + " simulated lifecycle checks passed across the local and hosted dashboards. Not a browser; no network or real data.");
