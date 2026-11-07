@@ -433,30 +433,76 @@ async function test(name, action) { await action(); passed++; console.log("PASS 
       assert.deepEqual(ui.calls.slice(before).map(c => c.url), ["/v1/health"]);
       assert.match(ui.elements.announcement.textContent, variant === "local"
         ? /data mode changed since you connected: it now accepts real watch data\. Loaded records and the token were removed from this page\. Enter the token and connect again to continue\.$/
-        : /now reports that it accepts real watch data\. This hosted candidate requires a synthetic-only backend, so loaded records were removed from this page and no records were requested\.$/);
+        : /now reports that it accepts real watch data\. This hosted candidate requires a synthetic-only backend, so loaded records were removed from this page and no records were requested\. Connect again once the backend is synthetic-only\.$/);
       assert.deepEqual(flags[flags.length - 1], ["error", true], "the change is announced as an error");
-      assert.equal((variant === "local" ? ui.elements.accessToken : ui.elements.connectButton).focusCount, 1, "keyboard focus continues at the Connect form");
+      const form = variant === "local" ? ui.elements.accessToken : ui.elements.connectButton;
+      assert.equal(form.focusCount, 1, "keyboard focus continues at the Connect form");
+      assert.equal(ui.document.activeElement, form);
+      assert.equal(form.getAttribute("aria-describedby"), "announcement", "the message describes the control that now has focus");
       assert.equal(ui.elements.modeBadge.textContent, "Not connected");
       assert.equal(shown(ui), 0);
       assert.equal(ui.elements.watchLink.textContent, "Not reported");
       assert.equal(ui.elements.refreshButton.disabled, true);
+      connect(ui, variant === "local" ? "synthetic-lifecycle-token-mode-00000000000001" : ""); await idle(ui);
+      assert.equal(form.getAttribute("aria-describedby"), null, "a later message no longer describes it");
+    });
+
+    await test(variant + ": after a mode change, focus the user moved stays put and an emptied table scroller hands it on", async () => {
+      // The user moves focus while Refresh waits for /v1/health: to the range selector (still usable), or to
+      // the table scroller that clearSession then empties (Chromium moves focus off it only later).
+      for (const [where, moved] of [["range selector", ui => ui.elements.rangeSelect],
+                                    ["table scroller", ui => Object.assign(ui.document.createElement("div"), { className: "table-scroll" })]]) {
+        const api = backend(); const ui = setup(api.handler, fixture);
+        connect(ui, variant === "local" ? "synthetic-lifecycle-token-mode-00000000000002" : ""); await idle(ui);
+        api.override = url => url === "/v1/health" ? json({ status: "ready", schema_version: 1, synthetic_only: false }) : null;
+        api.hold = url => url === "/v1/health";
+        ui.elements.refreshButton.click(); await ticks();
+        assert.equal(api.held.length, 1, where);
+        const target = moved(ui); ui.document.activeElement = target;
+        api.hold = () => false; api.held.shift().release(); await idle(ui);
+        const form = variant === "local" ? ui.elements.accessToken : ui.elements.connectButton;
+        assert.match(ui.elements.announcement.textContent, /real watch data/, where);
+        if (where === "range selector") {
+          assert.equal(ui.document.activeElement, target, where + ": focus stays where the user put it");
+          assert.equal(form.focusCount || 0, 0, where);
+          assert.equal(form.getAttribute("aria-describedby"), null, where);
+        } else {
+          assert.equal(ui.document.activeElement, form, where + ": focus continues at the Connect form");
+          assert.equal(form.focusCount, 1, where);
+          assert.equal(form.getAttribute("aria-describedby"), "announcement", where);
+        }
+      }
     });
 
     if (variant === "local") await test("local: Refresh after the backend left real-data mode ends the session too", async () => {
+      // app.py serves real-data mode only with a token, so this session has one.
       const api = backend(); const ui = setup(api.handler, fixture);
       let synthetic = false;
       api.override = url => url === "/v1/health" ? json({ status: "ready", schema_version: 1, synthetic_only: synthetic }) : null;
-      connect(ui); await idle(ui);
+      connect(ui, "synthetic-lifecycle-token-mode-00000000000003"); await idle(ui);
       assert.equal(ui.elements.modeBadge.textContent, "Private backend data");
       assert.equal(shown(ui), 3);
       ui.elements.refreshButton.click(); await idle(ui);
       assert.match(ui.elements.announcement.textContent, /Refreshed saved backend records/, "an unchanged mode refreshes as before");
       synthetic = true;
       ui.elements.refreshButton.click(); await idle(ui);
-      assert.match(ui.elements.announcement.textContent, /it now accepts synthetic test data only\. Loaded records were removed from this page\. Connect again to continue\.$/);
+      assert.match(ui.elements.announcement.textContent, /it now accepts synthetic test data only\. Loaded records and the token were removed from this page\. Enter the token and connect again to continue\.$/);
       assert.equal(ui.elements.accessToken.focusCount, 1);
       assert.equal(ui.elements.modeBadge.textContent, "Not connected");
       assert.equal(shown(ui), 0);
+    });
+
+    if (variant === "local") await test("local (defensive; app.py cannot serve this): a mode change seen without a token mentions no token", async () => {
+      // app.py refuses real-data mode without a token, so a tokenless session meets a switch to it as a 401.
+      // Another backend might answer /v1/health without one; the message then names no removed token.
+      const api = backend(); const ui = setup(api.handler, fixture);
+      let synthetic = false;
+      api.override = url => url === "/v1/health" ? json({ status: "ready", schema_version: 1, synthetic_only: synthetic }) : null;
+      connect(ui); await idle(ui);
+      synthetic = true;
+      ui.elements.refreshButton.click(); await idle(ui);
+      assert.match(ui.elements.announcement.textContent, /it now accepts synthetic test data only\. Loaded records were removed from this page\. Connect again to continue\.$/);
+      assert.equal(ui.elements.accessToken.focusCount, 1);
     });
 
     await test(variant + ": a null /v1/health body is refused on Connect and on Refresh", async () => {

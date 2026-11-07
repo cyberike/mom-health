@@ -5,11 +5,19 @@
   const ui = Object.fromEntries(["modeBadge", "clearSession", "announcement", "accessToken", "connectForm", "connectButton", "demoButton", "deviceSelect", "moreDevices", "refreshButton", "sourceStatus", "latestBpm", "latestLabel", "latestTime", "sampleCount", "countNote", "receiptAge", "receiptNote", "rangeSelect", "chartEmpty", "chartWrap", "historyChart", "loadedStatus", "historyRows", "loadMore", "pageNote", "statusReportTime", "watchLink", "watchLinkNote", "watchBattery", "watchBatteryNote", "phoneQueue", "phoneQueueNote"].map(id => [id, el(id)]));
   let mode = "none", token = "", devices = [], rows = [], deviceCursor = null, sampleCursor = null;
   let gateway = null;
-  let selectedId = "", busy = false, generation = 0, controller = null, syntheticOnly = true, focusReturn = null, errorShown = false, statusLoaded = false, samplesLoaded = false;
+  let selectedId = "", busy = false, generation = 0, controller = null, syntheticOnly = true, focusReturn = null, described = null, errorShown = false, statusLoaded = false, samplesLoaded = false;
   const seenDeviceCursors = new Set(), seenSampleCursors = new Set();
   const dateFormat = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "medium" });
   const timeFormat = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" });
-  function say(message, error = false) { ui.announcement.textContent = message; ui.announcement.classList.toggle("error", error); errorShown = error; }
+  function say(message, error = false) { if (described) { described.removeAttribute("aria-describedby"); described = null; } ui.announcement.textContent = message; ui.announcement.classList.toggle("error", error); errorShown = error; }
+  // Keyboard focus that was lost continues at the Connect form, which the current message then describes
+  // for screen readers. The disabled Refresh button drops focus to <body>, and an emptied table scroller
+  // stays focused until Chromium moves focus to <body> later. Focus the user moved elsewhere stays put.
+  function continueAtConnect(control) {
+    const active = document.activeElement;
+    if (active && active !== document.body && !(active.closest && active.closest(".table-scroll"))) return;
+    described = control; control.setAttribute("aria-describedby", "announcement"); control.focus();
+  }
   function localTime(value) { return dateFormat.format(new Date(value)); }
   function currentDevice() { return devices.find(d => d.device_id === selectedId) || null; }
   function setBusy(value) {
@@ -199,15 +207,15 @@
     if (mode === "demo") { ui.demoButton.click(); return; }
     if (mode !== "backend") return;
     operation(async epoch => { const previous = selectedId; gateway = null; statusLoaded = false; render();
-      // Re-check the data mode first, so Refresh never requests or shows records after it changed. Watch changes
-      // and the pagers do not re-check until the next Refresh; a synthetic-only session still rejects real records.
+      // Re-check the data mode first: once this health read shows a change, Refresh requests and shows no records.
+      // A change after it is seen at the next Refresh, as for watch changes and the pagers; a synthetic-only
+      // session still rejects real records.
       const health = await readHealth(epoch);
       if (health.synthetic_only !== syntheticOnly) {
         // Connect accepts only a synthetic-only backend, so the change can only be to real data.
         clearSession(false);
-        say("The backend now reports that it accepts real watch data. This hosted candidate requires a synthetic-only backend, so loaded records were removed from this page and no records were requested.", true);
-        // The disabled Refresh button dropped keyboard focus; continue at the Connect form.
-        if (!document.activeElement || document.activeElement === document.body) ui.connectButton.focus();
+        say("The backend now reports that it accepts real watch data. This hosted candidate requires a synthetic-only backend, so loaded records were removed from this page and no records were requested. Connect again once the backend is synthetic-only.", true);
+        continueAtConnect(ui.connectButton);
         return;
       }
       seenDeviceCursors.clear(); await loadDevices(epoch, true); const moved = previous && selectedId !== previous; if (selectedId) { await loadSamplePage(epoch, true); await loadGatewayStatus(epoch); } ui.sourceStatus.textContent = "Backend checked: " + localTime(new Date().toISOString()) + " · No automatic polling"; say("Refreshed saved backend records and any gateway status report. Reported status is not proof of a current connection." + (moved ? (deviceCursor ? " The previously selected watch is not on the first page of sources, so another watch is shown; use Load more devices to find it." : " The previously selected watch is no longer listed, so another watch is shown.") : "")); });

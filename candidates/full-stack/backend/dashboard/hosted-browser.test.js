@@ -71,6 +71,19 @@ async function finish(view, expectedResourceError = null) {
 
 const idle = page => page.waitForFunction(() => document.getElementById("connectForm").getAttribute("aria-busy") === "false");
 const text = (page, id) => page.locator("#" + id).textContent();
+const active = page => page.evaluate(() => document.activeElement === document.body || !document.activeElement ? "BODY" : document.activeElement.id || document.activeElement.className || document.activeElement.tagName);
+const frames = page => page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+
+// The computed accessible description of the focused element, as Chromium exposes it to screen readers.
+async function focusedDescription(page) {
+  const client = await page.context().newCDPSession(page);
+  try {
+    const { nodes } = await client.send("Accessibility.getFullAXTree");
+    // The document's root node reports focus too; the focused control is the deepest node that does.
+    const focused = nodes.filter(node => (node.properties || []).some(property => property.name === "focused" && property.value.value)).pop();
+    return focused && focused.description ? focused.description.value : "";
+  } finally { await client.detach(); }
+}
 
 async function connected(view) {
   await view.page.click("#connectButton");
@@ -203,9 +216,37 @@ async function check(name, action) { await action(); passed++; console.log("PASS
     await page.focus("#refreshButton");
     await page.keyboard.press("Enter"); await idle(page);
     assert.deepEqual(view.requests.slice(before).map(url => new URL(url).pathname), ["/v1/health"]);
-    assert.match(await text(page, "announcement"), /This hosted candidate requires a synthetic-only backend, so loaded records were removed from this page and no records were requested\./);
+    assert.match(await text(page, "announcement"), /This hosted candidate requires a synthetic-only backend, so loaded records were removed from this page and no records were requested\. Connect again once the backend is synthetic-only\./);
     assert.equal(await page.evaluate(() => document.activeElement.id), "connectButton");
+    assert.match(await focusedDescription(page), /Connect again once the backend is synthetic-only/, "the Connect button is described by the message");
     await finish(view);
+  }));
+
+  await check("direct_candidate.py: after a mode change on Refresh, focus moved to the range selector stays and focus on the emptied table goes to Connect", () => withHosted("direct", async (browser, backend) => {
+    // Enough fictional rows for the table to scroll, which makes it a keyboard stop in Chromium.
+    const samples = Array.from({ length: 12 }, (_, i) => ({ sample_id: randomUUID(), device_id: DEVICE, session_id: randomUUID(), model: "V8", source: "live",
+      received_at: new Date(Date.now() - (i + 5) * 60000).toISOString(), measured_at: null, heart_rate_bpm: 70 + i, missing_reason: null, synthetic: true }));
+    assert.equal((await phonePost(backend, "direct", "/v1/batches", { schema_version: 1, batch_id: randomUUID(), samples })).status, 200);
+    for (const [tabs, moved, expected] of [[1, "rangeSelect", "rangeSelect"], [2, "table-scroll", "connectButton"]]) {
+      const view = await signIn(browser, "direct", CAREGIVER);
+      const page = view.page;
+      assert.equal((await connected(view)).count, "15");
+      let release;
+      const held = new Promise(resolve => { release = resolve; });
+      await page.route("**/v1/health", async route => { await held; await route.fulfill({ status: 200, contentType: "application/json",
+        body: JSON.stringify({ status: "ready", schema_version: 1, synthetic_only: false }) }); });
+      await page.focus("#refreshButton");
+      await page.keyboard.press("Enter");
+      for (let i = 0; i < tabs; i++) await page.keyboard.press("Tab");
+      assert.equal(await active(page), moved, "Tab x" + tabs + " while Refresh waits");
+      release(); await idle(page); await frames(page);
+      assert.match(await text(page, "announcement"), /requires a synthetic-only backend/);
+      assert.equal(await active(page), expected, "focus after the mode change, moved to " + moved);
+      const description = await focusedDescription(page);
+      if (expected === "connectButton") assert.match(description, /Connect again once the backend is synthetic-only/);
+      else assert.doesNotMatch(description, /Connect again/);
+      await finish(view);
+    }
   }));
 
   console.log(passed + " hosted real-browser checks passed. Headless Chromium with real Basic sign-in against loopback gateway.py and direct_candidate.py; fictional host, credentials and records. Not TLS, proxy, Railway edge, public-domain or deployment validation.");

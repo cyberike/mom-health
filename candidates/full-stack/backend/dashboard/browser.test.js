@@ -75,6 +75,26 @@ const idle = page => page.waitForFunction(() => document.getElementById("connect
 const text = (page, id) => page.locator("#" + id).textContent();
 const active = page => page.evaluate(() => document.activeElement === document.body || !document.activeElement ? "BODY" : document.activeElement.id || document.activeElement.className || document.activeElement.tagName);
 
+// The computed accessible description of the focused element, as Chromium exposes it to screen readers.
+async function focusedDescription(page) {
+  const client = await page.context().newCDPSession(page);
+  try {
+    const { nodes } = await client.send("Accessibility.getFullAXTree");
+    // The document's root node reports focus too; the focused control is the deepest node that does.
+    const focused = nodes.filter(node => (node.properties || []).some(property => property.name === "focused" && property.value.value)).pop();
+    return focused && focused.description ? focused.description.value : "";
+  } finally { await client.detach(); }
+}
+
+// Answers /v1/health only when released, so keys can be pressed while a Refresh waits.
+async function holdHealth(page, body) {
+  let release;
+  const held = new Promise(resolve => { release = resolve; });
+  await page.route("**/v1/health", async route => { await held; await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) }); });
+  return release;
+}
+const frames = page => page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+
 async function connect(page, token = TOKEN) {
   await page.fill("#accessToken", token);
   await page.click("#connectButton");
@@ -407,8 +427,29 @@ async function check(name, action) { await action(); passed++; console.log("PASS
       assert.match(await text(view.page, "announcement"), /Loaded records and the token were removed from this page\. Enter the token and connect again to continue\./);
       assert.equal(await view.page.locator("#announcement.error").count(), 1);
       assert.equal(await active(view.page), "accessToken");
+      assert.match(await focusedDescription(view.page), /Loaded records and the token were removed from this page/, "the token field is described by the message");
       assert.equal(await text(view.page, "modeBadge"), "Not connected");
       await close(view);
+    });
+
+    await check("after a mode change on Refresh, focus moved to the range selector stays and focus on the emptied table goes to the token field", async () => {
+      for (const [tabs, moved, expected] of [[1, "rangeSelect", "rangeSelect"], [2, "table-scroll", "accessToken"]]) {
+        const view = await open(seeded);
+        await connect(view.page);
+        const release = await holdHealth(view.page, { status: "ready", schema_version: 1, synthetic_only: false });
+        await view.page.focus("#refreshButton");
+        await view.page.keyboard.press("Enter");
+        assert.equal(await view.page.locator("#connectForm").getAttribute("aria-busy"), "true");
+        for (let i = 0; i < tabs; i++) await view.page.keyboard.press("Tab");
+        assert.equal(await active(view.page), moved, "Tab x" + tabs + " while Refresh waits");
+        release(); await idle(view.page); await frames(view.page);
+        assert.match(await text(view.page, "announcement"), /now accepts real watch data/);
+        assert.equal(await active(view.page), expected, "focus after the mode change, moved to " + moved);
+        const description = await focusedDescription(view.page);
+        if (expected === "accessToken") assert.match(description, /Enter the token and connect again/);
+        else assert.doesNotMatch(description, /connect again/);
+        await close(view);
+      }
     });
 
     const phones = [[320, 640], [360, 740], [375, 812], [414, 896], [768, 1024]];

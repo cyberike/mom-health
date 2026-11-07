@@ -12,10 +12,13 @@ class Element {
   append(...children) { this.children.push(...children); }
   replaceChildren(...children) { this.children = children; }
   setAttribute(key, value) { this.attributes[key] = value; }
+  getAttribute(key) { return Object.prototype.hasOwnProperty.call(this.attributes, key) ? this.attributes[key] : null; }
+  removeAttribute(key) { delete this.attributes[key]; }
+  closest(selector) { return selector.startsWith(".") && String(this.className || "").split(" ").includes(selector.slice(1)) ? this : null; }
   addEventListener(event, handler) { this.listeners[event] = handler; }
   querySelector(selector) { this.parts ||= {}; return this.parts[selector] ||= new Element(selector); }
   click() { if (!this.disabled && this.listeners.click) this.listeners.click({ preventDefault() {} }); }
-  focus() { this.focusCount = (this.focusCount || 0) + 1; }
+  focus() { this.focusCount = (this.focusCount || 0) + 1; if (this.ownerDocument) this.ownerDocument.activeElement = this; }
 }
 const html = fs.readFileSync(path.join(__dirname, "index.html"), "utf8");
 const source = fs.readFileSync(path.join(__dirname, "app.js"), "utf8");
@@ -26,11 +29,16 @@ function setup(handler, fixture = {}) {
   elements.rangeSelect.value = "all";
   const calls = [], lifecycle = {};
   const window = { MomHealthDashboard: core, addEventListener(event, action) { lifecycle[event] = action; } };
-  const context = { window, document: { getElementById: id => elements[id], createElement: tag => new Element(tag), createElementNS: (namespace, tag) => new Element(tag) }, location: { protocol: "http:" }, URLSearchParams, AbortController, TextDecoder, Uint8Array, Intl, Date,
+  // activeElement starts on <body>; focus() moves it, and a check may set it to stand for the user moving focus.
+  const body = new Element("body"), document = { body, activeElement: body, getElementById: id => elements[id] };
+  const owned = element => { element.ownerDocument = document; return element; };
+  Object.values(elements).forEach(owned);
+  Object.assign(document, { createElement: tag => owned(new Element(tag)), createElementNS: (namespace, tag) => owned(new Element(tag)) });
+  const context = { window, document, location: { protocol: "http:" }, URLSearchParams, AbortController, TextDecoder, Uint8Array, Intl, Date,
     setTimeout: fixture.setTimeout || setTimeout, clearTimeout: fixture.clearTimeout || clearTimeout,
     fetch: async (url, options) => { calls.push({ url, options }); return handler(url, options); } };
   vm.runInNewContext(script, context, { filename: "app.js" });
-  return { elements, calls, lifecycle };
+  return { elements, calls, lifecycle, document };
 }
 const json = value => new Response(JSON.stringify(value), { status: 200, headers: { "content-type": "application/json" } });
 async function idle(ui) { for (let i = 0; i < 100; i++) { if (!ui.elements.connectButton.disabled) return; await new Promise(resolve => setImmediate(resolve)); } throw new Error("UI operation did not finish"); }
