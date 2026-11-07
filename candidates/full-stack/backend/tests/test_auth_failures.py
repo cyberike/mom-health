@@ -82,6 +82,29 @@ class BoundaryAuthorizationTests(unittest.TestCase):
             with self.subTest(method=method, path=path):
                 self.assertEqual(401, client.request(method, path).status_code)
 
+    def test_every_rejection_carries_the_security_headers(self):
+        client = self.client()
+        served = client.get('/v1/health', headers={'Authorization': 'Bearer ' + TOKEN})
+        expected = {name: served.headers[name] for name in ('cache-control', 'x-content-type-options', 'referrer-policy',
+                                                           'x-frame-options', 'content-security-policy')}
+        self.assertEqual(('no-store', 'nosniff', 'DENY'), (expected['cache-control'], expected['x-content-type-options'], expected['x-frame-options']))
+        hosted = TestClient(create_app(Settings(sqlite_path=str(self.database), access_token=TOKEN, hosted_hostname='care.example.org')), client=('127.0.0.1', 50000))
+        remote = TestClient(create_app(Settings(sqlite_path=str(self.database), access_token=TOKEN)), client=('192.0.2.10', 50000))
+        rejections = {
+            '401 missing token': client.get('/v1/devices'),
+            '400 duplicate authorization': client.get('/v1/health', headers=[('Authorization', 'Bearer ' + TOKEN)] * 2),
+            '413 oversized body': client.post('/v1/batches', content=b'{' + b' ' * 200000 + b'}',
+                                              headers={'Authorization': 'Bearer ' + TOKEN, 'Content-Type': 'application/json'}),
+            '403 non-loopback client': remote.get('/v1/health'),
+            '403 wrong hosted origin': hosted.get('/v1/health', headers={'Authorization': 'Bearer ' + TOKEN}),
+        }
+        for label, response in rejections.items():
+            with self.subTest(rejection=label):
+                self.assertEqual(int(label[:3]), response.status_code)
+                self.assertEqual(expected, {name: response.headers.get(name) for name in expected})
+                self.assertEqual(['no-store'], response.headers.get_list('cache-control'))
+        self.assertEqual([0, 0, 0], self.stored())
+
     def test_real_http_trims_surrounding_whitespace_but_not_inner_spacing(self):
         # The Boundary compares the header byte-exactly. Over a real listener,
         # h11 strips optional whitespace around a field value (RFC 9110), so a
