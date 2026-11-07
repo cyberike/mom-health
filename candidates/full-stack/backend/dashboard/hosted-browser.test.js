@@ -35,6 +35,15 @@ function phonePost(backend, mode, route, body) {
   });
 }
 
+function unsignedGet(backend, route) {
+  // A caregiver read with no Authorization header: one failure for gateway.py's role-wide budget.
+  return new Promise((resolve, reject) => {
+    const request = http.request({ host: "127.0.0.1", port: backend.port, method: "GET", path: route, agent: false,
+      headers: { Host: HOST, "X-Forwarded-Proto": "https" } }, response => { response.resume(); response.on("end", () => resolve(response.statusCode)); });
+    request.on("error", reject); request.end();
+  });
+}
+
 async function seed(backend, mode) {
   const samples = [72, 74, null].map((bpm, i) => ({ sample_id: randomUUID(), device_id: DEVICE, session_id: randomUUID(), model: "V8", source: "live",
     received_at: new Date(Date.now() - (i + 1) * 60000).toISOString(), measured_at: null, heart_rate_bpm: bpm, missing_reason: bpm === null ? "no_result" : null, synthetic: true }));
@@ -114,6 +123,21 @@ async function check(name, action) { await action(); passed++; console.log("PASS
     }
     assert.notEqual(refusedAt, null, "expected the documented role-wide lockout within eight legitimate sign-ins");
     console.log("     observed: legitimate fresh sign-in #" + refusedAt + " was refused with 429 (no wrong password was used)");
+  }));
+
+  await check("gateway.py: a lockout after connecting says how long the gateway asked to wait", () => withHosted("gateway", async (browser, backend) => {
+    const view = await signIn(browser, "gateway", CAREGIVER);
+    assert.equal((await connected(view)).count, "3");
+    const statuses = [];
+    while (!statuses.includes(429) && statuses.length < 12) statuses.push(await unsignedGet(backend, "/v1/devices"));
+    assert(statuses.includes(429) && statuses.every(code => code === 401 || code === 429), String(statuses));
+    await view.page.click("#refreshButton");
+    await idle(view.page);
+    const announcement = await text(view.page, "announcement");
+    assert.match(announcement, /HTTP 429\)\. No current data was confirmed\. The backend asked to wait about (\d+) seconds before trying again; no automatic retry occurs\./);
+    const seconds = Number(/about (\d+) seconds/.exec(announcement)[1]);
+    assert(seconds >= 45 && seconds <= 60, announcement);
+    await finish(view, /status of 429/);
   }));
 
   await check("direct_candidate.py: repeated legitimate fresh sign-ins are never throttled", () => withHosted("direct", async browser => {

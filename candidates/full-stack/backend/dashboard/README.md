@@ -13,6 +13,7 @@ Buildless original HTML/CSS/JavaScript, served by the existing FastAPI backend a
 - Explicit synthetic preview generated locally, marked in the banner and metrics. It makes no API call and is never sent to the server. Initial state is empty, not a fabricated patient overview.
 - Clear session removes loaded records/token and cancels outstanding requests. Leaving the page clears the in-memory session. Every new session (Connect, preview or Clear session) starts from all loaded data, so an earlier time-range choice never hides records. No automatic polling, upload, background activity or browser persistence.
 - Refresh first re-checks `/v1/health`. If the backend's data mode changed since Connect (synthetic-only or real data), the session is cleared and nothing is requested under the new mode; connect again deliberately.
+- Error messages state any wait the backend asks for with `Retry-After` (for example a 429 sign-in lockout), in seconds, minutes or hours. Nothing retries automatically.
 
 The backend enforces loopback and API authorization. Static HTML/JS/CSS shell can be served without the token so a caregiver can enter it; the shell contains no health data. This is not public hosting or a production multi-user identity system. No ongoing-access credential has been generated or configured.
 

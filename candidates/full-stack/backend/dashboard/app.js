@@ -49,7 +49,12 @@
       // A connection failure gets the same caregiver wording as HTTP errors; aborts propagate.
       catch (error) { if (error && error.name === "AbortError") throw error; throw new Error("The backend could not be reached. No current data was confirmed."); }
       if (generation !== epoch) throw new Error("Cancelled");
-      if (!response.ok) throw new Error(response.status === 401 ? "Access was refused. Check the caregiver token, then connect again." : response.status === 403 ? "Backend denied this request. Check the caregiver access configuration." : "Backend request failed (HTTP " + response.status + "). No current data was confirmed.");
+      if (!response.ok) {
+        // Say how long the backend asked to wait (Retry-After); nothing retries automatically.
+        const wait = core.retryAfterLabel(response.headers.get("retry-after")), advice = wait ? " The backend asked to wait " + wait + " before trying again; no automatic retry occurs." : "";
+        if (response.status === 429) throw new Error("Too many requests or sign-in attempts (HTTP 429). No current data was confirmed." + (advice || " Wait before trying again; no automatic retry occurs."));
+        throw new Error((response.status === 401 ? "Access was refused. Check the caregiver token, then connect again." : response.status === 403 ? "Backend denied this request. Check the caregiver access configuration." : "Backend request failed (HTTP " + response.status + "). No current data was confirmed.") + advice);
+      }
       if (!(response.headers.get("content-type") || "").includes("application/json")) throw new Error("Backend returned an unsupported response.");
       const reader = response.body.getReader(); const chunks = []; let bytes = 0;
       while (true) { const part = await reader.read(); if (part.done) break; bytes += part.value.byteLength; if (bytes > 262144) { await reader.cancel(); throw new Error("Backend response exceeded the dashboard limit."); } chunks.push(part.value); }

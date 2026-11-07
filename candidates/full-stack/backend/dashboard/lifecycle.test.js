@@ -365,6 +365,26 @@ async function test(name, action) { await action(); passed++; console.log("PASS 
       });
     }
 
+    await test(variant + ": a 429 says how long the backend asked to wait, and nothing retries automatically", async () => {
+      const api = backend(); const ui = setup(api.handler, fixture);
+      connect(ui); await idle(ui);
+      const later = new Date(Date.now() + 120000).toUTCString();
+      const answer = (status, headers) => new Response(JSON.stringify({ detail: "synthetic refusal" }), { status, headers: { "content-type": "application/json", ...headers } });
+      for (const [headers, wait] of [[{ "retry-after": "45" }, /asked to wait about 45 seconds before trying again/], [{ "retry-after": later }, /asked to wait about 2 minutes before trying again/],
+        [{}, /Wait before trying again/], [{ "retry-after": "soon" }, /Wait before trying again/]]) {
+        api.override = url => url.startsWith("/v1/devices?") ? answer(429, headers) : null;
+        const before = ui.calls.length;
+        ui.elements.refreshButton.click(); await idle(ui);
+        assert.match(ui.elements.announcement.textContent, /HTTP 429/);
+        assert.match(ui.elements.announcement.textContent, wait);
+        assert.match(ui.elements.announcement.textContent, /no automatic retry occurs/);
+        assert.deepEqual(ui.calls.slice(before).map(c => c.url.split("?")[0]), ["/v1/health", "/v1/devices"], "no automatic retry");
+      }
+      api.override = url => url.startsWith("/v1/devices?") ? answer(503, { "retry-after": "5" }) : null;
+      ui.elements.refreshButton.click(); await idle(ui);
+      assert.match(ui.elements.announcement.textContent, /HTTP 503\)\. No current data was confirmed\. The backend asked to wait about 5 seconds/);
+    });
+
     await test(variant + ": every new session starts from the widest time range", async () => {
       const api = backend(); const ui = setup(api.handler, fixture);
       const choose = value => { ui.elements.rangeSelect.value = value; ui.elements.rangeSelect.listeners.change(); };
