@@ -7,7 +7,7 @@ This is local synthetic testing in a cloud Linux container. Nothing was deployed
 ## Restrictions kept
 
 - Handoff boundaries are unchanged: the Rekor/Caddy signature verification remains unresolved and was not retried; the rejected Railway public-domain action was not retried or approximated; no new persistent credentials, accounts, services or costs were created; WSL, Docker and emulator-ADB denials were respected.
-- Only fictional records and obviously fictional in-test credentials were used. Every database was a fresh disposable SQLite file under the gitignored `candidates/full-stack/build/<suite>/<uuid>/`, retained for inspection like the existing suites. The browser launcher refuses any database outside its own fixture directory.
+- Only fictional records and obviously fictional in-test credentials were used. Every database was a fresh disposable SQLite file under the gitignored `candidates/full-stack/build/<suite>/<uuid>/`, retained for inspection like the existing suites, or (in the November 7 follow-up) a throwaway local PostgreSQL cluster described there. The browser launcher refuses any database outside its own fixture directory.
 - Servers bound only to `127.0.0.1`. The real-browser checks launch headless Chromium with no proxy and a host-resolver rule that makes every hostname fail except explicit loopback mappings, and every check asserts that all requests stayed on loopback. The fictional host `synthetic.example.com` resolved to loopback inside that browser only; no DNS, domain, tunnel or provider was involved.
 - The original fail-closed `gateway.py` and `direct_candidate.py` code was not modified (RAILWAY_DIRECT_DECISION_20261029.md asks to keep the original gateway intact). Their behavior is measured and pinned below; one README sentence was added.
 
@@ -133,7 +133,7 @@ The full backend run takes about 27 s and both browser suites about 50 s on four
 
 ## Blocked or not run
 
-- PostgreSQL runtime, including the new advisory-lock path in `save_status`: no psycopg or server, and Docker remains denied.
+- PostgreSQL on a hosted or managed instance (Railway or any other): not attempted. PostgreSQL ran only on throwaway local clusters in this container (follow-up below); Docker remains denied.
 - Caddy and the Rekor transparency check: unchanged and not retried. Railway domain, deployment, public HTTPS, a real proxy or edge: not attempted.
 - Phone, watch, BLE, Android storage, ADB, emulator, S25 Ultra: not allowed. The Android portable Java suites were not run; they are outside this request and their runner ships in the build kit, not this repository.
 - Firefox, WebKit/Safari, headed browsers with a native Basic sign-in prompt, real mobile browsers and screen readers: not available here.
@@ -145,7 +145,8 @@ The full backend run takes about 27 s and both browser suites about 50 s on four
 - [ ] Choose the ingress candidate in light of the measured `gateway.py` sign-in lockout, and decide items 2, 5, 6 and 7 above.
 - [ ] Resolve the Rekor/Caddy verification through legitimately applied, confirmed scoped access, then run the prepared Caddy loopback harness.
 - [ ] Resolve the rejected Railway public-domain action through the applicable review; only then a protected synthetic hosted test.
-- [ ] PostgreSQL parity, concurrency and rollback on an approved isolated instance, including the new status lock.
+- [x] PostgreSQL parity, concurrency, rollback and crash recovery, including the status lock, on throwaway local PostgreSQL 16 clusters (follow-up below).
+- [ ] If PostgreSQL is chosen over the Railway SQLite volume: the same suite against the intended instance's settings (TLS, connection limits, its locale and default isolation), and a server-side `idle_in_transaction_session_timeout` decision (follow-up below).
 - [ ] Browser QA beyond headless Chromium: Firefox and Safari, real phones, VoiceOver/TalkBack/NVDA, real 200%/400% zoom, the native sign-in prompt and its cache.
 - [ ] Supervised phone acceptance per `PHONE_ACCEPTANCE_0.8.3.md`, with the user's participation and approvals.
 - [ ] Real phone-to-server HTTPS upload to an approved destination; caregiver login and role isolation over real HTTPS; synthetic end-to-end result.
@@ -156,3 +157,78 @@ The full backend run takes about 27 s and both browser suites about 50 s on four
 ## Method
 
 Test strength was checked with mutants that the new tests must kill: deferred transactions, an unbound descending cursor scope, a removed 12-hex rule, a lost hot journal, two admission-slot leaks and commit instead of rollback on error. Product fixes were validated in a separate copy and committed one defect at a time, each with the test that fails without it, while the review agents kept reading the unchanged starting code.
+
+## Follow-up, November 7, 2026
+
+After reviewing the branch, the owner approved three follow-ups: a pull request ([cyberike/mom-health#1](https://github.com/cyberike/mom-health/pull/1); not merged), PostgreSQL testing on a throwaway database in this container, and conservative defaults for some of the findings above. Every restriction listed at the top still applies.
+
+### PostgreSQL parity on throwaway local clusters
+
+**Environment and isolation.**
+
+- The container already had the Ubuntu PostgreSQL 16.15 server packages. Its stock `main` cluster was stopped and was not touched.
+- psycopg[binary] 3.3.8 (bundled libpq 18.0.6) was installed into the same virtual environment outside the repository.
+- `backend/tests/postgresql_throwaway.py` creates a new cluster for each run under the gitignored `build/postgresql-fixtures/<id>/`:
+  - The server listens only on a Unix socket in an owner-only directory. `listen_addresses` is empty, so there is no TCP listener.
+  - Authentication is `trust` on that socket; TCP is set to `reject`.
+  - `fsync`, `synchronous_commit` and `full_page_writes` are on.
+  - One fictional non-superuser role owns one `mom_health_synthetic_*` database. The suite refuses any database with another name.
+- PostgreSQL refuses to run as root, so the server ran as the container's existing `postgres` account through `runuser`.
+- After each run the launcher stops the server and confirms that it exited: `pg_ctl status` reports it stopped, `postmaster.pid` is gone, and no process names the data directory. With `--discard`, it then deletes the cluster.
+- Each test works in its own schema, which is dropped afterwards.
+- No password, network listener or persistent credential was created, and all data was fictional.
+
+**Coverage.** `backend/tests/postgresql_parity.py` has 37 tests. It is opt-in, like `integration_contract_android`. Without psycopg or a database it fails with `POSTGRESQL PARITY CHECKS NOT RUN` and never reports a pass.
+
+These suites run unchanged, on PostgreSQL:
+
+- `test_backend.RepositoryTests` (13). The three tests that open the SQLite file are replaced by PostgreSQL equivalents, one of which injects a fault with a real PL/pgSQL trigger.
+- `test_concurrent_retries.RepositoryRaceTests` (5).
+- `test_device_isolation.DeviceIsolationTests` (5).
+- The two app-restart tests in `test_restart_recovery`.
+
+New checks:
+
+- **Startup.** Eight concurrent first starts create one schema. Startup waits for a brief peer and fails closed on a persistent one; the peer is either another instance's migration lock or an uncommitted write.
+- **Killed session.** A session terminated with `pg_terminate_backend` in the middle of a 100-sample ingest leaves nothing behind, and the retry commits once.
+- **Server crash.** The server is crash-stopped with `pg_ctl stop -m immediate` while an ingest is open:
+  - Batches acknowledged before the crash survive recovery, and replaying them returns identical receipts.
+  - The open transaction leaves nothing behind.
+  - Writes and reads during the outage get 503; `/v1/health` still says "ready" (finding 5).
+  - Retries commit exactly once.
+- **Locks.** A brief and a persistent lock holder, for both uploads and status reports.
+- **Status reports.** Delayed and 32-way concurrent status reports test the status lock 7240090003.
+- **Isolation settings.** The same races run under stricter default isolation levels.
+- **Lost acknowledgment.** A durable commit whose acknowledgment is lost; the retry gets the receipt.
+- **Disconnect.** A client gives up mid-ingest while its identical retry waits on the ingest lock.
+- **Collation.** The device listing keeps byte order under a linguistic collation.
+
+**Defects found and fixed** (`repository.py`, PostgreSQL path only). Each has a regression test that fails without the fix:
+
+| # | Defect | Evidence before the fix | Fix | Regression test |
+| --- | --- | --- | --- | --- |
+| 14 | Lock waits had no limit (PostgreSQL's `lock_timeout` defaults to 0). A peer holding the upload, status or migration lock, or an uncommitted write, made uploads and status reports wait indefinitely and made startup hang. SQLite answers 503 after its 5 s busy timeout and fails startup closed. | Requests still waiting after 20 s; startup never finished, so the test server could not be stopped | `SET LOCAL lock_timeout = '5s'` in every PostgreSQL transaction. `SET LOCAL` also works behind transaction-pooling proxies. | `PostgreSQLWriteLockTests...persistent_lock_holder_yields_503...`, `PostgreSQLRestartTests...startup_waits_for_a_brief_peer...` |
+| 15 | The advisory-lock protocol depended on the server's default isolation level. If a server, database or role sets `default_transaction_isolation` to repeatable read or serializable, the snapshot is taken before the lock wait. Identical concurrent retries then hit unique-key violations or serialization failures and got 503 instead of the stored receipt. No duplicate or wrong acknowledgment occurred. | 15 of 16 identical retries failed under repeatable read; 12 of 16 under serializable | Every connection runs in READ COMMITTED | `PostgreSQLWriteLockTests...stricter_default_isolation_level` |
+| 16 | The device listing and its cursor followed the database locale. Under a linguistic collation (here ICU `en-US`; hosted servers are commonly initialized with `en_US.utf8`), the same watches were listed in a different order from SQLite: lowercase before uppercase, `_` before `-`. Nothing was skipped or repeated. | The inherited listing test, run against an ICU database | `COLLATE "C"` (byte order, like SQLite) for the listing and its cursor | `PostgreSQLDeviceIsolationTests...linguistic_collation`, which forces a linguistic column collation so it fails without the fix on any server with ICU |
+
+**Mutants.** Each of these changes makes at least one test fail (6 of 6): removing any one of the three advisory locks (7240090001 migration, 7240090002 upload, 7240090003 status), the READ COMMITTED setting, the lock timeout, or the byte-order collation.
+
+**Commands and results** (from `candidates/full-stack/backend`, outside environment first on `PATH`, as root):
+
+| Command | Result |
+| --- | --- |
+| `python tests/postgresql_throwaway.py --run-as postgres -- python -m unittest tests.postgresql_parity -v` | 37 OK in 28 s (C locale), server stopped and exited |
+| `python tests/postgresql_throwaway.py --run-as postgres --locale icu-en-US -- python -m unittest tests.postgresql_parity -v` | 37 OK in 28 s (ICU `en-US`), server stopped and exited |
+| The same against the code before the fixes | C: 6 failures (4 lock-wait subtests, 2 isolation subtests); ICU: also the listing order |
+| `python -m unittest tests.postgresql_parity` without a database | exits 1: `POSTGRESQL PARITY CHECKS NOT RUN` |
+| `python -m unittest discover -s tests -v` | still 172 OK (1 Windows-only skip); the parity module is not discovered |
+
+Run as a non-root account, the launcher needs no `--run-as`. The two cluster directories from the runs on unfixed code (stopped, fictional data, about 47 MB each) were retained under `build/postgresql-fixtures/`; the other runs used `--discard`.
+
+**Not shown.**
+
+- Hosted or managed PostgreSQL, TLS, real network latency, connection limits under production load (each request opens its own connection), replication and failover.
+- glibc `en_US` collation: the locale isn't installed here, so ICU stood in for it.
+- PostgreSQL versions other than 16.15, and psycopg versions other than 3.3.8.
+
+**Operational note for the owner.** If the app host disappears mid-transaction (power loss or a network partition), PostgreSQL keeps that session's locks until it notices the dead connection, which with default TCP keepalives can take hours. Until then, every write is answered 503 after 5 s. A server-side `idle_in_transaction_session_timeout` of about a minute would bound this. That is a server-configuration choice and was not made here.

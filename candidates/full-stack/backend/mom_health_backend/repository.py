@@ -143,7 +143,10 @@ class Repository:
         try:
             policy = "" if allow_real else " AND synthetic=1"
             selection="" if allow_real else " WHERE synthetic=1"
-            groups=self.execute(connection,"SELECT device_id FROM (SELECT device_id FROM samples"+selection+" UNION SELECT device_id FROM gateway_status"+selection+") AS known_devices WHERE device_id>? ORDER BY device_id LIMIT ?",(cursor or "",limit+1)).fetchall()
+            # Byte order on both backends (SQLite's default), so the listing and
+            # its cursor do not depend on a PostgreSQL database's locale.
+            order=' COLLATE "C"' if self.postgres else ""
+            groups=self.execute(connection,"SELECT device_id FROM (SELECT device_id FROM samples"+selection+" UNION SELECT device_id FROM gateway_status"+selection+") AS known_devices WHERE device_id"+order+">? ORDER BY device_id"+order+" LIMIT ?",(cursor or "",limit+1)).fetchall()
             result=[]
             for (device,) in groups[:limit]:
                 count,seq=self.execute(connection,"SELECT COUNT(*),MAX(seq) FROM samples WHERE device_id=?"+policy,(device,)).fetchone()
@@ -207,4 +210,17 @@ class PostgreSQLRepository(Repository):
             import psycopg
         except ImportError as exc:
             raise RuntimeError("PostgreSQL requires the separately approved psycopg dependency") from exc
-        return psycopg.connect(self.dsn, connect_timeout=5)
+        connection = psycopg.connect(self.dsn, connect_timeout=5)
+        try:
+            # Every operation is one transaction on its own connection. READ
+            # COMMITTED whatever the server or role default, so each statement
+            # after an advisory lock sees the previous holder's commit; and lock
+            # waits bounded like SQLite's 5 s busy timeout, so a stuck holder is
+            # answered 503 instead of holding a worker indefinitely. SET LOCAL
+            # also works behind transaction-pooling proxies.
+            connection.isolation_level = psycopg.IsolationLevel.READ_COMMITTED
+            connection.execute("SET LOCAL lock_timeout = '5s'")
+        except BaseException:
+            connection.close()
+            raise
+        return connection
