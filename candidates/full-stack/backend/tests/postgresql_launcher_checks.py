@@ -3,18 +3,20 @@
 Not collected by ``unittest discover``. The launch checks need Linux and the
 PostgreSQL server binaries; as root, the launcher's server runs as the postgres
 account, and the failed-setup check also runs once as that account without
---run-as. Most launch checks run a private copy of the launcher in a unique
-directory under build/ (deep enough that its socket goes in a private directory
-under /tmp), with a small probe command and --discard, so every cluster is
-removed again and concurrent runs cannot disturb each other. The other checks
-need only POSIX. From candidates/full-stack/backend:
+--run-as. Each launch check runs a private copy of the launcher in a unique
+directory (under build/, deep enough that its socket goes in a private
+directory under /tmp; one layout of the ownership check uses a short copy under
+/tmp, whose socket stays in the cluster), with a small probe command and
+--discard, so every cluster is removed again and concurrent runs cannot disturb
+each other. The other checks need only POSIX, and the module imports anywhere.
+From candidates/full-stack/backend:
 
     python -m unittest tests.postgresql_launcher_checks -v
 """
+import itertools
 import json
 import os
 from pathlib import Path
-import pty
 import select
 import shutil
 import signal
@@ -56,6 +58,44 @@ import signal, time
 print('SIGHUP ignored:', signal.getsignal(signal.SIGHUP) == signal.SIG_IGN, flush=True)
 time.sleep(3)
 print('finished normally', flush=True)
+'''
+UNTIL = r'''
+import os, time
+while not os.path.exists(%r):
+    time.sleep(0.05)
+'''
+# Runs the launcher with a SIGTERM to itself just before or just after Popen has started the command,
+# which is where a signal sent to the launcher alone lands if it arrives while the command starts.
+SIGNAL_WHILE_STARTING = r'''
+import os, runpy, signal, subprocess, sys
+when, marker, launcher = sys.argv[1:4]
+
+
+class Popen(subprocess.Popen):
+    def __init__(self, args, *rest, **options):
+        command = marker in str(args)
+        if command and when == 'before':
+            os.kill(os.getpid(), signal.SIGTERM)
+        super().__init__(args, *rest, **options)
+        if command:
+            print('command started as', self.pid, file=sys.stderr, flush=True)
+            if when == 'after':
+                os.kill(os.getpid(), signal.SIGTERM)
+
+
+subprocess.Popen = Popen
+sys.argv = sys.argv[3:]
+runpy.run_path(launcher, run_name='__main__')
+'''
+# A status line written after the reader went away, then an exit with the given status.
+CLOSED_STREAM = r'''
+import sys
+sys.path.insert(0, sys.argv[1])
+import postgresql_throwaway as launcher
+sys.stdin.readline()  # the parent has closed its end of our stderr
+for line in range(3):
+    launcher.say('Throwaway PostgreSQL status line %d' % line)
+sys.exit(143)
 '''
 
 
@@ -113,31 +153,33 @@ def remove_copy(root):
     shutil.rmtree(root, ignore_errors=True)
 
 
-def private_copy(test, owner=None):
-    """A launcher copy in a unique directory under build/, removed after the test. Its in-cluster
-    socket path is longer than a Unix socket allows."""
+def private_copy(test, owner=None, short=False):
+    """A launcher copy in a unique directory, removed after the test. Under build/ its in-cluster socket
+    path is longer than a Unix socket allows; a short copy under /tmp keeps its socket in the cluster."""
     launcher.FIXTURES.parent.mkdir(parents=True, exist_ok=True)
-    root = Path(tempfile.mkdtemp(prefix='launcher-check-', dir=launcher.FIXTURES.parent))
+    root = Path(tempfile.mkdtemp(prefix='lc-' if short else 'launcher-check-', dir='/tmp' if short else launcher.FIXTURES.parent))
     test.addCleanup(remove_copy, root)
     root.chmod(0o755)  # the server account must reach data/ inside it
-    script = root / ('deep-checkout-' + 'd' * 16) / 'backend' / 'tests' / 'postgresql_throwaway.py'
+    script = root / ('' if short else 'deep-checkout-' + 'd' * 16) / 'backend' / 'tests' / 'postgresql_throwaway.py'
     script.parent.mkdir(parents=True)
     shutil.copy(launcher.__file__, script)
     fixtures = script.parents[2] / 'build' / 'postgresql-fixtures'
-    test.assertGreater(len(str(fixtures / ('x' * 12) / 's' / '.s.PGSQL.5432').encode()), launcher.SOCKET_PATH_LIMIT)
+    socket = len(str(fixtures / ('x' * 12) / 's' / '.s.PGSQL.5432').encode())
+    (test.assertLessEqual if short else test.assertGreater)(socket, launcher.SOCKET_PATH_LIMIT)
     if owner is not None:
         for path in [root, *root.rglob('*')]:
             os.chown(path, owner, -1)
     return root, script, fixtures
 
 
-def launch(script, command, *options, run_as=RUN_AS, env=None, stderr=subprocess.PIPE, ignore=(), interpreter=sys.executable, user=None):
+def launch(script, command, *options, run_as=RUN_AS, env=None, stderr=subprocess.PIPE, ignore=(), interpreter=sys.executable,
+           user=None, wrapper=()):
     """Start a launcher in its own process group, with SIGINT, SIGTERM and SIGHUP at their defaults
     (or ignored, for those in ``ignore``) whatever this test process inherited."""
     def dispositions():
         for signum in SIGNALS:
             signal.signal(signum, signal.SIG_IGN if signum in ignore else signal.SIG_DFL)
-    argv = [interpreter, str(script), *run_as, '--discard', *options, '--', interpreter, '-c', command]
+    argv = [interpreter, *wrapper, str(script), *run_as, '--discard', *options, '--', interpreter, '-c', command]
     if user:
         argv = ['runuser', '-u', user, '--'] + argv
     return subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=stderr, text=True, env=env, start_new_session=True,
@@ -187,8 +229,10 @@ class CleanupHelperTests(unittest.TestCase):
     def test_a_status_line_survives_a_closed_stream(self):
         for failure in (BrokenPipeError(32, 'Broken pipe'), OSError(5, 'Input/output error')):
             with self.subTest(failure=type(failure).__name__):
-                with patch('builtins.print', side_effect=failure):
+                silenced = []
+                with patch('builtins.print', side_effect=failure), patch.object(launcher, 'silence_stderr', lambda: silenced.append(1)):
                     launcher.say('Throwaway PostgreSQL stopped and exited: yes')
+                self.assertEqual([1], silenced, 'stderr was not pointed at /dev/null')
 
     def test_the_status_check_runs_in_its_own_session(self):
         seen = {}
@@ -220,8 +264,174 @@ class CleanupHelperTests(unittest.TestCase):
         self.assertEqual(2, len(slept))
 
 
+def restore_signals(test):
+    """Put SIGNALS and SIGALRM back as they are now once the test is over, and HELD as it was."""
+    for signum in SIGNALS + (signal.SIGALRM,):
+        test.addCleanup(signal.signal, signum, signal.getsignal(signum))
+    test.addCleanup(launcher.HELD.update, dict(launcher.HELD))
+
+
+def interrupt(signum, frame):
+    raise KeyboardInterrupt(signum)
+
+
+@unittest.skipUnless(os.name == 'posix', 'needs POSIX')
+class SignalTests(unittest.TestCase):
+    def test_the_handler_stops_the_run_and_ignores_further_signals(self):
+        restore_signals(self)
+        for signum in SIGNALS:
+            signal.signal(signum, launcher.interrupted)
+        launcher.HELD.update(starting=False, signum=None)
+        with self.assertRaises(KeyboardInterrupt) as stop:
+            launcher.interrupted(signal.SIGTERM, None)
+        self.assertEqual((signal.SIGTERM,), stop.exception.args)
+        self.assertEqual([signal.SIG_IGN] * len(SIGNALS), [signal.getsignal(signum) for signum in SIGNALS])
+
+    def test_while_the_command_starts_the_handler_holds_the_signal_and_ignores_nothing(self):
+        restore_signals(self)
+        for signum in SIGNALS:
+            signal.signal(signum, launcher.interrupted)
+        launcher.HELD.update(starting=True, signum=None)
+        self.assertIsNone(launcher.interrupted(signal.SIGHUP, None))
+        self.assertEqual(signal.SIGHUP, launcher.HELD['signum'])
+        # Ignored now, the signals would stay ignored in the command, which could then not be stopped.
+        self.assertEqual([launcher.interrupted] * len(SIGNALS), [signal.getsignal(signum) for signum in SIGNALS])
+
+    def test_a_status_line_nobody_reads_leaves_the_exit_status_alone(self):
+        import pty  # POSIX only, like the termios module it needs
+        for stream, buffered in itertools.product(('pipe', 'terminal'), (True, False)):
+            with self.subTest(stream=stream, buffered=buffered):
+                environment = {name: value for name, value in os.environ.items() if name != 'PYTHONUNBUFFERED'}
+                if not buffered:
+                    environment['PYTHONUNBUFFERED'] = '1'
+                reader, writer = pty.openpty() if stream == 'terminal' else os.pipe()
+                process = subprocess.Popen([sys.executable, '-c', CLOSED_STREAM, str(HERE)], stdin=subprocess.PIPE, stderr=writer,
+                                           env=environment, text=True)
+                os.close(writer)
+                os.close(reader)  # nobody reads its stderr any more
+                process.stdin.write('go\n')
+                process.stdin.close()
+                # Python's final flush of a buffered stderr would fail, and the exit status would be 120.
+                self.assertEqual(143, process.wait(60))
+
+
+@unittest.skipUnless(os.name == 'posix', 'needs POSIX')
+class StepTests(unittest.TestCase):
+    """An interrupted setup step that outlives STEP_GRACE is stopped, and the wait for it stays bounded."""
+    def interrupted_run(self, command, step_grace=0.3, term_grace=1):
+        restore_signals(self)
+        signal.signal(signal.SIGALRM, interrupt)
+        started = time.monotonic()
+        with patch.object(launcher, 'STEP_GRACE', step_grace), patch.object(launcher, 'TERM_GRACE', term_grace):
+            signal.setitimer(signal.ITIMER_REAL, 0.5)  # the step is running by then
+            try:
+                with self.assertRaises(KeyboardInterrupt):
+                    launcher.run(command)
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+        return time.monotonic() - started
+
+    def pids(self, path):
+        deadline = time.monotonic() + 10
+        while not (path.exists() and path.read_text().endswith('\n')) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return [int(pid) for pid in path.read_text().split()]
+
+    def gone(self, pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        return False
+
+    def kill_later(self, pids):
+        for pid in pids:
+            self.addCleanup(lambda pid=pid: self.gone(pid) or os.kill(pid, signal.SIGKILL))
+
+    def scratch(self):
+        root = Path(tempfile.mkdtemp(prefix='launcher-step-'))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        return root
+
+    def test_a_step_that_ignores_sigterm_is_killed(self):
+        pids = self.scratch() / 'pids'
+        step = ("import os, signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "open(%r, 'w').write('%%d\\n' %% os.getpid())\ntime.sleep(30)\n" % str(pids))
+        elapsed = self.interrupted_run([sys.executable, '-c', step])
+        self.kill_later(self.pids(pids))
+        self.assertLess(elapsed, 15, 'run() waited for the step instead of stopping it')
+        self.assertTrue(self.gone(self.pids(pids)[0]), 'the step was left running')
+
+    def test_the_wait_ends_even_when_another_process_still_holds_the_steps_output(self):
+        pids = self.scratch() / 'pids'
+        holder = "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"
+        step = ("import os, signal, subprocess, sys, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "holder = subprocess.Popen([sys.executable, '-c', %r])\n"
+                "open(%r, 'w').write('%%d %%d\\n' %% (os.getpid(), holder.pid))\ntime.sleep(30)\n" % (holder, str(pids)))
+        elapsed = self.interrupted_run([sys.executable, '-c', step])
+        step_pid, holder_pid = self.pids(pids)
+        self.kill_later([holder_pid, step_pid])
+        self.assertLess(elapsed, 15, 'run() kept reading output that another process still held')
+        self.assertTrue(self.gone(step_pid), 'the step was left running')
+
+    @unittest.skipUnless(ROOT and sys.platform.startswith('linux') and shutil.which('runuser'), 'needs Linux, root and runuser')
+    def test_as_root_runuser_stops_the_step_itself(self):
+        interpreter = os.path.realpath(sys.executable)
+        if subprocess.run(['runuser', '-u', 'postgres', '--', 'test', '-x', interpreter]).returncode:
+            self.skipTest('the postgres account cannot run %s' % interpreter)
+        marker = 'launcher-step-under-runuser-%d' % os.getpid()
+        step = 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)  # ' + marker
+        # runuser kills its child 2 s after a SIGTERM; a SIGKILL would end runuser alone.
+        elapsed = self.interrupted_run(['runuser', '-u', 'postgres', '--', interpreter, '-c', step], term_grace=5)
+        left = [entry.name for entry in Path('/proc').glob('[0-9]*') if marker.encode() in _cmdline(entry)]
+        self.kill_later([int(pid) for pid in left])
+        self.assertLess(elapsed, 15, 'run() waited for the step under runuser')
+        self.assertEqual([], left, 'the step under runuser was left running')
+
+
 @unittest.skipUnless(os.name == 'posix', 'needs POSIX')
 class SetupTests(unittest.TestCase):
+    def long_cluster(self):
+        """A cluster path too long for an in-cluster socket, with SHORT_SOCKET_BASE in a temporary root."""
+        root = Path(tempfile.mkdtemp(prefix='launcher-socket-'))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        base = root / 'short'
+        base.mkdir()
+        cluster = root / ('c' * 90) / 'postgresql-fixtures' / 'synthetic'
+        self.assertGreater(len(str(cluster / 's' / '.s.PGSQL.5432').encode()), launcher.SOCKET_PATH_LIMIT)
+        for target, value in (('SHORT_SOCKET_BASE', str(base)), ('run', lambda command, stdin=None, detached=False: '')):
+            patcher = patch.object(launcher, target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return cluster, base
+
+    def test_a_signal_while_the_short_socket_directory_is_made_waits_until_cluster_json_names_it(self):
+        cluster, base = self.long_cluster()
+        restore_signals(self)
+        signal.signal(signal.SIGTERM, interrupt)
+        made, mkdtemp = [], tempfile.mkdtemp
+        def signalled(*arguments, **options):
+            made.append(mkdtemp(*arguments, **options))
+            os.kill(os.getpid(), signal.SIGTERM)
+            return made[-1]
+        with patch.object(launcher.tempfile, 'mkdtemp', signalled), self.assertRaises(KeyboardInterrupt):
+            launcher.create(cluster, Path('/usr/lib/postgresql/16/bin'), None, 'c')
+        self.assertEqual(1, len(made))
+        self.assertEqual(base, Path(made[0]).parent)
+        self.assertTrue((cluster / 'cluster.json').exists(), 'interrupted before cluster.json named the socket directory')
+        self.assertEqual(made[0], json.loads((cluster / 'cluster.json').read_text())['sockets'])
+
+    def test_a_cluster_json_that_cannot_be_written_takes_the_short_socket_directory_with_it(self):
+        cluster, base = self.long_cluster()
+        write_text = Path.write_text
+        def full(path, *arguments, **options):
+            if path.name == 'cluster.json':
+                raise OSError(28, 'No space left on device (synthetic)')
+            return write_text(path, *arguments, **options)
+        with patch.object(Path, 'write_text', full), self.assertRaises(OSError):
+            launcher.create(cluster, Path('/usr/lib/postgresql/16/bin'), None, 'c')
+        self.assertEqual([], list(base.iterdir()), 'the temporary socket directory was left behind')
+
     def test_the_server_account_appends_the_settings_and_root_writes_nothing_in_its_directories(self):
         root = Path(tempfile.mkdtemp(prefix='launcher-config-'))
         self.addCleanup(shutil.rmtree, root)
@@ -229,7 +439,8 @@ class SetupTests(unittest.TestCase):
         account = pwd.getpwuid(os.getuid()).pw_name  # any existing account: os.chown is recorded, not run
         cluster, commands = root / 'postgresql-fixtures' / 'synthetic', []
         with patch.object(launcher, 'run', lambda command, stdin=None, detached=False: commands.append((command, stdin)) or ''), \
-                patch.object(launcher.os, 'chown', lambda *arguments: None):
+                patch.object(launcher.os, 'chown', lambda *arguments: None), \
+                patch.object(launcher, 'SHORT_SOCKET_BASE', str(root)):  # a long TMPDIR: any short socket directory goes here
             info = launcher.create(cluster, Path('/usr/lib/postgresql/16/bin'), account, 'c')
         config = str(Path(info['data']) / 'postgresql.conf')
         appends = [(command, stdin) for command, stdin in commands if config in command]
@@ -289,25 +500,44 @@ class LauncherChecks(unittest.TestCase):
     def test_a_terminated_or_hung_up_launcher_stops_the_server_and_discards_the_cluster(self):
         for signum, whole_group in ((signal.SIGTERM, True), (signal.SIGHUP, False), (signal.SIGINT, True)):
             with self.subTest(signal=signum.name):
-                process = self.launch(launcher.__file__, WAITING)
+                root, script, fixtures = private_copy(self)
+                process = self.launch(script, WAITING + '# %s\n' % root)  # named, so a failed check can stop it
+                seen = []
+                sockets = self.socket_directory(read_until(process.stderr, SOCKETS, seen))
+                line = read_until(process.stderr, STARTED, seen)
+                self.assertIsNotNone(line, 'the launcher never reported its cluster')
+                cluster = Path(line.rsplit(': ', 1)[1])
+                child = int(process.stdout.readline())
+                (os.killpg if whole_group else os.kill)(process.pid, signum)
                 try:
-                    line = read_until(process.stderr, STARTED, [])
-                    self.assertIsNotNone(line, 'the launcher never reported its cluster')
-                    cluster = Path(line.rsplit(': ', 1)[1])
-                    child = int(process.stdout.readline())
-                    (os.killpg if whole_group else os.kill)(process.pid, signum)
-                    self.assertEqual(128 + signum, process.wait(120))
-                    report = process.stderr.read()
-                finally:
-                    if process.poll() is None:
-                        process.kill()
-                        process.wait()
-                    process.stdout.close()
-                    process.stderr.close()
-                self.assertIn('Throwaway PostgreSQL stopped and exited: yes', report)
+                    process.wait(120)
+                except subprocess.TimeoutExpired:
+                    pass
+                left = Path('/proc/%d' % child).exists()
+                if left:  # it holds the launcher's output, so reading that would wait for it
+                    os.kill(child, signal.SIGKILL)
+                _, errors = finish(process, timeout=120)
+                self.assertEqual(128 + signum, process.returncode, errors)
+                self.assertFalse(left, 'the command was left running')
                 self.assertFalse(cluster.exists(), 'the cluster directory was left behind')
-                self.assertEqual([], processes_naming(cluster / 'data'))
-                self.assertFalse(Path('/proc/%d' % child).exists(), 'the command was left running')
+                self.assertNothingLeft(root, fixtures, sockets, ''.join(seen) + errors)
+
+    def test_a_signal_while_the_command_starts_still_stops_the_command(self):
+        for when in ('after', 'before'):
+            with self.subTest(signal=when + ' Popen starts the command'):
+                root, script, fixtures = private_copy(self)
+                wrapper = root / 'signal_while_starting.py'
+                wrapper.write_text(SIGNAL_WHILE_STARTING)
+                marker = 'signalled command %s' % root  # names root, so assertNothingLeft also looks for the command
+                started = time.monotonic()
+                process = self.launch(script, 'import time  # %s\ntime.sleep(30)\n' % marker, wrapper=[str(wrapper), when, marker])
+                seen = []
+                sockets = self.socket_directory(read_until(process.stderr, SOCKETS, seen))
+                _, errors = finish(process, timeout=90)
+                self.assertEqual(143, process.returncode, errors)
+                # Not the 30 s that terminate() would wait for a command that inherited an ignored SIGTERM.
+                self.assertLess(time.monotonic() - started, 25, errors)
+                self.assertNothingLeft(root, fixtures, sockets, ''.join(seen) + errors)
 
     def test_a_failed_setup_leaves_nothing_behind(self):
         runs = [('as the calling account', None)]
@@ -327,12 +557,19 @@ class LauncherChecks(unittest.TestCase):
                 self.assertNotEqual(0, process.returncode)
                 self.assertNothingLeft(root, fixtures, sockets, ''.join(seen) + errors)
 
-    def test_a_closed_terminal_or_broken_pipe_does_not_stop_the_cleanup(self):
-        for variant, signum in (('pipe', signal.SIGTERM), ('terminal', signal.SIGHUP)):
-            with self.subTest(variant):
+    def test_a_closed_terminal_or_broken_pipe_neither_stops_the_cleanup_nor_changes_the_exit_status(self):
+        import pty  # POSIX only, like the termios module it needs
+        variants = (('pipe', signal.SIGTERM), ('terminal', signal.SIGHUP), ('pipe, the command succeeds', None))
+        for (variant, signum), buffered in itertools.product(variants, (True, False)):
+            # Buffered is stderr as an ordinary shell gives it; PYTHONUNBUFFERED=1 makes it unbuffered.
+            with self.subTest(variant, buffered=buffered):
                 root, script, fixtures = private_copy(self)
+                environment = {name: value for name, value in os.environ.items() if name != 'PYTHONUNBUFFERED'}
+                if not buffered:
+                    environment['PYTHONUNBUFFERED'] = '1'
+                go = root / 'go'
                 reader, writer = pty.openpty() if variant == 'terminal' else os.pipe()
-                process = self.launch(script, WAITING, stderr=writer)
+                process = self.launch(script, WAITING if signum else UNTIL % str(go), stderr=writer, env=environment)
                 os.close(writer)
                 try:
                     text, deadline = '', time.monotonic() + 120
@@ -343,14 +580,19 @@ class LauncherChecks(unittest.TestCase):
                     os.close(reader)  # nobody reads the launcher's stderr any more
                 self.assertIn(STARTED, text)
                 sockets = self.socket_directory(next((line.strip() for line in text.splitlines() if line.startswith(SOCKETS)), None))
-                child = int(process.stdout.readline())
-                os.killpg(process.pid, signum)
-                self.assertEqual(128 + signum, process.wait(180))
+                if signum:
+                    child = int(process.stdout.readline())
+                    os.killpg(process.pid, signum)
+                else:
+                    child = None
+                    go.touch()  # the command finishes; every later status line meets the closed stream
+                self.assertEqual(128 + signum if signum else 0, process.wait(180))
                 process.stdout.close()
                 self.assertEqual([], list(fixtures.iterdir()), 'a cluster directory was left behind')
                 self.assertFalse(Path(sockets).exists(), 'the temporary socket directory was left behind')
                 self.assertEqual([], processes_naming(root))
-                self.assertFalse(Path('/proc/%d' % child).exists(), 'the command was left running')
+                if child:
+                    self.assertFalse(Path('/proc/%d' % child).exists(), 'the command was left running')
 
     def test_a_signal_during_initdb_lets_it_finish_and_leaves_nothing_behind(self):
         for signum, whole_group in ((signal.SIGTERM, False), (signal.SIGHUP, False), (signal.SIGINT, True)):
@@ -389,7 +631,30 @@ class LauncherChecks(unittest.TestCase):
             time.sleep(0.02)
         _, errors = finish(process)
         self.assertEqual(143, process.returncode, errors)
+        # The cleanup's stop ran in its own session: no repeated SIGTERM made runuser kill it.
+        self.assertNotIn('Command failed', errors)
         self.assertNothingLeft(root, fixtures, sockets, ''.join(seen) + errors)
+
+    def test_a_signal_during_the_cleanup_after_the_command_succeeded_is_ignored(self):
+        for whole_group in (False, True):
+            with self.subTest(whole_group=whole_group):
+                root, script, fixtures = private_copy(self)
+                process = self.launch(script, 'pass')
+                seen = []
+                sockets = self.socket_directory(read_until(process.stderr, SOCKETS, seen))
+                deadline, stopping = time.monotonic() + 60, False
+                while not stopping and process.poll() is None and time.monotonic() < deadline:
+                    stopping = bool(processes_naming(root, b'\0stop\0'))  # the cleanup's pg_ctl stop
+                    time.sleep(0 if stopping else 0.002)
+                self.assertTrue(stopping, 'the cleanup was never seen stopping the server')
+                try:
+                    (os.killpg if whole_group else os.kill)(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                _, errors = finish(process)
+                self.assertEqual(0, process.returncode, errors)
+                self.assertNotIn('Command failed', errors)
+                self.assertNothingLeft(root, fixtures, sockets, ''.join(seen) + errors)
 
     def test_a_hangup_ignored_at_start_stays_ignored_for_the_whole_run(self):
         root, script, fixtures = private_copy(self)
@@ -405,17 +670,30 @@ class LauncherChecks(unittest.TestCase):
 
     def test_libpq_variables_never_reach_a_client_and_only_the_server_account_owns_its_files(self):
         hostile = dict(os.environ, PGHOSTADDR='192.0.2.1', PGPORT='1', PGSERVICE='synthetic-missing-service')
-        output, errors = finish(self.launch(launcher.__file__, PROBE, env=hostile))
-        self.assertIn('Throwaway PostgreSQL stopped and exited: yes', errors)
-        seen = json.loads(output)
-        self.assertEqual([], seen['libpq'])
-        self.assertTrue(seen['dsn'].startswith('host=/'), seen['dsn'])
-        self.assertEqual([0o700, server_uid()], seen['socket_dir'])
-        if RUN_AS:
-            server = server_uid()
-            self.assertEqual({'cluster': 0, 'metadata': 0, 'data': server, 'config': server, 'log': server}, seen['owners'])
+        for layout in ('deep', 'short'):
+            with self.subTest(checkout=layout):
+                root, script, fixtures = private_copy(self, short=layout == 'short')
+                output, errors = finish(self.launch(script, PROBE, env=hostile))
+                sockets = next((line.rsplit(': ', 1)[1] for line in errors.splitlines() if line.startswith(SOCKETS)), None)
+                if sockets:
+                    self.addCleanup(shutil.rmtree, sockets, ignore_errors=True)
+                self.assertNothingLeft(root, fixtures, sockets, errors)
+                seen = json.loads(output)
+                self.assertEqual([], seen['libpq'])
+                self.assertTrue(seen['dsn'].startswith('host=/'), seen['dsn'])
+                if layout == 'deep':  # too long for a socket in the cluster: a private directory under /tmp
+                    self.assertEqual(Path('/tmp'), Path(seen['sockets']).parent)
+                    self.assertEqual(sockets, seen['sockets'], 'the socket directory was not named on stderr')
+                else:  # <cluster>/s
+                    self.assertEqual(fixtures, Path(seen['sockets']).parent.parent)
+                    self.assertIsNone(sockets, 'a socket directory inside the cluster was announced as temporary')
+                self.assertEqual([0o700, server_uid()], seen['socket_dir'])
+                if RUN_AS:
+                    server = server_uid()
+                    self.assertEqual({'cluster': 0, 'metadata': 0, 'data': server, 'config': server, 'log': server}, seen['owners'])
 
     def test_a_deep_checkout_gets_a_private_socket_directory_under_tmp_whatever_tmpdir_says(self):
+        launcher.FIXTURES.parent.mkdir(parents=True, exist_ok=True)  # build/ is gitignored, so a fresh clone has none
         scratch = Path(tempfile.mkdtemp(prefix='launcher-tmpdir-', dir=launcher.FIXTURES.parent))
         self.addCleanup(shutil.rmtree, scratch, ignore_errors=True)
         closed = scratch / 'closed'

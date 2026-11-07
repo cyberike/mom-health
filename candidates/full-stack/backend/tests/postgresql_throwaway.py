@@ -11,14 +11,16 @@ so no client can be redirected off the private socket.
 Afterwards it stops the server and checks that it exited, also when the
 launcher is interrupted or terminated (SIGINT, SIGTERM or SIGHUP). A setup step
 still running at that moment (initdb, pg_ctl, psql) may finish first, so none of
-them is left running on its own; a command still running is sent SIGTERM. Only
-the command's own process is signalled: programs it started stop too only when
-the signal went to the whole process group (Ctrl-C, timeout, a closed
-terminal). Further signals are ignored until the cleanup is done, and the
-cleanup's server commands run in their own session, out of reach of a repeated
-group signal. A signal already ignored when the launcher starts (under nohup,
-for example) stays ignored. Status lines go to stderr; a closed terminal or a
-broken pipe does not stop the cleanup. If the server does not start, the end of
+them is left running on its own; one still running after STEP_GRACE seconds is
+stopped (see run()). A command still running is sent SIGTERM, also when the
+signal arrives while the command is being started. Only the command's own
+process is signalled: programs it started stop too only when the signal went to
+the whole process group (Ctrl-C, timeout, a closed terminal). Further signals
+are ignored until the cleanup is done, and the cleanup's server commands run in
+their own session, out of reach of a repeated group signal. A signal already
+ignored when the launcher starts (under nohup, for example) stays ignored.
+Status lines go to stderr; a closed terminal or a broken pipe neither stops the
+cleanup nor changes the exit status. If the server does not start, the end of
 its log is included in the error, because --discard deletes the log.
 
 Socket authentication is ``trust``: only the server account (and root) can
@@ -61,8 +63,11 @@ SOCKET_PATH_LIMIT = 107  # bytes, including the ".s.PGSQL.5432" file name
 # Not TMPDIR: that can be long, or private to root (pam_tmpdir), and the server account must reach the socket.
 SHORT_SOCKET_BASE = '/tmp'
 SIGNALS = tuple(getattr(signal, name) for name in ('SIGINT', 'SIGTERM', 'SIGHUP') if hasattr(signal, name))
-STEP_GRACE = 120  # seconds an interrupted setup step may take to finish before it is killed
+STEP_GRACE = 120  # seconds an interrupted setup step may take to finish before it is stopped
+TERM_GRACE = 10  # seconds between SIGTERM and SIGKILL for such a step (runuser itself takes 2)
 STOP_GRACE = 60  # seconds the cleanup waits for every process naming the cluster to exit
+# While main() starts the command, a signal is held here until the command's process is known.
+HELD = {'starting': False, 'signum': None}
 
 
 def find_bindir(explicit=None, root='/usr/lib/postgresql'):
@@ -91,12 +96,36 @@ def say(message):
     try:
         print(message, file=sys.stderr, flush=True)
     except OSError:
+        silence_stderr()
+
+
+def silence_stderr():
+    """Point stderr's file descriptor at /dev/null once nobody reads it. What is still buffered for it can
+    then be flushed at exit; otherwise Python's final flush fails and the exit status becomes 120."""
+    try:
+        null = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(null, sys.stderr.fileno())
+        finally:
+            os.close(null)
+    except (OSError, ValueError, AttributeError):  # no file descriptor behind stderr
         pass
 
 
 def ignore_signals():
     for signum in SIGNALS:
         signal.signal(signum, signal.SIG_IGN)
+
+
+def interrupted(signum, frame):
+    """Handler for SIGNALS: stop the run, and ignore further signals until the cleanup is done. While the
+    command is being started, the signal is held until its process is known, so the cleanup can still
+    stop it. Signals are not ignored (or blocked) meanwhile: the command would inherit that."""
+    if HELD['starting']:
+        HELD['signum'] = signum
+        return
+    ignore_signals()  # finish the cleanup even if signalled again
+    raise KeyboardInterrupt(signum)
 
 
 def describe(cluster):
@@ -112,9 +141,9 @@ def as_account(command, account):
 
 def run(command, stdin=None, detached=False):
     """Run one step and return its output. If the launcher is signalled meanwhile, the step may still
-    finish (killed after STEP_GRACE seconds), so a signal sent to the launcher alone cannot leave an
-    initdb or pg_ctl running on its own. detached=True starts it in its own session, so signals sent
-    to the launcher's process group do not reach it."""
+    finish within STEP_GRACE seconds (then it is stopped, see stop_step()), so a signal sent to the
+    launcher alone cannot leave an initdb or pg_ctl running on its own. detached=True starts it in its
+    own session, so signals sent to the launcher's process group do not reach it."""
     process = subprocess.Popen(command, stdin=subprocess.DEVNULL if stdin is None else subprocess.PIPE,
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=private_environment(),
                                start_new_session=detached)
@@ -129,12 +158,25 @@ def run(command, stdin=None, detached=False):
         try:
             process.communicate(timeout=STEP_GRACE)
         except subprocess.TimeoutExpired:
-            process.kill()
-            process.communicate()
+            stop_step(process)
         raise
     if process.returncode:
         raise RuntimeError('Command failed (%d): %s\n%s' % (process.returncode, ' '.join(command), output))
     return output
+
+
+def stop_step(process):
+    """Stop a setup step that outlived STEP_GRACE: SIGTERM, then SIGKILL after TERM_GRACE seconds. As root
+    the step's own process is runuser, which kills the step itself 2 s after a SIGTERM. If something
+    still holds the step's output after the SIGKILL (a stopped step stops runuser too), the launcher
+    stops reading it, so the wait stays bounded; the cleanup then reports what still names the cluster."""
+    process.terminate()
+    try:
+        process.communicate(timeout=TERM_GRACE)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.stdout.close()
+        process.wait()
 
 
 def pg_ctl(info, *arguments):
@@ -258,10 +300,6 @@ def main():
         parser.error('--run-as needs root (runuser); omit it to run as the current account')
     bindir = find_bindir(args.bindir)
     cluster = FIXTURES / uuid4().hex[:12]
-
-    def interrupted(signum, frame):
-        ignore_signals()  # finish the cleanup even if signalled again
-        raise KeyboardInterrupt(signum)
     for signum in SIGNALS:
         if signal.getsignal(signum) is not signal.SIG_IGN:  # left ignored (nohup, a background job), as Python does
             signal.signal(signum, interrupted)
@@ -275,7 +313,13 @@ def main():
                  '-c', "CREATE DATABASE %s OWNER %s TEMPLATE template0 ENCODING 'UTF8' %s" % (DATABASE, ROLE, LOCALES[args.locale])])
             dsn = 'host=%s dbname=%s user=%s' % (info['sockets'], DATABASE, ROLE)
             say('Throwaway PostgreSQL (%s, locale %s, socket only): %s' % (bindir, args.locale, cluster))
-            child = subprocess.Popen(command, env=private_environment(MOM_HEALTH_TEST_POSTGRESQL_DSN=dsn, MOM_HEALTH_TEST_POSTGRESQL_CLUSTER=str(cluster)))
+            HELD['starting'] = True  # a signal now waits until child names the command's process
+            try:
+                child = subprocess.Popen(command, env=private_environment(MOM_HEALTH_TEST_POSTGRESQL_DSN=dsn, MOM_HEALTH_TEST_POSTGRESQL_CLUSTER=str(cluster)))
+            finally:
+                HELD['starting'] = False
+            if HELD['signum'] is not None:
+                interrupted(HELD['signum'], None)
             status = child.wait()
         finally:
             ignore_signals()  # still inside the outer try: a signal arriving just before this is handled below
