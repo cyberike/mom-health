@@ -33,26 +33,32 @@ before the first status line. A non-blocking stderr that is full for a moment
 silences none of the lines after it. With stderr buffered (no PYTHONUNBUFFERED
 or -u), the line that met the full pipe is kept too, as far as Python's buffer
 holds it (4 KiB for a pipe); unbuffered, Python drops that line. A traceback
-written into a full pipe keeps only its first line buffered, and nothing of it
-unbuffered. If the server does not start, the end of its log is included in
-the error, because --discard deletes the log.
+written into a full pipe keeps only its first line buffered (twice on Python
+3.13), and nothing of it unbuffered. If the server does not start, the end of
+its log is included in the error, because --discard deletes the log.
 
 Socket authentication is ``trust``: only the server account (and root) can
 reach the socket, and no password or other credential exists. Fixtures are
 retained for inspection unless --discard is given. Nothing outside the new
 cluster directory is created, changed or removed, except a private socket
 directory under /tmp when the checkout path is too long for a Unix socket; that
-directory is named on stderr and removed once the server has stopped.
+directory is named on stderr and removed once the server has stopped. While the
+server runs, it has a System V shared memory segment, which only a server that
+did not stop (killed, for example) leaves behind.
 
 Needs Linux (it reads /proc to confirm the server exited). PostgreSQL refuses to
 run as root, so a root caller names an unprivileged account with --run-as, which
 uses runuser. The cluster directory and its cluster.json then stay root-owned;
 only data/, log/ and the socket directory belong to that account, so it cannot
-change what root later runs. Root without CAP_SYS_PTRACE (Docker's default
-capability set, for example) cannot see that account's working directories, so
-a backend left by a killed postmaster would not be found; the launcher says so
-when the server starts (a stale postmaster.pid still keeps such a cluster). From
-candidates/full-stack/backend:
+change what root later runs. Root without CAP_SYS_PTRACE cannot read that
+account's working directories, and in Docker's default capability set, which
+also lacks CAP_SYS_ADMIN and CAP_PERFMON, not its environments either: the
+cleanup then still finds the server's own processes, by their command line or
+their title (which names the cluster: cluster_name), but not a program the
+server started that outlives it (COPY ... TO PROGRAM, archive_command), and the
+launcher says so when the server starts. A postmaster that did not stop
+(killed, for example) leaves its postmaster.pid, which keeps the cluster too.
+From candidates/full-stack/backend:
 
     python tests/postgresql_throwaway.py --run-as postgres -- \\
         python -m unittest tests.postgresql_parity -v
@@ -88,6 +94,10 @@ STOP_GRACE = 60  # seconds the cleanup waits for every process using the cluster
 EXIT_FLUSH_GRACE = 2  # seconds the exit waits for a full non-blocking stderr to take what is still buffered
 # While start() starts a step or the command, a signal is held here until the process is known.
 HELD = {'starting': False, 'signum': None}
+try:  # CPython: signal.pthread_sigmask() is a Python function around this C one (see main())
+    from _signal import pthread_sigmask as C_PTHREAD_SIGMASK
+except ImportError:  # not POSIX, or another Python
+    C_PTHREAD_SIGMASK = getattr(signal, 'pthread_sigmask', None)
 
 
 def find_bindir(explicit=None, root='/usr/lib/postgresql'):
@@ -141,11 +151,16 @@ def flush_stderr():
     """Registered by main() with atexit, which runs before Python's own final flush: flush what is still
     buffered for stderr (a usage message, or a status line that met a full pipe, for example), and silence
     stderr if that fails or is cut short, so the final flush cannot fail and turn the exit status into 120.
-    A full non-blocking stderr gets EXIT_FLUSH_GRACE seconds to take it first. SIGINT is blocked from here
-    on: before main() installs its handlers, Ctrl-C is Python's KeyboardInterrupt, and a second one (from a
-    wrapper that passes Ctrl-C on, for example) could otherwise cut the silencing short. One already pending
-    is raised by the blocking call itself, and stderr is silenced then too. Once main() has run, SIGINT,
-    SIGTERM and SIGHUP are ignored anyway; before that, SIGTERM and SIGHUP end the process."""
+    A full non-blocking stderr gets EXIT_FLUSH_GRACE seconds to take it first. Before main() installs its
+    handlers, Ctrl-C is Python's KeyboardInterrupt, which could cut this short: one arriving as this function
+    is entered is raised ahead of its try, and a second one (from a wrapper that passes Ctrl-C on, for
+    example) could land before the silencing. So main() also registers the C function that blocks SIGINT,
+    which atexit calls just before this one, and SIGINT stays blocked until the process exits; one already
+    pending is raised by that call, which atexit reports. Registered without it, this function blocks SIGINT
+    itself, inside its try, and one pending then still has stderr silenced. Either way, a Ctrl-C that ends
+    main() after it registered this function but before its handlers gives exit status 130 (128+2, as one
+    after them does) rather than ending the process by the signal. Once main() has run, SIGINT, SIGTERM and
+    SIGHUP are ignored anyway; before that, SIGTERM and SIGHUP end the process."""
     try:
         if hasattr(signal, 'pthread_sigmask'):  # POSIX
             signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGINT])
@@ -294,23 +309,33 @@ def running(info):
         return False
 
 
+def cluster_name(cluster):
+    """The server's cluster_name, which create() sets: every server process but the postmaster starts its
+    title (its command line) with "postgres: <name>: "."""
+    return 'mom-health-' + Path(cluster).name
+
+
 def leftover_processes(info):
     """PIDs of the processes that still use this cluster's data directory (Linux /proc): their command line
-    names it, their environment has it as PGDATA, or it is their working directory. initdb and pg_ctl set
-    PGDATA for what they start, so this finds a helper of an interrupted initdb (its sh -c and bootstrap
-    backend name no directory), and a program the server starts (archive_command, COPY ... TO PROGRAM)
-    inherits it. The postmaster names the directory and has it as PGDATA; its children (backends and
-    auxiliary processes) overwrite both with their process title, but every server process runs in the
-    data directory, so a backend left by a killed postmaster is found too. So is any other process working
-    there, a shell someone left in it included: the cluster is then kept. Another account's environment and
-    working directory are not readable to an ordinary caller. Root reads both, except that without
-    CAP_SYS_PTRACE (Docker's default capability set, for example) another account's working directory is
-    unreadable too: the server's backends are then not found (see server_cwd_readable())."""
+    names it or is a server process title of this cluster, their environment has it as PGDATA, or it is
+    their working directory. The postmaster names the directory and has it as PGDATA; its children
+    (backends and auxiliary processes) overwrite both with their title, which names the cluster, so a
+    backend left by a killed postmaster is found too. initdb and pg_ctl set PGDATA for what they start, so
+    this finds a helper of an interrupted initdb (its sh -c and bootstrap backend name no directory), and a
+    program the server starts (archive_command, COPY ... TO PROGRAM) inherits it. Any other process working
+    in the data directory, a shell someone left in it included, is found too: the cluster is then kept.
+    Command lines are readable to everyone, so the server's own processes are found whatever else of theirs
+    the caller may read. A program the server started, or an initdb helper, is found only through its
+    environment or working directory: another account's are not readable to an ordinary caller, its working
+    directory not to root without CAP_SYS_PTRACE, and neither to root in Docker's default capability set (which
+    also lacks CAP_SYS_ADMIN and CAP_PERFMON); see server_unseen()."""
     data = info['data']
     named, variable, where, found = data.encode(), b'PGDATA=' + data.encode(), os.path.realpath(data), []
+    title = ('postgres: %s: ' % cluster_name(Path(data).parent)).encode()
     for entry in Path('/proc').glob('[0-9]*'):
         try:
-            if (named in (entry / 'cmdline').read_bytes() or variable in (entry / 'environ').read_bytes().split(b'\0')
+            command = (entry / 'cmdline').read_bytes()
+            if (named in command or command.startswith(title) or variable in (entry / 'environ').read_bytes().split(b'\0')
                     or os.readlink(entry / 'cwd') == where):
                 found.append(int(entry.name))
         except OSError:
@@ -318,21 +343,37 @@ def leftover_processes(info):
     return found
 
 
-def server_cwd_readable(info):
-    """Whether leftover_processes() can read the running server's working directory. Root without
-    CAP_SYS_PTRACE (Docker's default capability set, for example) cannot read another account's, and would
-    then not find a backend left by a killed postmaster; main() says so when the server has started."""
+def can_read(read, path):
+    """Whether read(path) succeeds: False if permission is denied; any other OSError is raised."""
+    try:
+        read(path)
+    except PermissionError:
+        return False
+    return True
+
+
+def server_unseen(info):
+    """What leftover_processes() cannot see here once the server runs, for main() to say, or None. Without
+    /proc it sees no process at all. Where neither the postmaster's environment nor its working directory can
+    be read (root in Docker's default capability set, for example), it still finds the server's own processes
+    by their command line or title, but not a program the server started (COPY ... TO PROGRAM,
+    archive_command), which it could find only through one of those two."""
+    if not os.path.isdir('/proc/self'):
+        return 'no /proc here, so the cleanup cannot see whether any process still uses the cluster'
     try:
         postmaster = int((Path(info['data']) / 'postmaster.pid').read_text().split()[0])
     except (OSError, ValueError, IndexError):  # no server after all: nothing to look at
-        return True
+        return None
     try:
-        os.readlink('/proc/%d/cwd' % postmaster)
-    except PermissionError:
-        return False
-    except OSError:  # no /proc, or the server is already gone
-        pass
-    return True
+        environment = can_read(Path.read_bytes, Path('/proc/%d/environ' % postmaster))
+        working_directory = can_read(os.readlink, '/proc/%d/cwd' % postmaster)
+    except OSError:  # the server is already gone
+        return None
+    if environment or working_directory:
+        return None
+    return ("the server account's environments and working directories are not readable here (root without "
+            "CAP_SYS_PTRACE, as in Docker's default capability set?), so the cleanup cannot find a program the server "
+            "started (COPY ... TO PROGRAM, archive_command) that outlives it; it finds the server's own processes")
 
 
 def stop_server(info):
@@ -392,12 +433,17 @@ def create(cluster, bindir, run_as, locale):
     run(as_account(['tee', '-a', str(Path(info['data']) / 'postgresql.conf')], run_as), stdin=(
         "\n# Throwaway parity cluster: Unix socket only, owner-only, durable commits.\n"
         "listen_addresses = ''\nunix_socket_directories = '%s'\nunix_socket_permissions = 0700\n"
-        "fsync = on\nsynchronous_commit = on\nfull_page_writes = on\nmax_connections = 100\n" % info['sockets']))
+        "fsync = on\nsynchronous_commit = on\nfull_page_writes = on\nmax_connections = 100\n"
+        "cluster_name = '%s'\n" % (info['sockets'], cluster_name(cluster))))  # in every server process title
     return info
 
 
 def main():
     atexit.register(flush_stderr)
+    if C_PTHREAD_SIGMASK:
+        # atexit calls the last registered first: this C function blocks SIGINT before flush_stderr() runs its first
+        # instruction, where Python would raise a Ctrl-C that has just arrived, ahead of its try (see there).
+        atexit.register(C_PTHREAD_SIGMASK, signal.SIG_BLOCK, [signal.SIGINT])
     parser = argparse.ArgumentParser(description='Run a command against a throwaway local PostgreSQL cluster.')
     parser.add_argument('--run-as', help='unprivileged account for the server (required as root)')
     parser.add_argument('--bindir', help='directory with initdb, pg_ctl and psql')
@@ -422,9 +468,9 @@ def main():
         try:
             info = create(cluster, bindir, args.run_as, args.locale)
             control(cluster, 'start')
-            if not server_cwd_readable(info):
-                say("Throwaway PostgreSQL: the server's working directory is not readable here (root without CAP_SYS_PTRACE?), "
-                    'so the cleanup cannot find a backend left by a killed postmaster; a stale postmaster.pid still keeps the cluster')
+            unseen = server_unseen(info)
+            if unseen:
+                say('Throwaway PostgreSQL: ' + unseen)
             run([str(bindir / 'psql'), '-X', '-q', '-v', 'ON_ERROR_STOP=1', '-h', info['sockets'], '-U', ADMIN, '-d', 'postgres',
                  '-c', 'CREATE ROLE %s LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE' % ROLE,
                  '-c', "CREATE DATABASE %s OWNER %s TEMPLATE template0 ENCODING 'UTF8' %s" % (DATABASE, ROLE, LOCALES[args.locale])])
