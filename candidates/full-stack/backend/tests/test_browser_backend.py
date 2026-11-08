@@ -4,10 +4,13 @@ tests/browser_backend.py serves Uvicorn on a listener it binds itself. Unless th
 socket, asyncio leaves TCP_NODELAY off, and every response after a connection's first then reaches the client
 about 40 ms after its headers (Nagle's algorithm waiting for the client's delayed ACK). The documented server
 (``python -m mom_health_backend``) answers within a few milliseconds, so the browser checks would see a slower
-server than the one they stand for. One check times the responses; the other pins the listener itself, which no
-load on the machine can blur. Loopback only, fictional token, a fresh fixture under build/.
+server than the one they stand for. One check times the responses; the other runs main() with Uvicorn's server
+replaced, and pins the socket main() hands it, which no load on the machine can blur. Loopback only, fictional token,
+a fresh fixture under build/.
 """
+import contextlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -16,6 +19,7 @@ import subprocess
 import sys
 import time
 import unittest
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 TOKEN = 'synthetic-browser-token-not-for-deployment-0001'  # the test constant browser_backend.py serves
@@ -59,17 +63,47 @@ class BrowserBackendTimingTests(unittest.TestCase):
         # about 40 ms for the client's delayed ACK. The median of seven keeps a moderately busy machine from deciding
         # this. A client held up past its delayed-ACK time sees even a held-back body arrive with its headers, though,
         # so one starved before most responses (stopped about 100 ms at a time, say) can still let the regression pass:
-        # the check below pins the listener itself.
+        # the check below pins the socket main() serves on.
         self.assertLess(sorted(delays[1:])[3], 0.02, 'response bodies trailed their headers by (s): %s' % ['%.4f' % d for d in delays])
 
-    def test_the_listener_is_an_ipproto_tcp_socket_on_loopback(self):
+    def test_main_serves_on_an_ipproto_tcp_socket_on_loopback(self):
         spec = importlib.util.spec_from_file_location('browser_backend', HERE / 'browser_backend.py')
         backend = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(backend)
-        listener = backend.loopback_listener(0)
-        self.addCleanup(listener.close)
-        self.assertEqual(socket.IPPROTO_TCP, listener.proto, 'asyncio sets TCP_NODELAY only on an IPPROTO_TCP socket')
-        self.assertEqual('127.0.0.1', listener.getsockname()[0])
+        served = []
+
+        class Server:
+            """Stands in for uvicorn.Server: records the sockets main() would serve on, and serves nothing."""
+            def __init__(self, config):
+                self.started = self.should_exit = False
+
+            def run(self, sockets=None):
+                served.extend(sockets or [])
+                self.started = True
+
+        class Thread:
+            """Stands in for threading.Thread: runs its target at start(), so nothing main() starts (its stdin reader
+            included) outlives the patches."""
+            def __init__(self, target, args=(), kwargs=None, daemon=None):
+                self.target, self.args, self.kwargs = target, args, kwargs or {}
+
+            def start(self):
+                self.target(*self.args, **self.kwargs)
+
+            def is_alive(self):
+                return False
+
+            def join(self, timeout=None):
+                pass
+        with patch.object(backend.uvicorn, 'Server', Server), patch.object(backend.threading, 'Thread', Thread), \
+                patch.object(backend.signal, 'signal', lambda *arguments: None), patch.object(backend.sys, 'argv', ['browser_backend.py']), \
+                patch.object(backend.sys, 'stdin', io.StringIO('')), contextlib.redirect_stdout(io.StringIO()):
+            backend.main()
+        for listener in served:
+            self.addCleanup(listener.close)
+        self.assertEqual(1, len(served), served)
+        self.assertEqual(socket.IPPROTO_TCP, served[0].proto, 'asyncio sets TCP_NODELAY only on an IPPROTO_TCP socket')
+        self.assertEqual('127.0.0.1', served[0].getsockname()[0])
 
 
 if __name__ == '__main__':

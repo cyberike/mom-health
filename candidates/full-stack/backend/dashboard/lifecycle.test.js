@@ -51,22 +51,37 @@ function backend() {
 
 const shown = ui => ui.elements.historyRows.children.length === 1 && ui.elements.historyRows.children[0].children[0].textContent === "No observations in this view." ? 0 : ui.elements.historyRows.children.length;
 // A Refresh that fails at its health read or device request keeps watch A's loaded rows, the backend's count and the
-// status line, also a moment later (a clear deferred to a later task would show by then).
+// status line: as rendered, 5 ms later (a clear deferred by less would show by then; one deferred longer would not,
+// nor one queued on a case's fake timers, which the timeout cases therefore require empty), and rendered again from
+// the dashboard's own state (a Refresh that emptied that state but left the page as it was would show then).
 async function assertKept(ui, why) {
-  for (const when of ["at once", "a moment later"]) {
-    if (when !== "at once") await new Promise(resolve => setTimeout(resolve, 5));
+  for (const when of ["at once", "5 ms later", "re-rendered"]) {
+    if (when === "5 ms later") await new Promise(resolve => setTimeout(resolve, 5));
+    if (when === "re-rendered") { ui.elements.rangeSelect.value = "all"; ui.elements.rangeSelect.listeners.change(); }
     assert.equal(shown(ui), 3, why + ": the loaded rows, " + when);
     assert.equal(ui.elements.sampleCount.textContent, "3", why + ": the backend's count, " + when);
     assert.match(ui.elements.loadedStatus.textContent, /^3 shown · 3 loaded · 3 in source · /, why + ": the status line, " + when);
   }
 }
-// Ways a request can fail, as the backend or the network answers it.
+const refusal = (status, headers) => new Response(JSON.stringify({ detail: "refused" }), { status, headers: { "content-type": "application/json", ...headers } });
+// Ways a request can fail, as the backend or the network answers it: refusals with and without a wait (gateway.py's
+// lockout is a 429 with Retry-After), a network failure, a body that breaks off or does not parse, and a page that is
+// not JSON (a proxy's error page, for example).
 const FAILURES = [
   ["HTTP 401", () => json({ detail: "Authorization required" }, 401), /Access was refused/],
   ["HTTP 403", () => json({ detail: "refused" }, 403), /denied this request/],
   ["HTTP 429", () => json({ detail: "refused" }, 429), /HTTP 429/],
+  ["HTTP 429 asking for a wait", () => refusal(429, { "retry-after": "60" }), /HTTP 429\).* asked to wait about 60 seconds/],
   ["HTTP 503", () => json({ detail: "refused" }, 503), /HTTP 503/],
+  ["HTTP 503 asking for a wait", () => refusal(503, { "retry-after": "5" }), /HTTP 503\).* asked to wait about 5 seconds/],
   ["a network failure", () => Promise.reject(new TypeError("Failed to fetch")), /could not be reached/],
+  ["a body that breaks off", () => new Response(new ReadableStream({ start(controller) {
+    controller.enqueue(new TextEncoder().encode('{"status":')); controller.error(new TypeError("network error"));
+  } }), { status: 200, headers: { "content-type": "application/json" } }), /^The backend's answer was cut off\. No current data was confirmed\.$/],
+  ["a body that does not parse", () => new Response('{"status": "ready", "schema', { status: 200, headers: { "content-type": "application/json" } }),
+    /^Backend returned an unsupported response\. No current data was confirmed\.$/],
+  ["a page that is not JSON", () => new Response("<html>synthetic proxy page</html>", { status: 200, headers: { "content-type": "text/html" } }),
+    /^Backend returned an unsupported response\. No current data was confirmed\.$/],
 ];
 let passed = 0;
 async function test(name, action) { await action(); passed++; console.log("PASS " + name); }
@@ -136,15 +151,23 @@ async function test(name, action) { await action(); passed++; console.log("PASS 
       assert.equal(ui.elements.connectButton.disabled, false);
     });
 
-    for (const [where, unanswered] of [["its health read", url => url === "/v1/health"], ["its device request", url => url.startsWith("/v1/devices?")]]) {
+    // The third is answered, but its body stops part-way: the timeout still ends it as a timeout, not as a body cut off.
+    for (const [where, unanswered, headed] of [["its health read", url => url === "/v1/health"], ["its device request", url => url.startsWith("/v1/devices?")],
+      ["the body of its device request", url => url.startsWith("/v1/devices?"), true]]) {
       await test(variant + ": an unanswered request (" + where + ") times out after 12 s with an explicit message and recovers", async () => {
         const timers = new Map(); let next = 1;
         const fake = { setTimeout: (fn, ms) => { timers.set(next, { fn, ms }); return next++; }, clearTimeout: id => { timers.delete(id); } };
         const api = backend(); let silent = false;
+        const aborted = () => new DOMException("The operation was aborted.", "AbortError");
         const ui = setup((url, options) => {
           if (!silent || !unanswered(url)) return api.handler(url, options);
+          // Like fetch, a body still being read errors once the dashboard aborts the request.
+          if (headed) return new Response(new ReadableStream({ start(controller) {
+            controller.enqueue(new TextEncoder().encode('{"devices":'));
+            options.signal.addEventListener("abort", () => controller.error(aborted()));
+          } }), { status: 200, headers: { "content-type": "application/json" } });
           // Like fetch, settle only when the dashboard aborts the request.
-          return new Promise((_, reject) => options.signal.addEventListener("abort", () => reject(new DOMException("The operation was aborted.", "AbortError"))));
+          return new Promise((_, reject) => options.signal.addEventListener("abort", () => reject(aborted())));
         }, { ...fixture, ...fake });
         connect(ui); await idle(ui);
         assert.equal(timers.size, 0, "completed requests must clear their timers");
@@ -155,6 +178,7 @@ async function test(name, action) { await action(); passed++; console.log("PASS 
         pending[0].fn(); await idle(ui);
         assert.match(ui.elements.announcement.textContent, /timed out or was cancelled/);
         await assertKept(ui, "a Refresh that times out at " + where);
+        assert.equal(timers.size, 0, "nothing is left queued to run later");
         assert.equal(ui.elements.refreshButton.disabled, false);
         assert.equal(ui.elements.connectButton.disabled, false);
         silent = false;
@@ -310,6 +334,7 @@ async function test(name, action) { await action(); passed++; console.log("PASS 
       ui.elements.refreshButton.click(); await idle(ui);
       assert.notEqual(ui.elements.statusReportTime.textContent, "No gateway status report received.");
       assert.match(ui.elements.statusReportTime.textContent, /not loaded/);
+      await assertKept(ui, "a Refresh that fails (HTTP 503) at its device request");
       api.override = url => url.startsWith("/v1/samples?") && url.includes(B) ? json({ detail: "Storage unavailable" }, 503) : null;
       ui.elements.deviceSelect.value = B; ui.elements.deviceSelect.listeners.change(); await idle(ui);
       assert.equal(shown(ui), 0);
@@ -459,11 +484,13 @@ async function test(name, action) { await action(); passed++; console.log("PASS 
         assert.match(ui.elements.announcement.textContent, /no automatic retry occurs/);
         assert.equal(ui.calls.slice(before).filter(c => c.url.startsWith("/v1/devices")).length, 1, "the refused request is not repeated");
         assert.equal(timers.size, 0, "no retry is scheduled for later");
+        await assertKept(ui, "a Refresh refused (429) at its device request");
       }
       api.override = url => url.startsWith("/v1/devices?") ? answer(503, { "retry-after": "5" }) : null;
       ui.elements.refreshButton.click(); await idle(ui);
       assert.match(ui.elements.announcement.textContent, /HTTP 503\)\. No current data was confirmed\. The backend asked to wait about 5 seconds/);
       assert.equal(timers.size, 0);
+      await assertKept(ui, "a Refresh that fails (HTTP 503 asking for a wait) at its device request");
     });
 
     await test(variant + ": every new session starts from the widest time range", async () => {
@@ -610,6 +637,8 @@ async function test(name, action) { await action(); passed++; console.log("PASS 
         assert.match(ui.elements.announcement.textContent, message);
         assert.equal(ui.calls.length - before, 1, "nothing is requested after the failed health read");
         await assertKept(ui, "a Refresh that fails (" + failure + ") at its health read");
+        assert.equal(ui.elements.watchLink.textContent, "Not reported", "an unconfirmed refresh must not keep showing the old gateway report");
+        assert.match(ui.elements.statusReportTime.textContent, /not loaded/);
       });
     }
   }

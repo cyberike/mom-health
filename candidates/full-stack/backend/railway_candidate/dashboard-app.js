@@ -75,12 +75,13 @@
         if (response.status === 429) throw new Error("Too many requests or sign-in attempts (HTTP 429). No current data was confirmed." + (advice || " Wait before trying again; no automatic retry occurs."));
         throw new Error((response.status === 401 ? "Access was refused. Sign in again with the caregiver account (a cached browser sign-in can require closing the browser), then connect again." : response.status === 403 ? "Backend denied this request. Check the caregiver access configuration." : "Backend request failed (HTTP " + response.status + "). No current data was confirmed.") + advice);
       }
-      if (!(response.headers.get("content-type") || "").includes("application/json")) throw new Error("Backend returned an unsupported response.");
+      if (!(response.headers.get("content-type") || "").includes("application/json")) throw new Error("Backend returned an unsupported response. No current data was confirmed.");
       const reader = response.body.getReader(); const chunks = []; let bytes = 0;
-      while (true) { const part = await reader.read(); if (part.done) break; bytes += part.value.byteLength; if (bytes > 262144) { await reader.cancel(); throw new Error("Backend response exceeded the dashboard limit."); } chunks.push(part.value); }
+      // A body cut off or unreadable after the headers gets caregiver wording too; aborts propagate.
+      while (true) { let part; try { part = await reader.read(); } catch (error) { if (error && error.name === "AbortError") throw error; throw new Error("The backend's answer was cut off. No current data was confirmed."); } if (part.done) break; bytes += part.value.byteLength; if (bytes > 262144) { await reader.cancel(); throw new Error("Backend response exceeded the dashboard limit."); } chunks.push(part.value); }
       const body = new Uint8Array(bytes); let offset = 0; for (const chunk of chunks) { body.set(chunk, offset); offset += chunk.byteLength; }
       if (generation !== epoch) throw new Error("Cancelled");
-      return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(body));
+      try { return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(body)); } catch (error) { throw new Error("Backend returned an unsupported response. No current data was confirmed."); }
     } finally { clearTimeout(timer); }
   }
   async function operation(work) {
