@@ -327,17 +327,26 @@ def outside_dockers_default():
     return [number for number in range(last + 1) if not DOCKER_DEFAULT_CAPABILITIES >> number & 1]
 
 
-def remove_segment(key, shmid, creator):
-    """Remove the System V shared memory segment that a killed postmaster left (ipcrm), but only while
-    /proc/sysvipc/shm still shows it with that key and id, made by that postmaster and attached to no process."""
+def segment(key, shmid):
+    """The fields of the System V shared memory segment with that key and id in /proc/sysvipc/shm, or None."""
     try:
         rows = Path('/proc/sysvipc/shm').read_text().splitlines()[1:]
     except OSError:
-        return
-    for row in rows:
-        fields = row.split()
-        if fields[:2] == [str(key), str(shmid)] and fields[4] == str(creator) and fields[6] == '0':
-            subprocess.run(['ipcrm', '-m', str(shmid)], stdin=subprocess.DEVNULL)
+        return None
+    return next((row.split() for row in rows if row.split()[:2] == [str(key), str(shmid)]), None)
+
+
+def remove_segment(key, shmid, creator):
+    """Remove the System V shared memory segment that a killed postmaster left (ipcrm), but only while it is still
+    there, made by that postmaster and attached to no process. ipcrm runs as the segment's owner: root without
+    CAP_SYS_ADMIN (in Docker's default capability set, for example) may not remove another account's."""
+    fields = segment(key, shmid)
+    if fields and fields[4] == str(creator) and fields[6] == '0':
+        import pwd  # POSIX only; imported here so the module imports anywhere
+        command = ['ipcrm', '-m', str(shmid)]
+        if int(fields[7]) != os.geteuid():
+            command = ['runuser', '-u', pwd.getpwuid(int(fields[7])).pw_name, '--'] + command
+        subprocess.run(command, stdin=subprocess.DEVNULL)
 
 
 def ended(path, timeout=10):
@@ -1285,6 +1294,8 @@ class LauncherChecks(unittest.TestCase):
         self.assertTrue((cluster / 'data' / 'postmaster.pid').exists(), 'the cluster was deleted although its server never stopped')
         self.assertTrue(Path(sockets).exists(), 'the socket directory was removed while the cluster is kept')
         self.assertEqual([], processes_naming(root), 'a process from the run was left running')
+        remove_segment(key, shmid, postmaster)
+        self.assertIsNone(segment(key, shmid), 'the shared memory segment that the killed postmaster left was not removed')
 
     def test_a_failed_setup_leaves_nothing_behind(self):
         runs = [('as the calling account', None)]
