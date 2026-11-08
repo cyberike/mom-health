@@ -418,13 +418,18 @@ def in_pid_namespace(numbers=(), hide=False):
     without the capabilities numbered, and with hide on a /proc mounted with hidepid=ptraceable first (see
     hiding_processes()); or (None, why not), where that cannot be done here (it needs root, unshare and
     CAP_SYS_ADMIN). With --kill-child, killing unshare (as finish() and end() do after a failed check) kills that
-    init, and with it every process of the namespace, so none of them keeps the command's output open."""
+    init, and with it every process of the namespace, so none of them keeps the command's output open. The init
+    first moves the namespace's next PIDs to far_pid(), where it may (a read-only /proc/sys refuses it), so that
+    they name no process in the parent's /proc: the namespace's own low PIDs would (its postmaster's is 23, which a
+    kernel thread can hold there)."""
     if not ROOT or not shutil.which('unshare'):
         return None, 'needs root and unshare, for a PID namespace of its own'
     front, why_not = hiding_processes([]) if hide else ([], None)
     if why_not:
         return None, why_not
-    namespace = ['unshare', '--pid', '--fork', '--kill-child', '--', 'sh', '-c', '"$@"; exit $?', 'sh']
+    start = far_pid()
+    init = ('{ echo %d > /proc/sys/kernel/ns_last_pid; } 2>/dev/null; ' % start if start else '') + '"$@"; exit $?'
+    namespace = ['unshare', '--pid', '--fork', '--kill-child', '--', 'sh', '-c', init, 'sh']
     probe = subprocess.run(front + namespace + ['true'], stdin=subprocess.DEVNULL, capture_output=True, text=True)
     if probe.returncode:
         return None, 'cannot make a PID namespace here: %s' % (probe.stderr.strip().splitlines() or ['exit status %d' % probe.returncode])[-1]
@@ -432,6 +437,25 @@ def in_pid_namespace(numbers=(), hide=False):
     if why_not:
         return None, why_not
     return front + namespace + drop, None
+
+
+def far_pid():
+    """Where a new PID namespace should count its PIDs from, so that its processes take PIDs that name no process in
+    this /proc (right after a boot, the low PIDs here are kernel threads): the first PID, from halfway round the space
+    of PIDs after the last one given here (they wrap past the highest to 300), whose next 500 PIDs name no process
+    here; or None where /proc/sys/kernel does not tell, or no such PID is found."""
+    try:
+        last = int(Path('/proc/sys/kernel/ns_last_pid').read_text())
+        top = int(Path('/proc/sys/kernel/pid_max').read_text())
+    except (OSError, ValueError):
+        return None
+    taken = {int(entry.name) for entry in Path('/proc').glob('[0-9]*')}
+    span = top - 300
+    for step in range(0, span, 997):
+        start = 300 + (last - 300 + span // 2 + step) % span
+        if start + 501 < top and taken.isdisjoint(range(start + 1, start + 501)):
+            return start
+    return None
 
 
 def unmapped(paths):
