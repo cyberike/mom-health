@@ -408,6 +408,7 @@ async function test(name, action) { await action(); passed++; console.log("PASS 
         api.override = url => url.startsWith("/v1/devices?") ? json({ detail: "refused" }, code) : null;
         ui.elements.refreshButton.click(); await idle(ui);
         assert.match(ui.elements.announcement.textContent, message);
+        assert.equal(shown(ui), 3, "a Refresh that fails at its device request keeps the loaded rows");
         assert.equal(ui.elements.refreshButton.disabled, false);
         assert.equal(ui.elements.watchLink.textContent, "Not reported", "an unconfirmed refresh must not keep showing the old gateway report");
         api.override = () => null;
@@ -572,6 +573,21 @@ async function test(name, action) { await action(); passed++; console.log("PASS 
       assert.equal(shown(ui), 3);
       blank = true; ui.elements.refreshButton.click(); await idle(ui);
       assert.match(ui.elements.announcement.textContent, /Backend contract is not supported/);
+      assert.equal(shown(ui), 3, "a Refresh refused at its health read keeps the loaded rows");
+    });
+
+    await test(variant + ": a Refresh refused (401) at its health read keeps the loaded rows and count", async () => {
+      const api = backend(); const ui = setup(api.handler, fixture);
+      connect(ui); await idle(ui);
+      assert.equal(shown(ui), 3);
+      // As when a token-less local session meets a backend that switched to real-data mode, which then requires a token.
+      api.override = url => url === "/v1/health" ? json({ detail: "Authorization required" }, 401) : null;
+      const before = ui.calls.length;
+      ui.elements.refreshButton.click(); await idle(ui);
+      assert.match(ui.elements.announcement.textContent, /Access was refused/);
+      assert.equal(ui.calls.length - before, 1, "nothing is requested after the refused health read");
+      assert.equal(shown(ui), 3);
+      assert.match(ui.elements.loadedStatus.textContent, /^3 shown · 3 loaded/);
     });
   }
   console.log("\n" + passed + " simulated lifecycle checks passed across the local and hosted dashboards. Not a browser; no network or real data.");

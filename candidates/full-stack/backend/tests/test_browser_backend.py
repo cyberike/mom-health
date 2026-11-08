@@ -54,8 +54,9 @@ class BrowserBackendTimingTests(unittest.TestCase):
                 delay, rest = read_response(connection, rest)
                 delays.append(delay)
         # The first response on a connection is quick either way; with Nagle's algorithm on, every later one waits
-        # about 40 ms for the client's delayed ACK. The quickest of seven keeps a busy machine from deciding this.
-        self.assertLess(min(delays[1:]), 0.02, 'response bodies trailed their headers by (s): %s' % ['%.4f' % d for d in delays])
+        # about 40 ms for the client's delayed ACK. The median of seven keeps a busy machine from deciding this either
+        # way: a client held up past its delayed-ACK time sees even a held-back body arrive with its headers.
+        self.assertLess(sorted(delays[1:])[3], 0.02, 'response bodies trailed their headers by (s): %s' % ['%.4f' % d for d in delays])
 
 
 if __name__ == '__main__':

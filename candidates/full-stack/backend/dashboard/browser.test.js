@@ -527,7 +527,7 @@ async function check(name, action) { await action(); passed++; console.log("PASS
       }
     });
 
-    await check("a Refresh that keeps the watch empties the table while it reloads: focus on it returns to Refresh, except where the empty table still scrolls", async () => {
+    await check("a Refresh that keeps the watch empties the table while it reloads: focus on it returns to Refresh, except where the emptied table still overflows", async () => {
       for (const [width, height, expected] of [[1280, 900, "refreshButton"], [320, 640, "table-scroll"]]) {
         const view = await open(seeded, { viewport: { width, height } });
         await connect(view.page);

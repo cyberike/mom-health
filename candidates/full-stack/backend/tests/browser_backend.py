@@ -85,8 +85,10 @@ def main():
         raise SystemExit('Hosted modes always use a fresh fixture')
     else:
         app, database = hosted_app(args.mode)
-    # IPPROTO_TCP, as Uvicorn's own listener is: asyncio sets TCP_NODELAY only on such sockets. Without it, every
-    # response after a connection's first trails its headers by about 40 ms (tests/test_browser_backend.py).
+    # IPPROTO_TCP, as the documented server's listener is (uvicorn.run with a host and port lets asyncio bind it;
+    # Uvicorn's own Config.bind_socket(), used for --reload and --workers, is not): asyncio sets TCP_NODELAY only on
+    # such sockets. Without it, every response after a connection's first trails its headers by about 40 ms
+    # (tests/test_browser_backend.py).
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind(('127.0.0.1', args.port))

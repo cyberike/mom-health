@@ -351,7 +351,7 @@ async function check(name, action) { await action(); passed++; console.log("PASS
     }
   }));
 
-  await check("direct_candidate.py: a Refresh that keeps the watch empties the table while it reloads: focus on it returns to Refresh, except where the empty table still scrolls", () => withHosted("direct", async (browser, backend) => {
+  await check("direct_candidate.py: a Refresh that keeps the watch empties the table while it reloads: focus on it returns to Refresh, except where the emptied table still overflows", () => withHosted("direct", async (browser, backend) => {
     await seedRows(backend);
     for (const [width, height, expected] of [[1280, 720, "refreshButton"], [320, 640, "table-scroll"]]) {
       const view = await signIn(browser, "direct", CAREGIVER, { viewport: { width, height } });
