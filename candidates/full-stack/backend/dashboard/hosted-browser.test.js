@@ -12,7 +12,7 @@
 const assert = require("node:assert/strict");
 const http = require("node:http");
 const { randomUUID } = require("node:crypto");
-const { requireBrowser, loopbackArgs, startBackend, stopBackend } = require("./browser-support.js");
+const { requireBrowser, loopbackArgs, launchOptions, startBackend, stopBackend } = require("./browser-support.js");
 
 const chromium = requireBrowser();
 // Test constants shared with ../tests/browser_backend.py; never deployed.
@@ -129,7 +129,7 @@ async function connected(view) {
 
 async function withHosted(mode, action) {
   const backend = await startBackend({ mode });
-  const browser = await chromium.launch({ args: loopbackArgs([[HOST, backend.port]]) });
+  const browser = await chromium.launch(launchOptions(loopbackArgs([[HOST, backend.port]])));
   try { await seed(backend, mode); await action(browser, backend); } finally { await browser.close(); await stopBackend(backend); }
 }
 

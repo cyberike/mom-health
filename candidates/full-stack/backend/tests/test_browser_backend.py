@@ -4,10 +4,11 @@ tests/browser_backend.py serves Uvicorn on a listener it binds itself. Unless th
 socket, asyncio leaves TCP_NODELAY off, and every response after a connection's first then reaches the client
 about 40 ms after its headers (Nagle's algorithm waiting for the client's delayed ACK). The documented server
 (``python -m mom_health_backend``) answers within a few milliseconds, so the browser checks would see a slower
-server than the one they stand for. One check times the responses; the other runs main() with Uvicorn's server class
-made to serve nothing, and pins the one Uvicorn server main() starts and the socket it hands that server, which no
-load on the machine can blur (another listening socket opened outside Uvicorn is not counted). Loopback only, fictional
-token, a fresh fixture under build/.
+server than the one they stand for. One check times the responses; the other runs main() with every way into Uvicorn's
+server class made to serve nothing, and pins the one Uvicorn server main() starts and the socket it hands that server,
+which no load on the machine can blur. A listening socket or a server other than Uvicorn's that main() also opens is
+not counted; one that keeps main() from returning fails the check after OVERDUE seconds instead of hanging it.
+Loopback only, fictional token, a fresh fixture under build/.
 """
 import contextlib
 import importlib.util
@@ -19,6 +20,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import types
 import unittest
@@ -26,6 +28,11 @@ from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 TOKEN = 'synthetic-browser-token-not-for-deployment-0001'  # the test constant browser_backend.py serves
+OVERDUE = 20  # seconds; main() returns within about 0.3 s when nothing it starts runs on
+
+
+class Overdue(BaseException):
+    """main() has not returned in time (a BaseException, so that no except Exception in main() swallows it)."""
 
 
 def read_response(connection, pending=b''):
@@ -74,9 +81,10 @@ class BrowserBackendTimingTests(unittest.TestCase):
         backend = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(backend)
         # Uvicorn's server class itself is patched, so main() is caught whatever name it reaches it by (uvicorn.Server,
-        # uvicorn.server.Server, uvicorn.run) and whichever entry point it serves through (run, or the serve() coroutine
-        # that run() wraps): every server is counted, and none serves. Each socket handed over is closed after the check,
-        # even if main() fails after it.
+        # uvicorn.server.Server, uvicorn.run, a subclass) and whichever of its entry points it serves through (run;
+        # serve, the coroutine that run() wraps; or startup, through which _serve() and every other way to a listening
+        # socket goes, with main_loop and shutdown made to return at once): every Uvicorn server is counted, and none
+        # serves. Each socket handed over is closed after the check, even if main() fails after it.
         server_class, servers, served = backend.uvicorn.server.Server, [], []
         initialize = server_class.__init__
 
@@ -85,17 +93,22 @@ class BrowserBackendTimingTests(unittest.TestCase):
             initialize(server, *arguments, **options)
 
         def recorded(server, sockets=None):
-            for listener in sockets or []:
+            sockets = list(sockets or [])  # an iterator would be spent by the first loop
+            for listener in sockets:
                 self.addCleanup(listener.close)
-            served.extend(sockets or [])
+            served.extend(sockets)
             server.started = True
 
         async def recorded_async(server, sockets=None):
             recorded(server, sockets)
 
+        async def idle(server, *arguments, **options):
+            pass
+
         class Thread:
             """Stands in for threading.Thread in browser_backend alone: runs its target at start(), so nothing main()
-            starts (its stdin reader included) outlives the check."""
+            starts (its stdin reader included) outlives the check. A target that never returns (an event loop run
+            forever, a server other than Uvicorn's) would hang the check: the alarm below fails it instead."""
             def __init__(self, target, args=(), kwargs=None, daemon=None):
                 self.target, self.args, self.kwargs = target, args, kwargs or {}
 
@@ -108,12 +121,27 @@ class BrowserBackendTimingTests(unittest.TestCase):
             def join(self, timeout=None):
                 pass
         handlers = types.SimpleNamespace(signal=lambda *arguments: None, SIGTERM=signal.SIGTERM, SIGINT=signal.SIGINT)
-        with patch.object(server_class, '__init__', counted), patch.object(server_class, 'run', recorded), \
-                patch.object(server_class, 'serve', recorded_async), \
-                patch.object(backend, 'threading', types.SimpleNamespace(Thread=Thread)), patch.object(backend, 'signal', handlers), \
-                patch.object(backend.sys, 'argv', ['browser_backend.py']), patch.object(backend.sys, 'stdin', io.StringIO('')), \
-                contextlib.redirect_stdout(io.StringIO()):
-            backend.main()
+
+        def overdue(signum, frame):
+            raise Overdue('main() had not returned after %d s: something it started still runs inside this check' % OVERDUE)
+        alarm = hasattr(signal, 'setitimer') and threading.current_thread() is threading.main_thread()
+        if alarm:
+            self.addCleanup(signal.signal, signal.SIGALRM, signal.signal(signal.SIGALRM, overdue))
+            self.addCleanup(signal.setitimer, signal.ITIMER_REAL, 0)
+            signal.setitimer(signal.ITIMER_REAL, OVERDUE)
+        try:
+            with patch.object(server_class, '__init__', counted), patch.object(server_class, 'run', recorded), \
+                    patch.object(server_class, 'serve', recorded_async), patch.object(server_class, 'startup', recorded_async), \
+                    patch.object(server_class, 'main_loop', idle), patch.object(server_class, 'shutdown', idle), \
+                    patch.object(backend, 'threading', types.SimpleNamespace(Thread=Thread)), patch.object(backend, 'signal', handlers), \
+                    patch.object(backend.sys, 'argv', ['browser_backend.py']), patch.object(backend.sys, 'stdin', io.StringIO('')), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                backend.main()
+        except Overdue as late:
+            self.fail(str(late))
+        finally:
+            if alarm:
+                signal.setitimer(signal.ITIMER_REAL, 0)
         self.assertEqual(1, len(servers), 'main() started %d servers' % len(servers))
         self.assertEqual(1, len(served), served)
         self.assertEqual(socket.IPPROTO_TCP, served[0].proto, 'asyncio sets TCP_NODELAY only on an IPPROTO_TCP socket')

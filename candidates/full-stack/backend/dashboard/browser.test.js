@@ -7,7 +7,7 @@
 // "python", like integration.test.js):  node browser.test.js
 const assert = require("node:assert/strict");
 const { randomUUID } = require("node:crypto");
-const { requireBrowser, loopbackArgs, startBackend, stopBackend } = require("./browser-support.js");
+const { requireBrowser, loopbackArgs, launchOptions, startBackend, stopBackend } = require("./browser-support.js");
 
 const chromium = requireBrowser();
 // Test constant shared with ../tests/browser_backend.py; never deployed.
@@ -158,7 +158,7 @@ let passed = 0;
 async function check(name, action) { await action(); passed++; console.log("PASS " + name); }
 
 (async () => {
-  browser = await chromium.launch({ args: loopbackArgs() });
+  browser = await chromium.launch(launchOptions(loopbackArgs()));
   const empty = await startBackend();
   const seeded = await startBackend();
   try {
