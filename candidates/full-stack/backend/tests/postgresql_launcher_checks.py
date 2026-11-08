@@ -187,8 +187,9 @@ sys.argv = sys.argv[2:]
 sys.exit(launcher.main())
 '''
 # A command that asks the launcher's own leftover_processes() which processes of the running server it sees, and
-# whether it can read the postmaster's environment, with the launcher's capabilities (it inherits them). The
-# postmaster's children (checkpointer, background writer, ...) overwrite their command line and environment.
+# whether it can read the postmaster's environment and working directory, with the launcher's capabilities (it
+# inherits them). The postmaster's children (checkpointer, background writer, ...) overwrite their command line and
+# environment.
 SEES_THE_SERVER = r'''
 import json, os, sys
 from pathlib import Path
@@ -209,14 +210,12 @@ def children():
     return found
 
 
-try:
-    readable = bool(Path('/proc/%%d/environ' %% postmaster).read_bytes())
-except PermissionError:
-    readable = False
+readable = {'environment': launcher.can_read(Path.read_bytes, Path('/proc/%%d/environ' %% postmaster)),
+            'working directory': launcher.can_read(os.readlink, '/proc/%%d/cwd' %% postmaster)}
 before = children()
 found = launcher.leftover_processes(info)
 lasting = before & children()  # there throughout, unlike an autovacuum worker that came and went meanwhile
-print(json.dumps({'postmaster': postmaster, 'children': sorted(lasting), 'found': sorted(found), 'environment_readable': readable}))
+print(json.dumps({'postmaster': postmaster, 'children': sorted(lasting), 'found': sorted(found), 'readable': readable}))
 '''
 # A command that kills the server's postmaster (SIGKILL, as the kernel's out-of-memory killer would) and waits until it
 # is gone, reaped; the server's other processes then end by themselves, and its postmaster.pid stays behind. First it
@@ -1259,10 +1258,12 @@ class LauncherChecks(unittest.TestCase):
                 # Its children name neither the data directory nor PGDATA any more, but their titles name the cluster.
                 self.assertEqual([], sorted(set([seen['postmaster']] + seen['children']) - set(seen['found'])), seen)
                 self.assertNothingLeft(root, fixtures, sockets, errors)
-                if 'Docker' in name and seen['environment_readable']:
-                    self.skipTest("root reads the server account's environments even in Docker's default capability set here")
+                readable = any(seen['readable'].values())  # a program the server started is found through either
+                if 'Docker' in name and readable:
+                    self.skipTest("root reads the server account's %s even in Docker's default capability set here"
+                                  % ' and '.join(what for what, can in seen['readable'].items() if can))
                 # Said exactly where the cleanup could not find a program the server started.
-                (self.assertNotIn if seen['environment_readable'] else self.assertIn)(UNSEEN, errors)
+                (self.assertNotIn if readable else self.assertIn)(UNSEEN, errors)
 
     @unittest.skipUnless(shutil.which('ipcrm'), 'needs ipcrm, to remove the shared memory segment that a killed postmaster leaves')
     def test_a_killed_postmaster_is_reported_and_its_cluster_kept(self):
