@@ -32,10 +32,10 @@ stops the cleanup nor changes the exit status, also after an error that came
 before the first status line. A non-blocking stderr that is full for a moment
 silences none of the lines after it. With stderr buffered (no PYTHONUNBUFFERED
 or -u), the line that met the full pipe is kept too, as far as Python's buffer
-holds it (4 KiB for a pipe); unbuffered, Python drops that line, and a
-traceback written into a full pipe keeps only its first line either way. If
-the server does not start, the end of its log is included in the error,
-because --discard deletes the log.
+holds it (4 KiB for a pipe); unbuffered, Python drops that line. A traceback
+written into a full pipe keeps only its first line buffered, and nothing of it
+unbuffered. If the server does not start, the end of its log is included in
+the error, because --discard deletes the log.
 
 Socket authentication is ``trust``: only the server account (and root) can
 reach the socket, and no password or other credential exists. Fixtures are
@@ -48,7 +48,11 @@ Needs Linux (it reads /proc to confirm the server exited). PostgreSQL refuses to
 run as root, so a root caller names an unprivileged account with --run-as, which
 uses runuser. The cluster directory and its cluster.json then stay root-owned;
 only data/, log/ and the socket directory belong to that account, so it cannot
-change what root later runs. From candidates/full-stack/backend:
+change what root later runs. Root without CAP_SYS_PTRACE (Docker's default
+capability set, for example) cannot see that account's working directories, so
+a backend left by a killed postmaster would not be found; the launcher says so
+when the server starts (a stale postmaster.pid still keeps such a cluster). From
+candidates/full-stack/backend:
 
     python tests/postgresql_throwaway.py --run-as postgres -- \\
         python -m unittest tests.postgresql_parity -v
@@ -80,7 +84,7 @@ SHORT_SOCKET_BASE = '/tmp'
 SIGNALS = tuple(getattr(signal, name) for name in ('SIGINT', 'SIGTERM', 'SIGHUP') if hasattr(signal, name))
 STEP_GRACE = 120  # seconds an interrupted setup step may take to finish before it is stopped
 TERM_GRACE = 10  # seconds between SIGTERM and SIGKILL for such a step (runuser takes 2 to end its child)
-STOP_GRACE = 60  # seconds the cleanup waits for every process naming the cluster to exit
+STOP_GRACE = 60  # seconds the cleanup waits for every process using the cluster (see leftover_processes()) to exit
 EXIT_FLUSH_GRACE = 2  # seconds the exit waits for a full non-blocking stderr to take what is still buffered
 # While start() starts a step or the command, a signal is held here until the process is known.
 HELD = {'starting': False, 'signum': None}
@@ -137,9 +141,14 @@ def flush_stderr():
     """Registered by main() with atexit, which runs before Python's own final flush: flush what is still
     buffered for stderr (a usage message, or a status line that met a full pipe, for example), and silence
     stderr if that fails or is cut short, so the final flush cannot fail and turn the exit status into 120.
-    A full non-blocking stderr gets EXIT_FLUSH_GRACE seconds to take it first. A signal ends that wait:
-    before main() installs its handlers, Ctrl-C is still Python's KeyboardInterrupt."""
+    A full non-blocking stderr gets EXIT_FLUSH_GRACE seconds to take it first. SIGINT is blocked from here
+    on: before main() installs its handlers, Ctrl-C is Python's KeyboardInterrupt, and a second one (from a
+    wrapper that passes Ctrl-C on, for example) could otherwise cut the silencing short. One already pending
+    is raised by the blocking call itself, and stderr is silenced then too. Once main() has run, SIGINT,
+    SIGTERM and SIGHUP are ignored anyway; before that, SIGTERM and SIGHUP end the process."""
     try:
+        if hasattr(signal, 'pthread_sigmask'):  # POSIX
+            signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGINT])
         deadline = time.monotonic() + EXIT_FLUSH_GRACE
         while True:
             try:
@@ -244,7 +253,7 @@ def stop_step(process):
     initdb, pg_ctl and tee run under runuser, which ends the step itself 2 s after a SIGTERM; psql runs as
     the caller and gets the signals directly. If something still holds the step's output after the
     SIGKILL (a stopped step stops runuser too), the launcher stops reading it, so the wait stays bounded;
-    the cleanup then reports what still names the cluster (see leftover_processes())."""
+    the cleanup then reports what still uses the cluster (see leftover_processes())."""
     process.terminate()
     try:
         process.communicate(timeout=TERM_GRACE)
@@ -290,10 +299,13 @@ def leftover_processes(info):
     names it, their environment has it as PGDATA, or it is their working directory. initdb and pg_ctl set
     PGDATA for what they start, so this finds a helper of an interrupted initdb (its sh -c and bootstrap
     backend name no directory), and a program the server starts (archive_command, COPY ... TO PROGRAM)
-    inherits it. The server's own processes overwrite their command line and environment with their
-    process title but run in the data directory, so a backend left by a killed postmaster is found too.
-    Another account's environment and working directory are not readable to an ordinary caller; root reads
-    every one."""
+    inherits it. The postmaster names the directory and has it as PGDATA; its children (backends and
+    auxiliary processes) overwrite both with their process title, but every server process runs in the
+    data directory, so a backend left by a killed postmaster is found too. So is any other process working
+    there, a shell someone left in it included: the cluster is then kept. Another account's environment and
+    working directory are not readable to an ordinary caller. Root reads both, except that without
+    CAP_SYS_PTRACE (Docker's default capability set, for example) another account's working directory is
+    unreadable too: the server's backends are then not found (see server_cwd_readable())."""
     data = info['data']
     named, variable, where, found = data.encode(), b'PGDATA=' + data.encode(), os.path.realpath(data), []
     for entry in Path('/proc').glob('[0-9]*'):
@@ -306,8 +318,25 @@ def leftover_processes(info):
     return found
 
 
+def server_cwd_readable(info):
+    """Whether leftover_processes() can read the running server's working directory. Root without
+    CAP_SYS_PTRACE (Docker's default capability set, for example) cannot read another account's, and would
+    then not find a backend left by a killed postmaster; main() says so when the server has started."""
+    try:
+        postmaster = int((Path(info['data']) / 'postmaster.pid').read_text().split()[0])
+    except (OSError, ValueError, IndexError):  # no server after all: nothing to look at
+        return True
+    try:
+        os.readlink('/proc/%d/cwd' % postmaster)
+    except PermissionError:
+        return False
+    except OSError:  # no /proc, or the server is already gone
+        pass
+    return True
+
+
 def stop_server(info):
-    """Stop the server if one runs, then wait up to STOP_GRACE seconds until no process names the
+    """Stop the server if one runs, then wait up to STOP_GRACE seconds until no process uses the
     cluster and none is reported running. Returns the PIDs still left. A failed stop (pg_ctl refuses a
     single-user backend that initdb has not finished with, for example) is reported and retried."""
     deadline, reported = time.monotonic() + STOP_GRACE, False
@@ -393,6 +422,9 @@ def main():
         try:
             info = create(cluster, bindir, args.run_as, args.locale)
             control(cluster, 'start')
+            if not server_cwd_readable(info):
+                say("Throwaway PostgreSQL: the server's working directory is not readable here (root without CAP_SYS_PTRACE?), "
+                    'so the cleanup cannot find a backend left by a killed postmaster; a stale postmaster.pid still keeps the cluster')
             run([str(bindir / 'psql'), '-X', '-q', '-v', 'ON_ERROR_STOP=1', '-h', info['sockets'], '-U', ADMIN, '-d', 'postgres',
                  '-c', 'CREATE ROLE %s LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE' % ROLE,
                  '-c', "CREATE DATABASE %s OWNER %s TEMPLATE template0 ENCODING 'UTF8' %s" % (DATABASE, ROLE, LOCALES[args.locale])])

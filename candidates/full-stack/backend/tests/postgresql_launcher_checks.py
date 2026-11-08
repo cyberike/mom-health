@@ -8,9 +8,10 @@ directory (under build/, deep enough that its socket goes in a private
 directory under /tmp; one layout of the ownership check uses a short copy under
 /tmp, whose socket stays in the cluster), with a small probe command and
 --discard, so every cluster is removed again and concurrent runs cannot disturb
-each other. The other checks need only POSIX, except three that read /proc and
-are skipped without it: the environment and working-directory checks of the
-cleanup (Linux) and the runuser step check (Linux, root and runuser). The
+each other (one launch check also needs root with CAP_SYS_PTRACE, and capsh to
+drop that capability). The other checks need only POSIX, except three that read
+/proc and are skipped without it: the environment and working-directory checks
+of the cleanup (Linux) and the runuser step check (Linux, root and runuser). The
 checks that need no server also run under every other CPython 3 installed in
 /usr/bin or /usr/local/bin (before 3.13, communicate() flushes a stdin that
 run() has closed). The module imports anywhere. From candidates/full-stack/backend:
@@ -41,6 +42,7 @@ RUN_AS = ['--run-as', 'postgres'] if ROOT else []
 SIGNALS = tuple(getattr(signal, name) for name in ('SIGINT', 'SIGTERM', 'SIGHUP') if hasattr(signal, name))
 STARTED = 'Throwaway PostgreSQL ('
 SOCKETS = 'Throwaway PostgreSQL socket directory'
+UNSEEN = "Throwaway PostgreSQL: the server's working directory is not readable here"
 WAITING = r'''
 import os, sys, time
 print(os.getpid(), flush=True)
@@ -142,8 +144,10 @@ launcher.say('last status line')
 print('exiting', flush=True)
 '''
 # A command that leaves a process behind which uses the cluster without naming it: it has the data directory as
-# PGDATA, or as its working directory. The process ends once RELEASE exists, or after 30 s: less than STOP_GRACE,
-# so an interrupted check (whose cleanups do not run) leaves no cluster behind.
+# PGDATA, or as its working directory. The process ends once RELEASE exists, or after 30 s: less than the default
+# STOP_GRACE, so an interrupted run of the check that waits for it (whose cleanups do not run) leaves no cluster
+# behind. The check with a 3 s STOP_GRACE keeps its cluster and /tmp socket directory by design; interrupted, it
+# leaves both (the kept cluster's cluster.json names the socket directory).
 LEAVES_A_PROCESS = r'''
 import os, subprocess, sys
 release, how = %r, %r
@@ -227,20 +231,58 @@ def processes_naming(path, marker=b''):
             if str(path).encode() in _cmdline(entry) and marker in _cmdline(entry)]
 
 
-def initdb_runs_a_backend(root):
-    """True once initdb from this copy has started its bootstrap or single-user backend. By then
-    initdb handles signals itself and ignores SIGPIPE, so an orphaned initdb would finish its work."""
-    initdb = {entry.name for entry in Path('/proc').glob('[0-9]*')
-              if _cmdline(entry).split(b'\0')[0].endswith(b'/initdb') and str(root).encode() in _cmdline(entry)}
+def process_state(pid):
+    """(state, parent pid, start time) from /proc/<pid>/stat, or None once the process is gone."""
+    try:
+        fields = Path('/proc/%d/stat' % pid).read_text().rsplit(')', 1)[1].split()
+        return fields[0], int(fields[1]), int(fields[19])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def initdb_with_its_backend(root):
+    """{pid: (parent pid, start time)} for initdb from this copy and its bootstrap or single-user backend, once that
+    backend runs; {} before. By then initdb handles signals itself and ignores SIGPIPE, so an orphaned initdb would
+    finish its work."""
+    initdb = {}
     for entry in Path('/proc').glob('[0-9]*'):
-        try:
-            child = (entry / 'stat').read_text().rsplit(')', 1)[1].split()[1] in initdb
-        except (OSError, IndexError):
-            continue
+        if _cmdline(entry).split(b'\0')[0].endswith(b'/initdb') and str(root).encode() in _cmdline(entry):
+            state = process_state(int(entry.name))
+            if state:
+                initdb[int(entry.name)] = state[1:]
+    for entry in Path('/proc').glob('[0-9]*'):
+        state = process_state(int(entry.name))
         # Not its earlier "postgres -V" probe, which runs before initdb ignores SIGPIPE.
-        if child and any(flag in _cmdline(entry) for flag in (b'--boot', b'--single')):
-            return True
-    return False
+        if state and state[1] in initdb and any(flag in _cmdline(entry) for flag in (b'--boot', b'--single')):
+            return {**initdb, int(entry.name): state[1:]}
+    return {}
+
+
+def orphaned(family):
+    """The processes of family ({pid: (parent pid, start time)}) still running under another parent."""
+    found = []
+    for pid, (parent, started) in family.items():
+        state = process_state(pid)
+        if state and state[2] == started and state[0] not in 'ZX' and state[1] != parent:
+            found.append(pid)
+    return found
+
+
+def has_capability(number):
+    """Whether this process has capability number (19 is CAP_SYS_PTRACE) in its effective set (Linux)."""
+    try:
+        status = Path('/proc/self/status').read_text()
+    except OSError:
+        return False
+    effective = re.search(r'^CapEff:\s*([0-9a-f]+)$', status, re.M)
+    return bool(effective) and bool(int(effective.group(1), 16) >> number & 1)
+
+
+def ended(path, timeout=10):
+    """Wait, at most timeout seconds, until no process names path any more."""
+    deadline = time.monotonic() + timeout
+    while processes_naming(path) and time.monotonic() < deadline:
+        time.sleep(0.05)
 
 
 def remove_copy(root):
@@ -277,17 +319,17 @@ def private_copy(test, owner=None, short=False):
 
 
 def launch(script, command, *options, run_as=RUN_AS, env=None, stderr=subprocess.PIPE, ignore=(), interpreter=sys.executable,
-           user=None, wrapper=(), command_line=None):
+           user=None, wrapper=(), command_line=None, prefix=()):
     """Start a launcher in its own process group, with SIGINT, SIGTERM and SIGHUP at their defaults
     (or ignored, for those in ``ignore``) whatever this test process inherited. The launcher runs
-    ``interpreter -c command``, or command_line if given."""
+    ``interpreter -c command``, or command_line if given; prefix (capsh ... --, for example) runs it."""
     def dispositions():
         for signum in SIGNALS:
             signal.signal(signum, signal.SIG_IGN if signum in ignore else signal.SIG_DFL)
     argv = [interpreter, *wrapper, str(script), *run_as, '--discard', *options, '--', *(command_line or [interpreter, '-c', command])]
     if user:
         argv = ['runuser', '-u', user, '--'] + argv
-    return subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=stderr, text=True, env=env, start_new_session=True,
+    return subprocess.Popen([*prefix, *argv], stdout=subprocess.PIPE, stderr=stderr, text=True, env=env, start_new_session=True,
                             preexec_fn=dispositions)
 
 
@@ -520,7 +562,7 @@ class SignalTests(unittest.TestCase):
                 # Not 120: the usage message or traceback is still buffered when Python's final flush fails.
                 self.assertEqual(expected, process.wait(60))
 
-    def test_a_signal_while_the_exit_waits_for_a_full_stderr_keeps_an_early_errors_exit_status(self):
+    def test_ctrl_c_while_the_exit_waits_for_a_full_stderr_is_held_off_and_the_early_errors_exit_status_kept(self):
         failures = (('invalid option', 'usage', ['--locale', 'synthetic-bogus'], 2), ('error message', 'message', RUN_AS, 1),
                     ('uncaught exception', 'exception', RUN_AS, 1))
         for name, failure, options, expected in failures:
@@ -534,10 +576,24 @@ class SignalTests(unittest.TestCase):
                 self.addCleanup(process.kill)
                 self.assertTrue(select.select([process.stdout], [], [], 30)[0], 'the launcher did not fail')
                 self.assertEqual('failed', process.stdout.readline().strip())
-                time.sleep(0.5)  # well inside EXIT_FLUSH_GRACE: the exit is waiting for the full stderr
-                process.send_signal(signal.SIGINT)  # Ctrl-C: main() never got to install its handlers
-                # Not 120: the wait was cut short, so stderr was silenced before Python's final flush.
+                time.sleep(launcher.EXIT_FLUSH_GRACE / 4)  # well inside the grace
+                self.assertIsNone(process.poll(), 'the exit had stopped waiting for the full stderr before the signal')
+                # Ctrl-C twice, as from a terminal and a wrapper that passes it on: main() never got to install its handlers.
+                process.send_signal(signal.SIGINT)
+                process.send_signal(signal.SIGINT)
+                time.sleep(launcher.EXIT_FLUSH_GRACE / 10)
+                # Held off: a second KeyboardInterrupt could otherwise land before stderr is silenced.
+                self.assertIsNone(process.poll(), 'Ctrl-C cut the exit wait short')
+                # Not 120: after the grace, stderr is silenced before Python's final flush.
                 self.assertEqual(expected, process.wait(60))
+
+    def test_an_interrupt_that_cuts_the_exit_flush_short_still_silences_stderr(self):
+        silenced = []
+        # A Ctrl-C already pending when flush_stderr() blocks SIGINT is raised by that very call.
+        with patch.object(launcher.signal, 'pthread_sigmask', side_effect=KeyboardInterrupt), \
+                patch.object(launcher, 'silence_stderr', lambda: silenced.append(1)), self.assertRaises(KeyboardInterrupt):
+            launcher.flush_stderr()
+        self.assertEqual([1], silenced, 'stderr was left as it is, so Python\'s final flush could fail and exit 120')
 
     def test_a_full_non_blocking_stderr_is_not_silenced_and_buffered_keeps_the_line_that_met_it(self):
         for buffered in (True, False):
@@ -820,7 +876,9 @@ class SetupTests(unittest.TestCase):
 @unittest.skipUnless(os.name == 'posix', 'needs POSIX')
 class OtherPythonTests(unittest.TestCase):
     """The checks that need no server, under every other CPython 3 installed here. Python before 3.13 flushes a
-    closed stdin in communicate() and raises ValueError, which run() must not let replace an interrupt."""
+    closed stdin in communicate() and raises ValueError, which run() must not let replace an interrupt. An
+    interpreter without the standard library modules these checks use (Debian's python3.N-minimal alone has no
+    unittest, pty or shutil) is skipped, with the reason; any other is run, whatever its version."""
     def test_the_checks_without_a_server_pass_under_every_other_installed_python(self):
         pythons = other_pythons()
         if not pythons:
@@ -829,10 +887,21 @@ class OtherPythonTests(unittest.TestCase):
                                                                           'StepTests', 'SetupTests')]
         for version, python in pythons.items():
             with self.subTest(python='%d.%d' % version):
+                probe = subprocess.run([str(python), '-s', '-c', 'import argparse, json, pty, select, shutil, signal, subprocess, '
+                                        'tempfile, termios, unittest.mock, uuid'], stdin=subprocess.DEVNULL, capture_output=True, text=True)
+                if probe.returncode:
+                    self.skipTest('%s lacks part of its standard library: %s' % (python, (probe.stderr.strip().splitlines() or ['?'])[-1]))
                 # These checks need the standard library only (-s: not even the caller's own site-packages).
-                result = subprocess.run([str(python), '-s', '-m', 'unittest', *names], cwd=HERE.parent, stdin=subprocess.DEVNULL,
-                                        capture_output=True, text=True, timeout=600)
-                self.assertEqual(0, result.returncode, result.stderr[-4000:])
+                try:
+                    result = subprocess.run([str(python), '-s', '-m', 'unittest', *names], cwd=HERE.parent, stdin=subprocess.DEVNULL,
+                                            capture_output=True, text=True, timeout=600)
+                except subprocess.TimeoutExpired as hung:
+                    partial = hung.stderr or b''  # bytes, even with text=True
+                    self.fail('%s: no result after %d s\n%s' % (python, hung.timeout, (partial.decode(errors='replace')
+                                                                                         if isinstance(partial, bytes) else partial)[-4000:]))
+                # unittest reports every error before every failure: name them all ahead of the tail.
+                failing = [line for line in result.stderr.splitlines() if line.startswith(('ERROR: ', 'FAIL: '))]
+                self.assertEqual(0, result.returncode, '\n'.join(failing + ['...', result.stderr[-4000:]]))
 
 
 @unittest.skipUnless(sys.platform.startswith('linux') and binaries_available(), 'needs Linux and the PostgreSQL server binaries')
@@ -948,7 +1017,10 @@ class LauncherChecks(unittest.TestCase):
             with self.subTest(how=how):
                 root, script, fixtures = private_copy(self)
                 release = root / 'release'
-                self.addCleanup(release.touch)  # after a failed check too: the waiter then ends before the copy goes
+                # Cleanups run last first: the release (after a failed check too), then a bounded wait until the waiter has
+                # seen it, so it ends before remove_copy() would have to stop it (its SIGQUIT dumps core where enabled).
+                self.addCleanup(ended, release)
+                self.addCleanup(release.touch)
                 process = self.launch(script, LEAVES_A_PROCESS % (str(release), how))
                 seen = []
                 sockets = self.socket_directory(read_until(process.stderr, SOCKETS, seen))
@@ -972,6 +1044,7 @@ class LauncherChecks(unittest.TestCase):
             with self.subTest(how=how):
                 root, script, fixtures = private_copy(self)
                 release = root / 'release'
+                self.addCleanup(ended, release)  # as in the check above: the waiter outlives this check's launcher
                 self.addCleanup(release.touch)
                 wrapper = root / 'short_stop_grace.py'
                 wrapper.write_text(SHORT_STOP_GRACE)
@@ -1000,6 +1073,20 @@ class LauncherChecks(unittest.TestCase):
         self.assertTrue(seen['children'], 'the server had no other process (checkpointer, background writer, ...)')
         # Its children name neither the data directory nor PGDATA any more; they run in the data directory.
         self.assertEqual([], sorted(set([seen['postmaster']] + seen['children']) - set(seen['found'])), seen)
+        self.assertNotIn(UNSEEN, errors, 'the launcher said it cannot see what it sees')
+        self.assertNothingLeft(root, fixtures, sockets, errors)
+
+    @unittest.skipUnless(ROOT and shutil.which('capsh') and has_capability(19), 'needs root with CAP_SYS_PTRACE, and capsh')
+    def test_without_cap_sys_ptrace_the_launcher_says_it_cannot_see_the_servers_working_directory(self):
+        root, script, fixtures = private_copy(self)
+        # As in a container with Docker's default capabilities: root cannot read the server account's working directories.
+        process = self.launch(script, 'pass', prefix=['capsh', '--drop=cap_sys_ptrace', '--', '-c', 'exec "$0" "$@"'])
+        seen = []
+        sockets = self.socket_directory(read_until(process.stderr, SOCKETS, seen))
+        _, errors = finish(process)
+        errors = ''.join(seen) + errors
+        self.assertEqual(0, process.returncode, errors)
+        self.assertIn(UNSEEN, errors)
         self.assertNothingLeft(root, fixtures, sockets, errors)
 
     def test_a_failed_setup_leaves_nothing_behind(self):
@@ -1064,16 +1151,23 @@ class LauncherChecks(unittest.TestCase):
                 process = self.launch(script, WAITING)
                 seen = []
                 sockets = self.socket_directory(read_until(process.stderr, SOCKETS, seen))
-                deadline, seen_backend = time.monotonic() + 60, False
-                while not seen_backend and process.poll() is None and time.monotonic() < deadline:
-                    seen_backend = initdb_runs_a_backend(root)
-                    time.sleep(0 if seen_backend else 0.002)
-                self.assertTrue(seen_backend, 'initdb was never seen running its backend')
+                deadline, family = time.monotonic() + 60, {}
+                while not family and process.poll() is None and time.monotonic() < deadline:
+                    family = initdb_with_its_backend(root)
+                    time.sleep(0 if family else 0.002)
+                self.assertTrue(family, 'initdb was never seen running its backend')
                 (os.killpg if whole_group else os.kill)(process.pid, signum)
+                lost = set()
+                while process.poll() is None and any(process_state(pid) for pid in family) and time.monotonic() < deadline + 60:
+                    lost.update(orphaned(family))
+                    time.sleep(0.002)
                 _, errors = finish(process)
                 self.assertEqual(128 + signum, process.returncode, errors)
-                # run() waited for initdb (StepTests pin that a step within STEP_GRACE is left to finish), so the
-                # cleanup's stop never met its single-user backend.
+                # run() waited for initdb (StepTests pin that a step within STEP_GRACE is left to finish): after a signal
+                # to the launcher alone, initdb and its backend kept their parent (runuser as root, else the launcher)
+                # until they ended, which a step stopped at once would not, and the cleanup's stop never met the backend.
+                if not whole_group:  # then initdb, its backend and runuser are signalled themselves
+                    self.assertEqual([], sorted(lost), 'initdb or its backend lost its parent while it still ran')
                 self.assertNotIn('Command failed', errors)
                 self.assertNothingLeft(root, fixtures, sockets, ''.join(seen) + errors)
 
