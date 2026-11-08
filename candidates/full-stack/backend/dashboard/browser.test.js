@@ -414,6 +414,9 @@ async function check(name, action) { await action(); passed++; console.log("PASS
         await view.page.click("#refreshButton"); await idle(view.page);
         assert.equal(await view.page.locator("#announcement.error").count(), 1);
         assert.equal(await view.page.locator("#refreshButton").isDisabled(), false);
+        // Failed at its health read (connection refused): the loaded rows and the backend's count stay.
+        const failed = await snapshot(view.page);
+        assert.deepEqual([failed.rows, failed.sampleCount], [before.rows, before.sampleCount], "a Refresh that cannot reach the backend keeps the loaded rows and count");
         const restarted = await startBackend({ port: own.port, db: own.db });
         own.child = restarted.child;
         await view.page.click("#refreshButton"); await idle(view.page);

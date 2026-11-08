@@ -177,6 +177,8 @@ async function check(name, action) { await action(); passed++; console.log("PASS
   await check("gateway.py: a lockout after connecting says how long the gateway asked to wait", () => withHosted("gateway", async (browser, backend) => {
     const view = await signIn(browser, "gateway", CAREGIVER);
     assert.equal((await connected(view)).count, "3");
+    const rows = () => view.page.$$eval("#historyRows tr", trs => trs.map(tr => tr.textContent));
+    const loaded = await rows();
     const statuses = [];
     while (!statuses.includes(429) && statuses.length < 12) statuses.push(await unsignedGet(backend, "/v1/devices"));
     assert(statuses.includes(429) && statuses.every(code => code === 401 || code === 429), String(statuses));
@@ -184,6 +186,8 @@ async function check(name, action) { await action(); passed++; console.log("PASS
     await idle(view.page);
     const announcement = await text(view.page, "announcement");
     assert.match(announcement, /HTTP 429\)\. No current data was confirmed\. The backend asked to wait about (\d+) seconds before trying again; no automatic retry occurs\./);
+    // Refused at its health read: the loaded rows and the backend's count stay.
+    assert.deepEqual([await rows(), await text(view.page, "sampleCount")], [loaded, "3"], "a Refresh refused (429) keeps the loaded rows and count");
     const seconds = Number(/about (\d+) seconds/.exec(announcement)[1]);
     assert(seconds >= 45 && seconds <= 60, announcement);
     await finish(view, /status of 429/);

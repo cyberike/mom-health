@@ -4,8 +4,10 @@ tests/browser_backend.py serves Uvicorn on a listener it binds itself. Unless th
 socket, asyncio leaves TCP_NODELAY off, and every response after a connection's first then reaches the client
 about 40 ms after its headers (Nagle's algorithm waiting for the client's delayed ACK). The documented server
 (``python -m mom_health_backend``) answers within a few milliseconds, so the browser checks would see a slower
-server than the one they stand for. Loopback only, fictional token, a fresh fixture under build/.
+server than the one they stand for. One check times the responses; the other pins the listener itself, which no
+load on the machine can blur. Loopback only, fictional token, a fresh fixture under build/.
 """
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -54,9 +56,20 @@ class BrowserBackendTimingTests(unittest.TestCase):
                 delay, rest = read_response(connection, rest)
                 delays.append(delay)
         # The first response on a connection is quick either way; with Nagle's algorithm on, every later one waits
-        # about 40 ms for the client's delayed ACK. The median of seven keeps a busy machine from deciding this either
-        # way: a client held up past its delayed-ACK time sees even a held-back body arrive with its headers.
+        # about 40 ms for the client's delayed ACK. The median of seven keeps a moderately busy machine from deciding
+        # this. A client held up past its delayed-ACK time sees even a held-back body arrive with its headers, though,
+        # so one starved before most responses (stopped about 100 ms at a time, say) can still let the regression pass:
+        # the check below pins the listener itself.
         self.assertLess(sorted(delays[1:])[3], 0.02, 'response bodies trailed their headers by (s): %s' % ['%.4f' % d for d in delays])
+
+    def test_the_listener_is_an_ipproto_tcp_socket_on_loopback(self):
+        spec = importlib.util.spec_from_file_location('browser_backend', HERE / 'browser_backend.py')
+        backend = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(backend)
+        listener = backend.loopback_listener(0)
+        self.addCleanup(listener.close)
+        self.assertEqual(socket.IPPROTO_TCP, listener.proto, 'asyncio sets TCP_NODELAY only on an IPPROTO_TCP socket')
+        self.assertEqual('127.0.0.1', listener.getsockname()[0])
 
 
 if __name__ == '__main__':

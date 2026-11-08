@@ -50,6 +50,24 @@ function backend() {
 }
 
 const shown = ui => ui.elements.historyRows.children.length === 1 && ui.elements.historyRows.children[0].children[0].textContent === "No observations in this view." ? 0 : ui.elements.historyRows.children.length;
+// A Refresh that fails at its health read or device request keeps watch A's loaded rows, the backend's count and the
+// status line, also a moment later (a clear deferred to a later task would show by then).
+async function assertKept(ui, why) {
+  for (const when of ["at once", "a moment later"]) {
+    if (when !== "at once") await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(shown(ui), 3, why + ": the loaded rows, " + when);
+    assert.equal(ui.elements.sampleCount.textContent, "3", why + ": the backend's count, " + when);
+    assert.match(ui.elements.loadedStatus.textContent, /^3 shown · 3 loaded · 3 in source · /, why + ": the status line, " + when);
+  }
+}
+// Ways a request can fail, as the backend or the network answers it.
+const FAILURES = [
+  ["HTTP 401", () => json({ detail: "Authorization required" }, 401), /Access was refused/],
+  ["HTTP 403", () => json({ detail: "refused" }, 403), /denied this request/],
+  ["HTTP 429", () => json({ detail: "refused" }, 429), /HTTP 429/],
+  ["HTTP 503", () => json({ detail: "refused" }, 503), /HTTP 503/],
+  ["a network failure", () => Promise.reject(new TypeError("Failed to fetch")), /could not be reached/],
+];
 let passed = 0;
 async function test(name, action) { await action(); passed++; console.log("PASS " + name); }
 
@@ -118,30 +136,33 @@ async function test(name, action) { await action(); passed++; console.log("PASS 
       assert.equal(ui.elements.connectButton.disabled, false);
     });
 
-    await test(variant + ": an unanswered request times out after 12 s with an explicit message and recovers", async () => {
-      const timers = new Map(); let next = 1;
-      const fake = { setTimeout: (fn, ms) => { timers.set(next, { fn, ms }); return next++; }, clearTimeout: id => { timers.delete(id); } };
-      const api = backend(); let silent = false;
-      const ui = setup((url, options) => {
-        if (!silent) return api.handler(url, options);
-        // Like fetch, settle only when the dashboard aborts the request.
-        return new Promise((_, reject) => options.signal.addEventListener("abort", () => reject(new DOMException("The operation was aborted.", "AbortError"))));
-      }, { ...fixture, ...fake });
-      connect(ui); await idle(ui);
-      assert.equal(timers.size, 0, "completed requests must clear their timers");
-      silent = true;
-      ui.elements.refreshButton.click(); await ticks();
-      const pending = [...timers.values()];
-      assert.deepEqual(pending.map(t => t.ms), [12000]);
-      pending[0].fn(); await idle(ui);
-      assert.match(ui.elements.announcement.textContent, /timed out or was cancelled/);
-      assert.equal(ui.elements.refreshButton.disabled, false);
-      assert.equal(ui.elements.connectButton.disabled, false);
-      silent = false;
-      ui.elements.refreshButton.click(); await idle(ui);
-      assert.match(ui.elements.announcement.textContent, /Refreshed saved backend records/);
-      assert.equal(shown(ui), 3);
-    });
+    for (const [where, unanswered] of [["its health read", url => url === "/v1/health"], ["its device request", url => url.startsWith("/v1/devices?")]]) {
+      await test(variant + ": an unanswered request (" + where + ") times out after 12 s with an explicit message and recovers", async () => {
+        const timers = new Map(); let next = 1;
+        const fake = { setTimeout: (fn, ms) => { timers.set(next, { fn, ms }); return next++; }, clearTimeout: id => { timers.delete(id); } };
+        const api = backend(); let silent = false;
+        const ui = setup((url, options) => {
+          if (!silent || !unanswered(url)) return api.handler(url, options);
+          // Like fetch, settle only when the dashboard aborts the request.
+          return new Promise((_, reject) => options.signal.addEventListener("abort", () => reject(new DOMException("The operation was aborted.", "AbortError"))));
+        }, { ...fixture, ...fake });
+        connect(ui); await idle(ui);
+        assert.equal(timers.size, 0, "completed requests must clear their timers");
+        silent = true;
+        ui.elements.refreshButton.click(); await ticks();
+        const pending = [...timers.values()];
+        assert.deepEqual(pending.map(t => t.ms), [12000]);
+        pending[0].fn(); await idle(ui);
+        assert.match(ui.elements.announcement.textContent, /timed out or was cancelled/);
+        await assertKept(ui, "a Refresh that times out at " + where);
+        assert.equal(ui.elements.refreshButton.disabled, false);
+        assert.equal(ui.elements.connectButton.disabled, false);
+        silent = false;
+        ui.elements.refreshButton.click(); await idle(ui);
+        assert.match(ui.elements.announcement.textContent, /Refreshed saved backend records/);
+        assert.equal(shown(ui), 3);
+      });
+    }
 
     await test(variant + ": switching watches never shows the previous watch's rows or report, even if the new load fails", async () => {
       const api = backend(); const ui = setup(api.handler, fixture);
@@ -307,6 +328,7 @@ async function test(name, action) { await action(); passed++; console.log("PASS 
       assert.notEqual(ui.elements.announcement.textContent, "Failed to fetch");
       assert.match(ui.elements.announcement.textContent, /could not be reached/);
       assert.match(ui.elements.announcement.textContent, /No current data was confirmed/);
+      await assertKept(ui, "a Refresh that cannot reach the backend at all");
       assert.equal(ui.elements.refreshButton.disabled, false);
     });
 
@@ -400,15 +422,15 @@ async function test(name, action) { await action(); passed++; console.log("PASS 
       assert.match(ui.elements.announcement.textContent, /Already connected/);
     });
 
-    for (const [code, message] of [[401, /Access was refused/], [403, /denied this request/], [429, /HTTP 429/], [503, /HTTP 503/]]) {
-      await test(variant + ": HTTP " + code + " on a later refresh is reported, and reconnecting fully recovers", async () => {
+    for (const [failure, answer, message] of FAILURES) {
+      await test(variant + ": " + failure + " at a later refresh's device request is reported, and reconnecting fully recovers", async () => {
         const api = backend(); const ui = setup(api.handler, fixture);
         connect(ui); await idle(ui);
         assert.equal(shown(ui), 3);
-        api.override = url => url.startsWith("/v1/devices?") ? json({ detail: "refused" }, code) : null;
+        api.override = url => url.startsWith("/v1/devices?") ? answer() : null;
         ui.elements.refreshButton.click(); await idle(ui);
         assert.match(ui.elements.announcement.textContent, message);
-        assert.equal(shown(ui), 3, "a Refresh that fails at its device request keeps the loaded rows");
+        await assertKept(ui, "a Refresh that fails (" + failure + ") at its device request");
         assert.equal(ui.elements.refreshButton.disabled, false);
         assert.equal(ui.elements.watchLink.textContent, "Not reported", "an unconfirmed refresh must not keep showing the old gateway report");
         api.override = () => null;
@@ -573,22 +595,23 @@ async function test(name, action) { await action(); passed++; console.log("PASS 
       assert.equal(shown(ui), 3);
       blank = true; ui.elements.refreshButton.click(); await idle(ui);
       assert.match(ui.elements.announcement.textContent, /Backend contract is not supported/);
-      assert.equal(shown(ui), 3, "a Refresh refused at its health read keeps the loaded rows");
+      await assertKept(ui, "a Refresh refused at its health read");
     });
 
-    await test(variant + ": a Refresh refused (401) at its health read keeps the loaded rows and count", async () => {
-      const api = backend(); const ui = setup(api.handler, fixture);
-      connect(ui); await idle(ui);
-      assert.equal(shown(ui), 3);
-      // As when a token-less local session meets a backend that switched to real-data mode, which then requires a token.
-      api.override = url => url === "/v1/health" ? json({ detail: "Authorization required" }, 401) : null;
-      const before = ui.calls.length;
-      ui.elements.refreshButton.click(); await idle(ui);
-      assert.match(ui.elements.announcement.textContent, /Access was refused/);
-      assert.equal(ui.calls.length - before, 1, "nothing is requested after the refused health read");
-      assert.equal(shown(ui), 3);
-      assert.match(ui.elements.loadedStatus.textContent, /^3 shown · 3 loaded/);
-    });
+    for (const [failure, answer, message] of FAILURES) {
+      await test(variant + ": a Refresh that fails (" + failure + ") at its health read keeps the loaded rows and count", async () => {
+        const api = backend(); const ui = setup(api.handler, fixture);
+        connect(ui); await idle(ui);
+        assert.equal(shown(ui), 3);
+        // HTTP 401: as when a token-less local session meets a backend that switched to real-data mode, which then requires a token.
+        api.override = url => url === "/v1/health" ? answer() : null;
+        const before = ui.calls.length;
+        ui.elements.refreshButton.click(); await idle(ui);
+        assert.match(ui.elements.announcement.textContent, message);
+        assert.equal(ui.calls.length - before, 1, "nothing is requested after the failed health read");
+        await assertKept(ui, "a Refresh that fails (" + failure + ") at its health read");
+      });
+    }
   }
   console.log("\n" + passed + " simulated lifecycle checks passed across the local and hosted dashboards. Not a browser; no network or real data.");
 })().catch(error => { console.error(error); process.exitCode = 1; });
