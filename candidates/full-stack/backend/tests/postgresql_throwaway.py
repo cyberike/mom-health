@@ -86,6 +86,7 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import shutil
 import signal
 import subprocess
@@ -388,6 +389,24 @@ def exists(pid):
     return True
 
 
+def ended(pid):
+    """Whether the process with this PID (as this process's own PID namespace numbers it) has ended, reaped or not: a
+    zombie still answers signal 0, but its pidfd reads as ready. Where pidfds are missing (before Linux 5.3 or Python
+    3.9, or refused by a seccomp filter), signal 0 decides, and a zombie counts as running."""
+    try:
+        descriptor = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return True
+    except (AttributeError, OSError):  # no pidfds here
+        return not exists(pid)
+    try:
+        poller = select.poll()
+        poller.register(descriptor, select.POLLIN)
+        return bool(poller.poll(0))
+    finally:
+        os.close(descriptor)
+
+
 def server_unseen(info):
     """What leftover_processes() cannot see here once the server runs, for main() to say, or None. Without a
     /proc that shows this process (none is mounted, or a child or sibling PID namespace's is), or where /proc
@@ -398,21 +417,25 @@ def server_unseen(info):
     PROGRAM, archive_command), which it can find only through one of those two. None does not mean that every
     such program is found (see leftover_processes()). Where /proc belongs to an ancestor's PID namespace (as
     under unshare --pid without --mount-proc), postmaster.pid's PID names another process there, or none, so
-    the postmaster is looked up there by its command line, which names the data directory."""
+    the postmaster is looked up there by its command line, which names the data directory. A postmaster that has
+    ended (exited, or a zombie, whose command line is empty: see ended()) is nothing to miss, also where it ends
+    while it is looked at: None."""
     if not os.path.isdir('/proc/self'):
         return ("no /proc here that shows this process (none, or another PID namespace's), so the cleanup cannot see "
                 'whether any process still uses the cluster')
     try:
-        postmaster = int((Path(info['data']) / 'postmaster.pid').read_text().split()[0])
+        pid = postmaster = int((Path(info['data']) / 'postmaster.pid').read_text().split()[0])
     except (OSError, ValueError, IndexError):  # no server after all: nothing to look at
         return None
-    if not exists(postmaster):  # the server is already gone (signal 0 takes this process's own PID namespace's PIDs)
+    if ended(pid):  # the server is already gone (pidfds and signal 0 take this process's own PID namespace's PIDs)
         return None
     if read_or(os.readlink, '/proc/self', None) != str(os.getpid()):  # this /proc is an ancestor PID namespace's
         named = info['data'].encode()
         postmaster = next((int(entry.name) for entry in Path('/proc').glob('[0-9]*')
                            if named in read_or(Path.read_bytes, entry / 'cmdline', b'').split(b'\0')), None)
     if postmaster is None or read_or(Path.read_bytes, Path('/proc/%d/cmdline' % postmaster), None) is None:
+        if ended(pid):  # it ended meanwhile
+            return None
         return ("the server's processes are hidden in /proc here (hidepid?), so the cleanup cannot see whether any process "
                 'still uses the cluster')
     try:
