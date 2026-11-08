@@ -44,7 +44,11 @@ cluster directory is created, changed or removed, except a private socket
 directory under /tmp when the checkout path is too long for a Unix socket; that
 directory is named on stderr and removed once the server has stopped. While the
 server runs, it has a System V shared memory segment, which only a server that
-did not stop (killed, for example) leaves behind.
+did not stop (killed, for example) leaves behind; its dynamic shared memory is
+kept in data/pg_dynshmem (dynamic_shared_memory_type = mmap), not in /dev/shm.
+Only initdb, which runs before that setting is written, makes short-lived files
+in /dev/shm for the servers it runs, and removes each as it ends (one killed
+with SIGKILL would leave its own).
 
 Needs Linux (it reads /proc to confirm the server exited). PostgreSQL refuses to
 run as root, so a root caller names an unprivileged account with --run-as, which
@@ -56,8 +60,10 @@ also lacks CAP_SYS_ADMIN and CAP_PERFMON, not its environments either: the
 cleanup then still finds the server's own processes, by their command line or
 their title (which names the cluster: cluster_name), but not a program the
 server started that outlives it (COPY ... TO PROGRAM, archive_command), and the
-launcher says so when the server starts. A postmaster that did not stop
-(killed, for example) leaves its postmaster.pid, which keeps the cluster too.
+launcher says so when the server starts. Where /proc is mounted with hidepid,
+root without CAP_SYS_PTRACE sees none of that account's processes, and the
+launcher says that too. A postmaster that did not stop (killed, for example)
+leaves its postmaster.pid, which keeps the cluster too.
 From candidates/full-stack/backend:
 
     python tests/postgresql_throwaway.py --run-as postgres -- \\
@@ -324,23 +330,34 @@ def leftover_processes(info):
     this finds a helper of an interrupted initdb (its sh -c and bootstrap backend name no directory), and a
     program the server starts (archive_command, COPY ... TO PROGRAM) inherits it. Any other process working
     in the data directory, a shell someone left in it included, is found too: the cluster is then kept.
-    Command lines are readable to everyone, so the server's own processes are found whatever else of theirs
-    the caller may read. A program the server started, or an initdb helper, is found only through its
-    environment or working directory: another account's are not readable to an ordinary caller, its working
+    Command lines are readable to every account unless /proc is mounted with hidepid, so the server's own
+    processes are found whatever else of theirs the caller may read (see server_unseen() for hidepid). A
+    program the server started, or an initdb helper, is found only through its environment or its working
+    directory, each read on its own: another account's are not readable to an ordinary caller, its working
     directory not to root without CAP_SYS_PTRACE, and neither to root in Docker's default capability set (which
-    also lacks CAP_SYS_ADMIN and CAP_PERFMON); see server_unseen()."""
+    also lacks CAP_SYS_ADMIN and CAP_PERFMON; server_unseen() reports that case). Such a program is also missed
+    where the one of the two it still has cannot be read: if it dropped PGDATA (run through sudo or env -i)
+    while working directories are unreadable, or left the data directory while environments are; and if it
+    did both, anywhere."""
     data = info['data']
     named, variable, where, found = data.encode(), b'PGDATA=' + data.encode(), os.path.realpath(data), []
     title = ('postgres: %s: ' % cluster_name(Path(data).parent)).encode()
     for entry in Path('/proc').glob('[0-9]*'):
-        try:
-            command = (entry / 'cmdline').read_bytes()
-            if (named in command or command.startswith(title) or variable in (entry / 'environ').read_bytes().split(b'\0')
-                    or os.readlink(entry / 'cwd') == where):
-                found.append(int(entry.name))
-        except OSError:
-            pass
+        command = read_or(Path.read_bytes, entry / 'cmdline', None)
+        if command is None:  # gone, or hidden from this caller (hidepid)
+            continue
+        if (named in command or command.startswith(title) or variable in read_or(Path.read_bytes, entry / 'environ', b'').split(b'\0')
+                or read_or(os.readlink, entry / 'cwd', None) == where):
+            found.append(int(entry.name))
     return found
+
+
+def read_or(read, path, default):
+    """read(path), or default where that fails: the process has gone, or the caller may not read it."""
+    try:
+        return read(path)
+    except OSError:
+        return default
 
 
 def can_read(read, path):
@@ -352,18 +369,35 @@ def can_read(read, path):
     return True
 
 
+def exists(pid):
+    """Whether a process with this PID exists (signal 0), whether or not it is the caller's."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # another account's
+        pass
+    return True
+
+
 def server_unseen(info):
     """What leftover_processes() cannot see here once the server runs, for main() to say, or None. Without
-    /proc it sees no process at all. Where neither the postmaster's environment nor its working directory can
-    be read (root in Docker's default capability set, for example), it still finds the server's own processes
-    by their command line or title, but not a program the server started (COPY ... TO PROGRAM,
-    archive_command), which it could find only through one of those two."""
+    /proc, or where /proc hides the server's processes (hidepid, for root without CAP_SYS_PTRACE), it sees none
+    of them. Where neither the postmaster's environment nor its working directory can be read (root in Docker's
+    default capability set, for example), it still finds the server's own processes by their command line or
+    title, but no program the server started (COPY ... TO PROGRAM, archive_command), which it can find only
+    through one of those two. None does not mean that every such program is found (see leftover_processes())."""
     if not os.path.isdir('/proc/self'):
         return 'no /proc here, so the cleanup cannot see whether any process still uses the cluster'
     try:
         postmaster = int((Path(info['data']) / 'postmaster.pid').read_text().split()[0])
     except (OSError, ValueError, IndexError):  # no server after all: nothing to look at
         return None
+    if read_or(Path.read_bytes, Path('/proc/%d/cmdline' % postmaster), None) is None:
+        if not exists(postmaster):  # the server is already gone
+            return None
+        return ("the server's processes are hidden in /proc here (hidepid?), so the cleanup cannot see whether any process "
+                'still uses the cluster')
     try:
         environment = can_read(Path.read_bytes, Path('/proc/%d/environ' % postmaster))
         working_directory = can_read(os.readlink, '/proc/%d/cwd' % postmaster)
@@ -434,6 +468,8 @@ def create(cluster, bindir, run_as, locale):
         "\n# Throwaway parity cluster: Unix socket only, owner-only, durable commits.\n"
         "listen_addresses = ''\nunix_socket_directories = '%s'\nunix_socket_permissions = 0700\n"
         "fsync = on\nsynchronous_commit = on\nfull_page_writes = on\nmax_connections = 100\n"
+        # In data/pg_dynshmem, not /dev/shm, so a server that is killed leaves it inside the cluster.
+        "dynamic_shared_memory_type = mmap\n"
         "cluster_name = '%s'\n" % (info['sockets'], cluster_name(cluster))))  # in every server process title
     return info
 
@@ -460,12 +496,13 @@ def main():
         parser.error('--run-as needs root (runuser); omit it to run as the current account')
     bindir = find_bindir(args.bindir)
     cluster = FIXTURES / uuid4().hex[:12]
-    for signum in SIGNALS:
-        if signal.getsignal(signum) is not signal.SIG_IGN:  # left ignored (nohup, a background job), as Python does
-            signal.signal(signum, interrupted)
     info, child, status = None, None, 1
     try:
         try:
+            # Inside the try: a signal handled as soon as its handler is in place gives 128+N as well.
+            for signum in SIGNALS:
+                if signal.getsignal(signum) is not signal.SIG_IGN:  # left ignored (nohup, a background job), as Python does
+                    signal.signal(signum, interrupted)
             info = create(cluster, bindir, args.run_as, args.locale)
             control(cluster, 'start')
             unseen = server_unseen(info)

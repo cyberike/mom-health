@@ -8,15 +8,24 @@ directory (under build/, deep enough that its socket goes in a private
 directory under /tmp; one layout of the ownership check uses a short copy under
 /tmp, whose socket stays in the cluster), with a small probe command and
 --discard, so every cluster is removed again and concurrent runs cannot disturb
-each other; the check of a killed postmaster keeps its cluster by design and
-removes it itself. As root, the check that the cleanup sees every process of
-the server also runs without CAP_SYS_PTRACE and in Docker's default capability
-set, where capsh can drop those (it needs CAP_SETPCAP and /bin/bash), and skips
-them otherwise. The other checks need only POSIX, except four that read /proc
-and are skipped without it: the environment, working-directory and title checks
-of the cleanup (Linux) and the runuser step check (Linux, root and runuser). The
-checks that need no server also run under every other CPython 3 installed in
-/usr/bin or /usr/local/bin (before 3.13, communicate() flushes a stdin that
+each other. The checks of a killed postmaster and of a process still using the
+cluster after the wait keep their cluster by design and remove it themselves;
+interrupted (a Ctrl-C at the test's terminal, which the launcher in its own
+session does not get), a check runs none of its cleanups, so each of those two
+leaves its cluster and /tmp socket directory (cluster.json names it), and the
+killed-postmaster check also the postmaster's System V shared memory segment
+(postmaster.pid line 7 names its key and id). As root, the check that the
+cleanup sees every process of the server also runs without CAP_SYS_PTRACE and
+in Docker's default capability set, where capsh can drop those (it needs
+CAP_SETPCAP and /bin/bash), and skips them otherwise; the check that a /proc
+hiding the server's processes is reported also needs unshare and CAP_SYS_ADMIN,
+to mount one with hidepid in a mount namespace of its own. The other checks
+need only POSIX, except four that read /proc and are skipped without it (the
+environment, working-directory and title checks of the cleanup, Linux; the
+runuser step check, Linux, root and runuser) and one skipped without ctypes
+(a Ctrl-C just as the exit begins). The checks that need no server also run
+under the first complete interpreter of every other CPython 3 version installed
+in /usr/bin or /usr/local/bin (before 3.13, communicate() flushes a stdin that
 run() has closed). The module imports anywhere. From candidates/full-stack/backend:
 
     python -m unittest tests.postgresql_launcher_checks -v
@@ -49,6 +58,7 @@ SIGNALS = tuple(getattr(signal, name) for name in ('SIGINT', 'SIGTERM', 'SIGHUP'
 STARTED = 'Throwaway PostgreSQL ('
 SOCKETS = 'Throwaway PostgreSQL socket directory'
 UNSEEN = "Throwaway PostgreSQL: the server account's environments and working directories are not readable here"
+HIDDEN = "Throwaway PostgreSQL: the server's processes are hidden in /proc here"
 DOCKER_DEFAULT_CAPABILITIES = 0xa80425fb  # root's CapEff in a container with Docker's default capability set
 CAP_SYS_PTRACE = 19
 WAITING = r'''
@@ -140,6 +150,33 @@ finally:
 '''
 EARLY_ERRORS = (('invalid option', 'usage', ['--locale', 'synthetic-bogus'], 2), ('error message', 'message', RUN_AS, 1),
                 ('uncaught exception', 'exception', RUN_AS, 1))
+# The launcher with the named signal sent to itself just as main() installs its handler for it, so that it is handled
+# at once (os.kill() checks for signals before it returns). find_bindir() and create() are replaced: the run needs no
+# server binaries and cannot make a cluster.
+SIGNAL_AS_HANDLED = r'''
+import os, signal, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import postgresql_throwaway as launcher
+target, install = getattr(signal, sys.argv[2]), signal.signal
+install(target, signal.SIG_DFL)  # whatever this process inherited (nohup ignores SIGHUP)
+
+
+def installing(signum, handler):
+    previous = install(signum, handler)
+    if signum == target and handler is launcher.interrupted:
+        os.kill(os.getpid(), signum)
+    return previous
+
+
+def create(*arguments):
+    raise SystemExit('create() was reached: the signal was not handled as its handler was installed')
+
+
+signal.signal, launcher.create, launcher.find_bindir = installing, create, lambda explicit=None: Path('/synthetic/bin')
+sys.argv = ['postgresql_throwaway.py'] + sys.argv[3:]
+sys.exit(launcher.main())
+'''
 # Status lines on a non-blocking stderr: the first meets a full pipe, the rest come after the parent drained it.
 FULL_STREAM = r'''
 import subprocess, sys
@@ -219,13 +256,20 @@ print(json.dumps({'postmaster': postmaster, 'children': sorted(lasting), 'found'
 '''
 # A command that kills the server's postmaster (SIGKILL, as the kernel's out-of-memory killer would) and waits until it
 # is gone, reaped; the server's other processes then end by themselves, and its postmaster.pid stays behind. First it
-# prints the postmaster's PID and the "key id" of its System V shared memory segment, which such a kill leaves too.
+# prints the postmaster's PID, the "key id" of its System V shared memory segment, which such a kill leaves too, outside
+# the cluster, and the files the postmaster maps (null where they are not readable, as for root without CAP_SYS_PTRACE):
+# its dynamic shared memory among them, which such a kill leaves as well.
 KILLS_THE_POSTMASTER = r'''
-import os, signal, time
+import json, os, signal, time
 from pathlib import Path
 lines = (Path(os.environ['MOM_HEALTH_TEST_POSTGRESQL_CLUSTER']) / 'data' / 'postmaster.pid').read_text().splitlines()
 postmaster = int(lines[0])
-print(postmaster, lines[6].strip(), flush=True)
+try:
+    maps = Path('/proc/%d/maps' % postmaster).read_text().splitlines()
+    mapped = sorted({line.split(None, 5)[5] for line in maps if len(line.split(None, 5)) == 6})
+except OSError:
+    mapped = None
+print(json.dumps({'postmaster': postmaster, 'segment': [int(word) for word in lines[6].split()], 'mapped': mapped}), flush=True)
 os.kill(postmaster, signal.SIGKILL)
 end = time.monotonic() + 60
 while os.path.exists('/proc/%d' % postmaster) and time.monotonic() < end:
@@ -318,6 +362,32 @@ def without_capabilities(numbers):
     return ['capsh', drop, '--', '-c', 'exec "$0" "$@"'], None
 
 
+def hiding_processes(numbers):
+    """(prefix, None): the prefix that runs a command as root, without the capabilities numbered (none: all kept), in a
+    mount namespace of its own whose /proc lists only the processes it may ptrace (hidepid=ptraceable, as systemd's
+    ProtectProc=ptraceable mounts it); or (None, why not), where that cannot be done here (it needs unshare and
+    CAP_SYS_ADMIN, and capsh what without_capabilities() says)."""
+    drop, why_not = without_capabilities(numbers) if numbers else ([], None)
+    if why_not:
+        return None, why_not
+    if not shutil.which('unshare'):
+        return None, 'needs unshare'
+    hide = ['unshare', '--mount', '--propagation', 'private', '--', 'sh', '-c',
+            'mount -t proc -o hidepid=ptraceable proc /proc && exec "$0" "$@"']
+    probe = subprocess.run(hide + ['true'], stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    if probe.returncode:
+        return None, 'cannot mount a /proc with hidepid here: %s' % (probe.stderr.strip().splitlines() or ['exit status %d' % probe.returncode])[-1]
+    return hide + drop, None
+
+
+def effective_capabilities():
+    """This process's effective capabilities (CapEff in /proc/self/status, Linux), or 0 where they cannot be read."""
+    try:
+        return int(next(line.split()[1] for line in Path('/proc/self/status').read_text().splitlines() if line.startswith('CapEff:')), 16)
+    except (OSError, StopIteration, ValueError, IndexError):
+        return 0
+
+
 def outside_dockers_default():
     """The capability numbers that Docker's default set lacks, up to the kernel's last one (Linux)."""
     try:
@@ -328,12 +398,14 @@ def outside_dockers_default():
 
 
 def segment(key, shmid):
-    """The fields of the System V shared memory segment with that key and id in /proc/sysvipc/shm, or None."""
+    """The fields of the System V shared memory segment with that key and id in /proc/sysvipc/shm, or None. The key is a
+    32-bit key_t, which postmaster.pid has unsigned and /proc/sysvipc/shm signed: one of 2**31 or more (from a data
+    directory whose inode number is that large, mod 2**32, as on a large XFS volume) is negative there."""
     try:
-        rows = Path('/proc/sysvipc/shm').read_text().splitlines()[1:]
+        rows = [row.split() for row in Path('/proc/sysvipc/shm').read_text().splitlines()[1:]]
     except OSError:
         return None
-    return next((row.split() for row in rows if row.split()[:2] == [str(key), str(shmid)]), None)
+    return next((fields for fields in rows if fields[1:2] == [str(shmid)] and int(fields[0]) % 2**32 == int(key) % 2**32), None)
 
 
 def remove_segment(key, shmid, creator):
@@ -449,7 +521,7 @@ def full_pipe(test):
 
 
 # The standard library modules that the checks without a server use (Debian's python3.N-minimal alone lacks most).
-STANDARD_LIBRARY = 'import argparse, ctypes, json, pty, select, shutil, signal, subprocess, tempfile, termios, unittest.mock, uuid'
+STANDARD_LIBRARY = 'import argparse, json, pty, select, shutil, signal, subprocess, tempfile, termios, unittest.mock, uuid'
 
 
 def other_pythons():
@@ -529,10 +601,18 @@ class CleanupHelperTests(unittest.TestCase):
             self.addCleanup(process.wait)
             self.addCleanup(process.stdin.close)
             pids[name] = process.pid
-        found = launcher.leftover_processes(dict(data=data))
-        for name, (_, left) in variants.items():
-            with self.subTest(name):
-                self.assertIs(left, pids[name] in found)
+        readlink = os.readlink
+
+        def refused(path, *arguments, **options):
+            if str(path).endswith('/cwd'):
+                raise PermissionError(13, 'Permission denied (synthetic)')
+            return readlink(path, *arguments, **options)
+        for working_directories in ('readable', 'refused'):  # refused: as for root without CAP_SYS_PTRACE
+            with patch.object(launcher.os, 'readlink', refused) if working_directories == 'refused' else contextlib.nullcontext():
+                found = launcher.leftover_processes(dict(data=data))
+            for name, (_, left) in variants.items():
+                with self.subTest(name, working_directories=working_directories):
+                    self.assertIs(left, pids[name] in found)
 
     @unittest.skipUnless(os.path.exists('/proc/self/cwd'), 'needs Linux /proc')
     def test_a_process_working_in_the_data_directory_is_left_over_and_no_other(self):
@@ -548,31 +628,42 @@ class CleanupHelperTests(unittest.TestCase):
             self.addCleanup(process.wait)
             self.addCleanup(process.stdin.close)
             pids[name] = process.pid
-        for named in ('data', 'link'):
-            with self.subTest(cluster_json_names=named):
-                found = launcher.leftover_processes(dict(data=str(root / named)))
+        read_bytes = Path.read_bytes
+
+        def refused(path):
+            if str(path).endswith('/environ'):
+                raise PermissionError(13, 'Permission denied (synthetic)')
+            return read_bytes(path)
+        # Environments refused: as under a policy that refuses only /proc/*/environ; the working directory is read anyway.
+        for named, environments in itertools.product(('data', 'link'), ('readable', 'refused')):
+            with self.subTest(cluster_json_names=named, environments=environments):
+                with patch.object(Path, 'read_bytes', refused) if environments == 'refused' else contextlib.nullcontext():
+                    found = launcher.leftover_processes(dict(data=str(root / named)))
                 self.assertIn(pids['data'], found, 'a process working in the data directory was overlooked')
                 self.assertNotIn(pids['data-other'], found, 'a directory that only starts the same was taken for it')
 
-    @unittest.skipUnless(os.path.exists('/proc/self/cmdline') and shutil.which('sleep'), 'needs Linux /proc and sleep')
+    @unittest.skipUnless(os.path.exists('/proc/self/cmdline'), 'needs Linux /proc')
     def test_a_process_titled_as_a_server_process_of_the_cluster_is_left_over_and_no_other(self):
         data = '/synthetic/postgresql-fixtures/r7%d/data' % os.getpid()
         name = launcher.cluster_name('/synthetic/postgresql-fixtures/r7%d' % os.getpid())
         titles = {'this cluster': ('postgres: %s: checkpointer ' % name, True),
                   'a cluster whose name only starts the same': ('postgres: %s-other: checkpointer ' % name, False),
                   'the name elsewhere on the command line': ('synthetic postgres: %s: checkpointer ' % name, False)}
-        pids = {}
+        processes = {}
         for case, (title, _) in titles.items():
-            # As a backend's title, in place of its command line (and so without the data directory).
-            process = subprocess.Popen([title, '60'], executable=shutil.which('sleep'), cwd='/',
-                                       env={key: value for key, value in os.environ.items() if key != 'PGDATA'})
-            self.addCleanup(process.wait)
-            self.addCleanup(process.kill)
-            pids[case] = process.pid
+            # As a backend's title, in place of its command line (and so without the data directory). This interpreter
+            # runs under it: a multi-call sleep (busybox, toybox) would take the title for the name of the program to be.
+            processes[case] = subprocess.Popen([title, '-c', 'import sys; sys.stdin.read()'], executable=sys.executable,
+                                               stdin=subprocess.PIPE, cwd='/',
+                                               env={key: value for key, value in os.environ.items() if key != 'PGDATA'})
+            self.addCleanup(processes[case].wait)
+            self.addCleanup(processes[case].stdin.close)
         found = launcher.leftover_processes(dict(data=data))
+        self.assertEqual({}, {case: process.returncode for case, process in processes.items() if process.poll() is not None},
+                         'a titled process ended before the cleanup looked')
         for case, (_, left) in titles.items():
             with self.subTest(case):
-                self.assertIs(left, pids[case] in found)
+                self.assertIs(left, processes[case].pid in found)
 
     def test_what_the_cleanup_cannot_see_is_named(self):
         root = Path(tempfile.mkdtemp(prefix='launcher-unseen-'))
@@ -580,35 +671,83 @@ class CleanupHelperTests(unittest.TestCase):
         data = root / 'data'
         data.mkdir()
         info = dict(data=str(data))
+        # A child stands in for the postmaster, so it exists; what root may read of it in /proc is faked below.
+        live = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()'], stdin=subprocess.PIPE)
+        self.addCleanup(live.wait)
+        self.addCleanup(live.stdin.close)
+        gone = subprocess.Popen([sys.executable, '-c', 'pass'])
+        gone.wait()  # and reaped: a postmaster already gone
         read_bytes, readlink = Path.read_bytes, os.readlink
+        everything = ('cmdline', 'environ', 'cwd')
 
-        def denying(environment, working_directory):
-            """Reads of the postmaster's environment or working directory refused, as for root in Docker's default set."""
-            def read(path):
-                if str(path).endswith('/environ') and not environment:
-                    raise PermissionError(13, 'Permission denied (synthetic)')
-                return read_bytes(path)
+        def proc(pid, refused=(), missing=()):
+            """/proc/<pid>/ with the reads of the entries in refused refused (PermissionError), and those of the entries
+            in missing failing as for no such process (FileNotFoundError). Reads elsewhere are real."""
+            prefix = '/proc/%d/' % pid
+            contents = {'cmdline': b'postgres\0-D\0%s\0' % str(data).encode(), 'environ': b'PGDATA=%s\0' % str(data).encode(),
+                        'cwd': str(data)}
 
-            def link(path, *arguments, **options):
-                if str(path).endswith('/cwd') and not working_directory:
+            def faked(path, real):
+                if not str(path).startswith(prefix):
+                    return real()
+                name = str(path)[len(prefix):]
+                if name in missing:
+                    raise FileNotFoundError(2, 'No such file or directory (synthetic)')
+                if name in refused:
                     raise PermissionError(13, 'Permission denied (synthetic)')
-                return readlink(path, *arguments, **options)
-            return patch.object(Path, 'read_bytes', read), patch.object(launcher.os, 'readlink', link)
+                return contents[name]
+            stack = contextlib.ExitStack()
+            stack.enter_context(patch.object(Path, 'read_bytes', lambda path: faked(path, lambda: read_bytes(path))))
+            stack.enter_context(patch.object(launcher.os, 'readlink', lambda path, *arguments, **options: faked(
+                path, lambda: readlink(path, *arguments, **options))))
+            return stack
+        cases = (('everything readable', live, (), (), None),
+                 # A program the server started is found through either, where it keeps what that one shows.
+                 ('environment refused', live, ('environ',), (), None),
+                 ('working directory refused (root without CAP_SYS_PTRACE)', live, ('cwd',), (), None),
+                 ("both refused (root in Docker's default set)", live, ('environ', 'cwd'), (), 'a program the server started'),
+                 # The postmaster runs, but /proc hides it: none of the server's processes is found.
+                 ('hidden (hidepid=ptraceable or invisible)', live, (), everything, 'hidden in /proc'),
+                 ('every read refused (hidepid=noaccess)', live, everything, (), 'hidden in /proc'),
+                 # Not a reason to warn: the setup fails at its next step anyway.
+                 ('already gone', gone, (), everything, None),
+                 ('gone just after its command line was read', live, (), ('environ', 'cwd'), None))
         with patch.object(launcher.os.path, 'isdir', lambda path: path == '/proc/self'):  # as on Linux
             self.assertIsNone(launcher.server_unseen(info), 'no server runs, so there is nothing to miss')
-            (data / 'postmaster.pid').write_text('%d\n%s\n' % (os.getpid(), data))  # this process stands in for the postmaster
-            for environment, working_directory in itertools.product((True, False), repeat=2):
-                with self.subTest(environment_readable=environment, working_directory_readable=working_directory):
-                    reads, links = denying(environment, working_directory)
-                    with reads, links:
+            for case, postmaster, refused, missing, said in cases:
+                with self.subTest(case):
+                    (data / 'postmaster.pid').write_text('%d\n%s\n' % (postmaster.pid, data))
+                    with proc(postmaster.pid, refused, missing):
                         unseen = launcher.server_unseen(info)
-                    # A program the server started is found through either; only where both are refused is it missed.
-                    if environment or working_directory:
-                        self.assertIsNone(unseen, 'what it can find was reported as unseen')
+                    if said is None:
+                        self.assertIsNone(unseen, 'reported as unseen')
                     else:
-                        self.assertIn('a program the server started', unseen or '')
+                        self.assertIn(said, unseen or '')
+            kill = os.kill
+
+            def refused(pid, signum):  # as for root without CAP_KILL: another account's process may not be signalled
+                if pid == live.pid:
+                    raise PermissionError(1, 'Operation not permitted (synthetic)')
+                return kill(pid, signum)
+            with self.subTest('hidden, and signal 0 to it refused'):
+                (data / 'postmaster.pid').write_text('%d\n%s\n' % (live.pid, data))
+                with proc(live.pid, (), everything), patch.object(launcher.os, 'kill', refused):
+                    self.assertIn('hidden in /proc', launcher.server_unseen(info) or '', 'a running postmaster was taken for gone')
         with patch.object(launcher.os.path, 'isdir', lambda path: False):  # no /proc
             self.assertIn('no /proc here', launcher.server_unseen(info) or '')
+
+    def test_the_checks_find_the_segment_of_a_killed_postmaster_whatever_the_sign_of_its_key(self):
+        # /proc/sysvipc/shm prints a key of 2**31 or more signed; postmaster.pid line 7 has it unsigned, in 64 bits.
+        rows = ('       key      shmid perms       size  cpid  lpid nattch   uid   gid  cuid  cgid      atime      dtime      ctime\n'
+                '-1698950604    1638406   600         56 23173 23181      0   102   104   102   104          0          0 1700000000\n'
+                '    674929    1638401   600         56 23246 23250      0   102   104   102   104          0          0 1700000000\n')
+        read_text = Path.read_text
+        with patch.object(Path, 'read_text', lambda path, *arguments, **options: rows if str(path) == '/proc/sysvipc/shm'
+                          else read_text(path, *arguments, **options)):
+            self.assertEqual('23173', (segment(2**64 - 1698950604, 1638406) or [None] * 5)[4], 'a negative key was not matched')
+            self.assertEqual('23246', (segment(674929, 1638401) or [None] * 5)[4])
+            self.assertIsNone(segment(674929, 1638406), 'a segment with another key was taken for it')
+            self.assertIsNone(segment(2**64 - 1698950604, 1638401), 'a segment with another id was taken for it')
 
     def test_the_cleanup_waits_for_processes_that_still_name_the_cluster(self):
         left, slept = iter([[4242], [4242], []]), []
@@ -700,14 +839,16 @@ class SignalTests(unittest.TestCase):
                 # Not 120: the usage message or traceback is still buffered when Python's final flush fails.
                 self.assertEqual(expected, process.wait(60))
 
-    def assertStillWaiting(self, process, failed_at, message):
+    def assertStillWaiting(self, process, failed_at, message, expected):
         """The launcher, which printed "failed" at failed_at (time.monotonic()), has not exited yet. If it has and the
-        whole exit wait could have passed by now, this check was starved (a stopped or overloaded test process): it
-        is skipped, as it can tell nothing then."""
+        whole exit wait could have passed by now, this check was starved (a stopped or overloaded test process): its
+        timing tells nothing then, so only the exit status, which does not depend on it, is checked before the skip."""
         status = process.poll()
         late = time.monotonic() - failed_at
         if status is not None and late >= launcher.EXIT_FLUSH_GRACE:
-            self.skipTest('starved: it looked %.2f s after the launcher failed, past the whole exit wait' % late)
+            self.assertEqual(expected, status, 'starved, but the exit status is still wrong')
+            self.skipTest('starved: it looked %.2f s after the launcher failed, past the whole exit wait (exit status %d, '
+                          'as expected)' % (late, status))
         self.assertIsNone(status, message)
 
     def test_ctrl_c_while_the_exit_waits_for_a_full_stderr_is_held_off_and_the_early_errors_exit_status_kept(self):
@@ -724,17 +865,23 @@ class SignalTests(unittest.TestCase):
                 word, failed_at = process.stdout.readline().split()
                 self.assertEqual('failed', word)
                 time.sleep(launcher.EXIT_FLUSH_GRACE / 4)  # well inside the grace
-                self.assertStillWaiting(process, float(failed_at), 'the exit had stopped waiting for the full stderr before the signal')
+                self.assertStillWaiting(process, float(failed_at), 'the exit had stopped waiting for the full stderr before the signal',
+                                        expected)
                 # Ctrl-C twice, as from a terminal and a wrapper that passes it on: main() never got to install its handlers.
                 process.send_signal(signal.SIGINT)
                 process.send_signal(signal.SIGINT)
                 time.sleep(launcher.EXIT_FLUSH_GRACE / 10)
                 # Held off: a second KeyboardInterrupt could otherwise land before stderr is silenced.
-                self.assertStillWaiting(process, float(failed_at), 'Ctrl-C cut the exit wait short')
+                self.assertStillWaiting(process, float(failed_at), 'Ctrl-C cut the exit wait short', expected)
                 # Not 120: after the grace, stderr is silenced before Python's final flush.
                 self.assertEqual(expected, process.wait(60))
 
     def test_a_ctrl_c_just_as_the_exit_begins_keeps_the_early_errors_exit_status(self):
+        try:  # EARLY_ERROR's "+ctrl-c" raises it through ctypes, from the C library's raise()
+            import ctypes
+            getattr(ctypes.CDLL(None), 'raise')
+        except (ImportError, OSError, AttributeError) as missing:
+            self.skipTest("needs ctypes and the C library's raise(): %s" % missing)
         for name, failure, options, expected in EARLY_ERRORS:
             with self.subTest(name):
                 _, writer, _ = full_pipe(self)  # and nobody drains it
@@ -766,6 +913,16 @@ class SignalTests(unittest.TestCase):
         # 128+2, as for a Ctrl-C after them: SIGINT is blocked as the exit begins and stays blocked (see flush_stderr()),
         # so Python's own exit by the signal, for an unhandled KeyboardInterrupt, does not happen.
         self.assertEqual(130, process.returncode)
+
+    def test_a_signal_handled_as_soon_as_main_installs_its_handler_gives_128_plus_its_number(self):
+        for signum in SIGNALS:
+            with self.subTest(signal=signum.name):
+                process = subprocess.run([sys.executable, '-c', SIGNAL_AS_HANDLED, str(HERE), signum.name, *RUN_AS, '--discard', '--',
+                                          'true'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                                         timeout=60)
+                # Not 130 for SIGTERM and SIGHUP: handled inside main()'s try, like any later signal, not past it.
+                self.assertEqual(128 + signum, process.returncode, process.stderr)
+                self.assertIn('Interrupted by signal %d; stopping the throwaway server.' % signum, process.stderr)
 
     def test_an_interrupt_that_cuts_the_exit_flush_short_still_silences_stderr(self):
         silenced = []
@@ -1032,6 +1189,8 @@ class SetupTests(unittest.TestCase):
         appends = [(command, stdin) for command, stdin in commands if config in command]
         self.assertEqual([['runuser', '-u', account, '--', 'tee', '-a', config]], [command for command, _ in appends])
         self.assertIn("listen_addresses = ''", appends[0][1])
+        # In data/pg_dynshmem, so a killed server leaves it in the cluster, not in /dev/shm.
+        self.assertIn('\ndynamic_shared_memory_type = mmap\n', appends[0][1])
         self.assertFalse(Path(config).exists(), 'the launcher wrote the server configuration itself')
 
     def test_a_server_that_does_not_start_reports_the_end_of_its_log(self):
@@ -1082,7 +1241,9 @@ class OtherPythonTests(unittest.TestCase):
                     text = partial.decode(errors='replace') if isinstance(partial, bytes) else partial
                     lines = text.splitlines()
                     failed = [line for line in lines if line.endswith((' ... ERROR', ' ... FAIL'))]
-                    running = ['still running: ' + lines[-1]] if lines and not text.endswith('\n') else []
+                    # The last check named whose line has no result yet; it may have printed subtest lines (indented) since.
+                    headers = [line for line in lines if re.match(r'test\w* \(', line)]
+                    running = ['still running: ' + headers[-1]] if headers and headers[-1].rstrip().endswith(' ...') else []
                     self.fail('\n'.join(['%s: no result after %d s' % (python, hung.timeout)] + failed + running + ['...', text[-4000:]]))
                 # unittest reports every error before every failure: name them all ahead of the tail.
                 failing = [line for line in result.stderr.splitlines() if line.startswith(('ERROR: ', 'FAIL: '))]
@@ -1267,12 +1428,35 @@ class LauncherChecks(unittest.TestCase):
                 # Its children name neither the data directory nor PGDATA any more, but their titles name the cluster.
                 self.assertEqual([], sorted(set([seen['postmaster']] + seen['children']) - set(seen['found'])), seen)
                 self.assertNothingLeft(root, fixtures, sockets, errors)
-                readable = any(seen['readable'].values())  # a program the server started is found through either
+                # With either readable, a program the server started is found where it keeps what that one shows.
+                readable = any(seen['readable'].values())
                 if 'Docker' in name and readable:
                     self.skipTest("root reads the server account's %s even in Docker's default capability set here"
                                   % ' and '.join(what for what, can in seen['readable'].items() if can))
                 # Said exactly where the cleanup could not find a program the server started.
                 (self.assertNotIn if readable else self.assertIn)(UNSEEN, errors)
+
+    def test_a_proc_that_hides_the_servers_processes_is_reported(self):
+        if not ROOT:
+            self.skipTest('needs root, to mount a /proc that hides other accounts\' processes')
+        # Root without CAP_SYS_PTRACE may ptrace none of the server account's processes, so that /proc lists none of them.
+        ptrace = bool(effective_capabilities() >> CAP_SYS_PTRACE & 1)
+        for name, drop in (("in Docker's default capability set", outside_dockers_default()), ("with this process's capabilities", [])):
+            with self.subTest(name):
+                hidden = CAP_SYS_PTRACE in drop or not ptrace
+                prefix, why_not = hiding_processes(drop)
+                if why_not:
+                    self.skipTest(why_not)
+                root, script, fixtures = private_copy(self)
+                process = self.launch(script, 'pass', prefix=prefix)
+                _, errors = finish(process)
+                sockets = next((line.rsplit(': ', 1)[1] for line in errors.splitlines() if line.startswith(SOCKETS)), None)
+                if sockets:
+                    self.addCleanup(shutil.rmtree, sockets, ignore_errors=True)
+                self.assertEqual(0, process.returncode, errors)
+                self.assertNothingLeft(root, fixtures, sockets, errors)
+                (self.assertIn if hidden else self.assertNotIn)(HIDDEN, errors)
+                self.assertNotIn(UNSEEN, errors)  # which would claim that the cleanup still finds the server's own processes
 
     @unittest.skipUnless(shutil.which('ipcrm'), 'needs ipcrm, to remove the shared memory segment that a killed postmaster leaves')
     def test_a_killed_postmaster_is_reported_and_its_cluster_kept(self):
@@ -1283,7 +1467,8 @@ class LauncherChecks(unittest.TestCase):
         line = read_until(process.stderr, STARTED, seen)
         self.assertIsNotNone(line, 'the launcher never reported its cluster')
         cluster = Path(line.rsplit(': ', 1)[1])
-        postmaster, key, shmid = (int(word) for word in process.stdout.readline().split())
+        killed = json.loads(process.stdout.readline())
+        postmaster, (key, shmid) = killed['postmaster'], killed['segment']
         self.addCleanup(remove_segment, key, shmid, postmaster)  # once its other processes have ended (finish() waits)
         _, errors = finish(process, timeout=180)
         errors = ''.join(seen) + errors
@@ -1294,6 +1479,12 @@ class LauncherChecks(unittest.TestCase):
         self.assertTrue((cluster / 'data' / 'postmaster.pid').exists(), 'the cluster was deleted although its server never stopped')
         self.assertTrue(Path(sockets).exists(), 'the socket directory was removed while the cluster is kept')
         self.assertEqual([], processes_naming(root), 'a process from the run was left running')
+        # Its dynamic shared memory, which no stop removed either, is in the cluster that is kept, not in /dev/shm.
+        if killed['mapped'] is not None:
+            self.assertEqual([], [path for path in killed['mapped'] if path.startswith('/dev/shm/PostgreSQL.')], killed['mapped'])
+            self.assertTrue([path for path in killed['mapped'] if '/pg_dynshmem/' in path], killed['mapped'])
+        self.assertTrue([path for path in (cluster / 'data' / 'pg_dynshmem').iterdir() if path.name.startswith('mmap.')],
+                        "the killed server's dynamic shared memory is not in its cluster")
         remove_segment(key, shmid, postmaster)
         self.assertIsNone(segment(key, shmid), 'the shared memory segment that the killed postmaster left was not removed')
 
