@@ -53,20 +53,34 @@ const shown = ui => ui.elements.historyRows.children.length === 1 && ui.elements
 // A Refresh that fails at its health read or device request keeps watch A's loaded rows, the backend's count and the
 // status line: as rendered, 5 ms later (a clear deferred by less would show by then; one deferred longer would not,
 // nor one queued on a case's fake timers, which the timeout cases therefore require empty), and rendered again from
-// the dashboard's own state (a Refresh that emptied that state but left the page as it was would show then).
-async function assertKept(ui, why) {
+// the dashboard's own state (a Refresh that emptied that state but left the page as it was would show then). The
+// case's own checks of the page (page) run at once and 5 ms later, before that re-render, which would redraw the
+// cards and re-enable the buttons from the state and so hide what the failed Refresh left on the page.
+async function assertKept(ui, why, page = () => {}) {
   for (const when of ["at once", "5 ms later", "re-rendered"]) {
     if (when === "5 ms later") await new Promise(resolve => setTimeout(resolve, 5));
     if (when === "re-rendered") { ui.elements.rangeSelect.value = "all"; ui.elements.rangeSelect.listeners.change(); }
+    else page(when);
     assert.equal(shown(ui), 3, why + ": the loaded rows, " + when);
     assert.equal(ui.elements.sampleCount.textContent, "3", why + ": the backend's count, " + when);
     assert.match(ui.elements.loadedStatus.textContent, /^3 shown · 3 loaded · 3 in source · /, why + ": the status line, " + when);
   }
 }
+// The page after a failed Refresh: both buttons usable again, and no old gateway report shown as current.
+const usable = ui => when => {
+  assert.equal(ui.elements.refreshButton.disabled, false, "Refresh is usable again, " + when);
+  assert.equal(ui.elements.connectButton.disabled, false, "Connect is usable again, " + when);
+};
+const unconfirmed = ui => when => {
+  usable(ui)(when);
+  assert.equal(ui.elements.watchLink.textContent, "Not reported", "an unconfirmed refresh must not keep showing the old gateway report, " + when);
+  assert.match(ui.elements.statusReportTime.textContent, /not loaded/, "the status says it was not loaded, " + when);
+};
 const refusal = (status, headers) => new Response(JSON.stringify({ detail: "refused" }), { status, headers: { "content-type": "application/json", ...headers } });
 // Ways a request can fail, as the backend or the network answers it: refusals with and without a wait (gateway.py's
-// lockout is a 429 with Retry-After), a network failure, a body that breaks off or does not parse, and a page that is
-// not JSON (a proxy's error page, for example).
+// lockout is a 429 with Retry-After), a network failure, a body that breaks off after its first bytes, one that does
+// not parse or is not UTF-8, a page that is not JSON (a proxy's error page, for example), and an answer labeled as
+// something else than JSON although its body would pass for one (the content type alone refuses it).
 const FAILURES = [
   ["HTTP 401", () => json({ detail: "Authorization required" }, 401), /Access was refused/],
   ["HTTP 403", () => json({ detail: "refused" }, 403), /denied this request/],
@@ -75,13 +89,18 @@ const FAILURES = [
   ["HTTP 503", () => json({ detail: "refused" }, 503), /HTTP 503/],
   ["HTTP 503 asking for a wait", () => refusal(503, { "retry-after": "5" }), /HTTP 503\).* asked to wait about 5 seconds/],
   ["a network failure", () => Promise.reject(new TypeError("Failed to fetch")), /could not be reached/],
-  ["a body that breaks off", () => new Response(new ReadableStream({ start(controller) {
-    controller.enqueue(new TextEncoder().encode('{"status":')); controller.error(new TypeError("network error"));
-  } }), { status: 200, headers: { "content-type": "application/json" } }), /^The backend's answer was cut off\. No current data was confirmed\.$/],
+  // Its first bytes are read before it fails (an error queued at once would discard them unread).
+  ["a body that breaks off", () => new Response(new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode('{"status":')); },
+    pull(controller) { controller.error(new TypeError("network error")); } }), { status: 200, headers: { "content-type": "application/json" } }),
+    /^The backend's answer was cut off\. No current data was confirmed\.$/],
   ["a body that does not parse", () => new Response('{"status": "ready", "schema', { status: 200, headers: { "content-type": "application/json" } }),
+    /^Backend returned an unsupported response\. No current data was confirmed\.$/],
+  ["a body that is not UTF-8", () => new Response(new Uint8Array([0x7b, 0x22, 0xff, 0xfe, 0x22, 0x3a, 0x31, 0x7d]), { status: 200, headers: { "content-type": "application/json" } }),
     /^Backend returned an unsupported response\. No current data was confirmed\.$/],
   ["a page that is not JSON", () => new Response("<html>synthetic proxy page</html>", { status: 200, headers: { "content-type": "text/html" } }),
     /^Backend returned an unsupported response\. No current data was confirmed\.$/],
+  ["a JSON answer labeled text/html", () => new Response(JSON.stringify({ status: "ready", schema_version: 1, synthetic_only: true, devices: summaries, next_cursor: null }),
+    { status: 200, headers: { "content-type": "text/html" } }), /^Backend returned an unsupported response\. No current data was confirmed\.$/],
 ];
 let passed = 0;
 async function test(name, action) { await action(); passed++; console.log("PASS " + name); }
@@ -177,10 +196,8 @@ async function test(name, action) { await action(); passed++; console.log("PASS 
         assert.deepEqual(pending.map(t => t.ms), [12000]);
         pending[0].fn(); await idle(ui);
         assert.match(ui.elements.announcement.textContent, /timed out or was cancelled/);
-        await assertKept(ui, "a Refresh that times out at " + where);
+        await assertKept(ui, "a Refresh that times out at " + where, unconfirmed(ui));
         assert.equal(timers.size, 0, "nothing is left queued to run later");
-        assert.equal(ui.elements.refreshButton.disabled, false);
-        assert.equal(ui.elements.connectButton.disabled, false);
         silent = false;
         ui.elements.refreshButton.click(); await idle(ui);
         assert.match(ui.elements.announcement.textContent, /Refreshed saved backend records/);
@@ -333,8 +350,7 @@ async function test(name, action) { await action(); passed++; console.log("PASS 
       api.override = url => url.startsWith("/v1/devices?") ? json({ detail: "Storage unavailable" }, 503) : null;
       ui.elements.refreshButton.click(); await idle(ui);
       assert.notEqual(ui.elements.statusReportTime.textContent, "No gateway status report received.");
-      assert.match(ui.elements.statusReportTime.textContent, /not loaded/);
-      await assertKept(ui, "a Refresh that fails (HTTP 503) at its device request");
+      await assertKept(ui, "a Refresh that fails (HTTP 503) at its device request", unconfirmed(ui));
       api.override = url => url.startsWith("/v1/samples?") && url.includes(B) ? json({ detail: "Storage unavailable" }, 503) : null;
       ui.elements.deviceSelect.value = B; ui.elements.deviceSelect.listeners.change(); await idle(ui);
       assert.equal(shown(ui), 0);
@@ -353,8 +369,7 @@ async function test(name, action) { await action(); passed++; console.log("PASS 
       assert.notEqual(ui.elements.announcement.textContent, "Failed to fetch");
       assert.match(ui.elements.announcement.textContent, /could not be reached/);
       assert.match(ui.elements.announcement.textContent, /No current data was confirmed/);
-      await assertKept(ui, "a Refresh that cannot reach the backend at all");
-      assert.equal(ui.elements.refreshButton.disabled, false);
+      await assertKept(ui, "a Refresh that cannot reach the backend at all", unconfirmed(ui));
     });
 
     await test(variant + ": an empty backend's chart never suggests loading older observations", async () => {
@@ -455,9 +470,7 @@ async function test(name, action) { await action(); passed++; console.log("PASS 
         api.override = url => url.startsWith("/v1/devices?") ? answer() : null;
         ui.elements.refreshButton.click(); await idle(ui);
         assert.match(ui.elements.announcement.textContent, message);
-        await assertKept(ui, "a Refresh that fails (" + failure + ") at its device request");
-        assert.equal(ui.elements.refreshButton.disabled, false);
-        assert.equal(ui.elements.watchLink.textContent, "Not reported", "an unconfirmed refresh must not keep showing the old gateway report");
+        await assertKept(ui, "a Refresh that fails (" + failure + ") at its device request", unconfirmed(ui));
         api.override = () => null;
         connect(ui); await idle(ui);
         assert.match(ui.elements.announcement.textContent, /Backend records loaded/);
@@ -484,13 +497,13 @@ async function test(name, action) { await action(); passed++; console.log("PASS 
         assert.match(ui.elements.announcement.textContent, /no automatic retry occurs/);
         assert.equal(ui.calls.slice(before).filter(c => c.url.startsWith("/v1/devices")).length, 1, "the refused request is not repeated");
         assert.equal(timers.size, 0, "no retry is scheduled for later");
-        await assertKept(ui, "a Refresh refused (429) at its device request");
+        await assertKept(ui, "a Refresh refused (429) at its device request", unconfirmed(ui));
       }
       api.override = url => url.startsWith("/v1/devices?") ? answer(503, { "retry-after": "5" }) : null;
       ui.elements.refreshButton.click(); await idle(ui);
       assert.match(ui.elements.announcement.textContent, /HTTP 503\)\. No current data was confirmed\. The backend asked to wait about 5 seconds/);
       assert.equal(timers.size, 0);
-      await assertKept(ui, "a Refresh that fails (HTTP 503 asking for a wait) at its device request");
+      await assertKept(ui, "a Refresh that fails (HTTP 503 asking for a wait) at its device request", unconfirmed(ui));
     });
 
     await test(variant + ": every new session starts from the widest time range", async () => {
@@ -622,7 +635,7 @@ async function test(name, action) { await action(); passed++; console.log("PASS 
       assert.equal(shown(ui), 3);
       blank = true; ui.elements.refreshButton.click(); await idle(ui);
       assert.match(ui.elements.announcement.textContent, /Backend contract is not supported/);
-      await assertKept(ui, "a Refresh refused at its health read");
+      await assertKept(ui, "a Refresh refused at its health read", unconfirmed(ui));
     });
 
     for (const [failure, answer, message] of FAILURES) {
@@ -636,9 +649,7 @@ async function test(name, action) { await action(); passed++; console.log("PASS 
         ui.elements.refreshButton.click(); await idle(ui);
         assert.match(ui.elements.announcement.textContent, message);
         assert.equal(ui.calls.length - before, 1, "nothing is requested after the failed health read");
-        await assertKept(ui, "a Refresh that fails (" + failure + ") at its health read");
-        assert.equal(ui.elements.watchLink.textContent, "Not reported", "an unconfirmed refresh must not keep showing the old gateway report");
-        assert.match(ui.elements.statusReportTime.textContent, /not loaded/);
+        await assertKept(ui, "a Refresh that fails (" + failure + ") at its health read", unconfirmed(ui));
       });
     }
   }

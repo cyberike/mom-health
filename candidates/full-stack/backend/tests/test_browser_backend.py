@@ -4,9 +4,9 @@ tests/browser_backend.py serves Uvicorn on a listener it binds itself. Unless th
 socket, asyncio leaves TCP_NODELAY off, and every response after a connection's first then reaches the client
 about 40 ms after its headers (Nagle's algorithm waiting for the client's delayed ACK). The documented server
 (``python -m mom_health_backend``) answers within a few milliseconds, so the browser checks would see a slower
-server than the one they stand for. One check times the responses; the other runs main() with Uvicorn's server
-replaced, and pins the socket main() hands it, which no load on the machine can blur. Loopback only, fictional token,
-a fresh fixture under build/.
+server than the one they stand for. One check times the responses; the other runs main() with Uvicorn's server class
+made to serve nothing, and pins the one server main() starts and the socket it hands that server, which no load on the
+machine can blur. Loopback only, fictional token, a fresh fixture under build/.
 """
 import contextlib
 import importlib.util
@@ -14,10 +14,12 @@ import io
 import json
 import os
 from pathlib import Path
+import signal
 import socket
 import subprocess
 import sys
 import time
+import types
 import unittest
 from unittest.mock import patch
 
@@ -70,20 +72,22 @@ class BrowserBackendTimingTests(unittest.TestCase):
         spec = importlib.util.spec_from_file_location('browser_backend', HERE / 'browser_backend.py')
         backend = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(backend)
-        served = []
+        # Uvicorn's server class itself is patched, so main() is caught whatever name it reaches it by (uvicorn.Server,
+        # uvicorn.server.Server, uvicorn.run): every server is counted, and none serves.
+        server_class, servers, served = backend.uvicorn.server.Server, [], []
+        initialize = server_class.__init__
 
-        class Server:
-            """Stands in for uvicorn.Server: records the sockets main() would serve on, and serves nothing."""
-            def __init__(self, config):
-                self.started = self.should_exit = False
+        def counted(server, *arguments, **options):
+            servers.append(server)
+            initialize(server, *arguments, **options)
 
-            def run(self, sockets=None):
-                served.extend(sockets or [])
-                self.started = True
+        def recorded(server, sockets=None):
+            served.extend(sockets or [])
+            server.started = True
 
         class Thread:
-            """Stands in for threading.Thread: runs its target at start(), so nothing main() starts (its stdin reader
-            included) outlives the patches."""
+            """Stands in for threading.Thread in browser_backend alone: runs its target at start(), so nothing main()
+            starts (its stdin reader included) outlives the check."""
             def __init__(self, target, args=(), kwargs=None, daemon=None):
                 self.target, self.args, self.kwargs = target, args, kwargs or {}
 
@@ -95,16 +99,18 @@ class BrowserBackendTimingTests(unittest.TestCase):
 
             def join(self, timeout=None):
                 pass
-        with patch.object(backend.uvicorn, 'Server', Server), patch.object(backend.threading, 'Thread', Thread), \
-                patch.object(backend.signal, 'signal', lambda *arguments: None), patch.object(backend.sys, 'argv', ['browser_backend.py']), \
-                patch.object(backend.sys, 'stdin', io.StringIO('')), contextlib.redirect_stdout(io.StringIO()):
+        handlers = types.SimpleNamespace(signal=lambda *arguments: None, SIGTERM=signal.SIGTERM, SIGINT=signal.SIGINT)
+        with patch.object(server_class, '__init__', counted), patch.object(server_class, 'run', recorded), \
+                patch.object(backend, 'threading', types.SimpleNamespace(Thread=Thread)), patch.object(backend, 'signal', handlers), \
+                patch.object(backend.sys, 'argv', ['browser_backend.py']), patch.object(backend.sys, 'stdin', io.StringIO('')), \
+                contextlib.redirect_stdout(io.StringIO()):
             backend.main()
         for listener in served:
             self.addCleanup(listener.close)
+        self.assertEqual(1, len(servers), 'main() started %d servers' % len(servers))
         self.assertEqual(1, len(served), served)
         self.assertEqual(socket.IPPROTO_TCP, served[0].proto, 'asyncio sets TCP_NODELAY only on an IPPROTO_TCP socket')
         self.assertEqual('127.0.0.1', served[0].getsockname()[0])
-
 
 if __name__ == '__main__':
     unittest.main()
