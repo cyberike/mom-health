@@ -48,10 +48,12 @@ did not stop (killed, for example) leaves behind; its dynamic shared memory is
 kept in data/pg_dynshmem (dynamic_shared_memory_type = mmap), not in /dev/shm.
 Only the servers initdb runs, before that setting is written, keep theirs in
 /dev/shm, each with its own System V segment, and remove both as they end. One
-that does not end by itself leaves both: one killed with SIGKILL, and one that
-a SIGTERM or SIGHUP sent to the whole process group (timeout, a closed
-terminal) reaches while initdb runs it, since initdb then removes the data
-directory under it.
+killed with SIGKILL leaves both, and so can one that a SIGTERM or SIGHUP sent
+to the whole process group (timeout, a closed terminal) reaches while initdb
+runs it, since initdb then removes the data directory under it: the bootstrap
+server then dies by the signal, and the single-user server panics (SIGABRT)
+under a SIGHUP, or under a SIGTERM late in its run (one earlier shuts it down
+cleanly).
 
 Needs Linux (it reads /proc to confirm the server exited). PostgreSQL refuses to
 run as root, so a root caller names an unprivileged account with --run-as, which
@@ -328,7 +330,7 @@ def cluster_name(cluster):
 
 
 def leftover_processes(info):
-    """PIDs of the processes that still use this cluster's data directory (Linux /proc): their command line
+    """PIDs, as /proc numbers them, of the processes that still use this cluster's data directory: their command line
     names it or is a server process title of this cluster, their environment has it as PGDATA, or it is
     their working directory. The postmaster names the directory and has it as PGDATA; its children
     (backends and auxiliary processes) overwrite both with their title, which names the cluster, so a
@@ -387,27 +389,30 @@ def exists(pid):
 
 
 def server_unseen(info):
-    """What leftover_processes() cannot see here once the server runs, for main() to say, or None. Without
-    /proc, or where /proc hides the server's processes (hidepid=ptraceable, or invisible or noaccess with a gid=
-    that root is not in, for root without CAP_SYS_PTRACE), it sees none of them. Where neither the postmaster's environment nor its working directory can be read (root in Docker's
-    default capability set, for example), it still finds the server's own processes by their command line or
-    title, but no program the server started (COPY ... TO PROGRAM, archive_command), which it can find only
-    through one of those two. None does not mean that every such program is found (see leftover_processes()).
-    Where /proc belongs to another PID namespace (an ancestor's, as under unshare --pid without --mount-proc), the
-    postmaster's PID names some other process there, or none, so nothing is said: the cleanup still finds the
-    server's processes by what they show, but a program the server started goes unseen there wherever both of
-    those reads are refused."""
+    """What leftover_processes() cannot see here once the server runs, for main() to say, or None. Without a
+    /proc that shows this process (none is mounted, or a child or sibling PID namespace's is), or where /proc
+    hides the server's processes (hidepid=ptraceable, or invisible or noaccess with a gid= that root is not in,
+    for root without CAP_SYS_PTRACE), it sees none of them. Where neither the postmaster's environment nor its
+    working directory can be read (root in Docker's default capability set, for example), it still finds the
+    server's own processes by their command line or title, but no program the server started (COPY ... TO
+    PROGRAM, archive_command), which it can find only through one of those two. None does not mean that every
+    such program is found (see leftover_processes()). Where /proc belongs to an ancestor's PID namespace (as
+    under unshare --pid without --mount-proc), postmaster.pid's PID names another process there, or none, so
+    the postmaster is looked up there by its command line, which names the data directory."""
     if not os.path.isdir('/proc/self'):
-        return 'no /proc here, so the cleanup cannot see whether any process still uses the cluster'
+        return ("no /proc here that shows this process (none, or another PID namespace's), so the cleanup cannot see "
+                'whether any process still uses the cluster')
     try:
         postmaster = int((Path(info['data']) / 'postmaster.pid').read_text().split()[0])
     except (OSError, ValueError, IndexError):  # no server after all: nothing to look at
         return None
-    if read_or(os.readlink, '/proc/self', None) != str(os.getpid()):  # this /proc is another PID namespace's
+    if not exists(postmaster):  # the server is already gone (signal 0 takes this process's own PID namespace's PIDs)
         return None
-    if read_or(Path.read_bytes, Path('/proc/%d/cmdline' % postmaster), None) is None:
-        if not exists(postmaster):  # the server is already gone
-            return None
+    if read_or(os.readlink, '/proc/self', None) != str(os.getpid()):  # this /proc is an ancestor PID namespace's
+        named = info['data'].encode()
+        postmaster = next((int(entry.name) for entry in Path('/proc').glob('[0-9]*')
+                           if named in read_or(Path.read_bytes, entry / 'cmdline', b'').split(b'\0')), None)
+    if postmaster is None or read_or(Path.read_bytes, Path('/proc/%d/cmdline' % postmaster), None) is None:
         return ("the server's processes are hidden in /proc here (hidepid?), so the cleanup cannot see whether any process "
                 'still uses the cluster')
     try:

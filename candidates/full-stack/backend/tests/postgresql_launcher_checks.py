@@ -12,7 +12,8 @@ each other. The checks of a killed postmaster and of a process still using the
 cluster after the wait keep their cluster by design and remove it themselves.
 Interrupted (a Ctrl-C at the test's terminal, which the launcher in its own
 session does not get), a launch check runs none of its cleanups, so it leaves
-its private copy (build/launcher-check-*, or /tmp/lc-* for the short layout);
+its private copy (build/launcher-check-*, or /tmp/lc-* for the short layout,
+and build/launcher-tmpdir-* too for the TMPDIR check);
 each of those two also leaves its cluster inside that copy and its /tmp socket
 directory (cluster.json names it), and the killed-postmaster check also the
 postmaster's System V shared memory segment (postmaster.pid line 7 names its
@@ -24,7 +25,10 @@ set, where capsh can drop those (it needs CAP_SETPCAP and /bin/bash), and skips
 them otherwise; the check that a /proc hiding the server's processes is
 reported also needs unshare and CAP_SYS_ADMIN, to mount one with hidepid in a
 mount namespace of its own (Linux 5.8 or later), and the check of a /proc that
-belongs to another PID namespace needs unshare too. The other checks
+belongs to another PID namespace needs unshare and CAP_SYS_ADMIN too. Run in a
+PID namespace of its own on its parent's /proc (unshare --pid without
+--mount-proc), the checks that compare their processes' PIDs with /proc's,
+the launch checks among them, are skipped: /proc's PIDs are not theirs there. The other checks
 need only POSIX, except four that read /proc and are skipped without it (the
 environment, working-directory and title checks of the cleanup, Linux; the
 runuser step check, Linux, root and runuser) and one skipped without ctypes
@@ -259,6 +263,13 @@ found = launcher.leftover_processes(info)
 lasting = before & children()  # there throughout, unlike an autovacuum worker that came and went meanwhile
 print(json.dumps({'postmaster': postmaster, 'children': sorted(lasting), 'found': sorted(found), 'readable': readable}))
 '''
+# A command that prints whether postmaster.pid's PID names any process in this /proc.
+NAMES_A_PROCESS = r'''
+import os
+from pathlib import Path
+postmaster = int((Path(os.environ['MOM_HEALTH_TEST_POSTGRESQL_CLUSTER']) / 'data' / 'postmaster.pid').read_text().split()[0])
+print(os.path.exists('/proc/%d' % postmaster))
+'''
 # A command that kills the server's postmaster (SIGKILL, as the kernel's out-of-memory killer would) and waits until it
 # is gone, reaped; the server's other processes then end by themselves, and its postmaster.pid stays behind. First it
 # prints the postmaster's PID, the "key id" of its System V shared memory segment, which such a kill leaves too, outside
@@ -397,15 +408,50 @@ def effective_capabilities():
         return 0
 
 
+def in_pid_namespace(numbers=(), hide=False):
+    """(prefix, None): the prefix that runs a command as root in a PID namespace of its own on its parent's /proc
+    (unshare --pid without --mount-proc; sh, which does not exec a command that is not its last, stays its init),
+    without the capabilities numbered, and with hide on a /proc mounted with hidepid=ptraceable first (see
+    hiding_processes()); or (None, why not), where that cannot be done here (it needs root, unshare and
+    CAP_SYS_ADMIN)."""
+    if not ROOT or not shutil.which('unshare'):
+        return None, 'needs root and unshare, for a PID namespace of its own'
+    front, why_not = hiding_processes([]) if hide else ([], None)
+    if why_not:
+        return None, why_not
+    namespace = ['unshare', '--pid', '--fork', '--', 'sh', '-c', '"$@"; exit $?', 'sh']
+    probe = subprocess.run(front + namespace + ['true'], stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    if probe.returncode:
+        return None, 'cannot make a PID namespace here: %s' % (probe.stderr.strip().splitlines() or ['exit status %d' % probe.returncode])[-1]
+    drop, why_not = without_capabilities(numbers) if numbers else ([], None)
+    if why_not:
+        return None, why_not
+    return front + namespace + drop, None
+
+
 def unmapped(paths):
-    """Those of paths that no process maps, as far as this process may read /proc/*/maps."""
+    """Those of paths that no process maps, as far as this process may read /proc/*/maps (in bytes: a mapped
+    file's path need not be text)."""
     mapped = set()
     for entry in Path('/proc').glob('[0-9]*'):
         try:
-            mapped.update(line.split(None, 5)[5] for line in (entry / 'maps').read_text().splitlines() if len(line.split(None, 5)) == 6)
+            mapped.update(line.split(None, 5)[5] for line in (entry / 'maps').read_bytes().splitlines() if len(line.split(None, 5)) == 6)
         except OSError:
             pass
-    return sorted(str(path) for path in paths if str(path) not in mapped)
+    return sorted(str(path) for path in paths if os.fsencode(path) not in mapped)
+
+
+def proc_of_another_pid_namespace():
+    """Whether /proc belongs to another PID namespace than this process's (an ancestor's, as under unshare --pid
+    without --mount-proc): its PIDs are then not the ones this process's children have."""
+    try:
+        return os.readlink('/proc/self') != str(os.getpid())
+    except OSError:
+        return False
+
+
+FOREIGN_PROC = proc_of_another_pid_namespace()
+FOREIGN_PROC_WHY = "this /proc is another PID namespace's: its PIDs are not the ones this process's children have"
 
 
 def outside_dockers_default():
@@ -449,8 +495,9 @@ def ended(path, timeout=10):
 
 
 def remove_copy(root):
-    """Stop anything still running from a private copy (only after a failed check), then remove it."""
-    for signum in (signal.SIGQUIT, signal.SIGKILL):
+    """Stop anything still running from a private copy (only after a failed check), then remove it. Where /proc is
+    another PID namespace's, its PIDs would name other processes here, so none is signalled."""
+    for signum in (signal.SIGQUIT, signal.SIGKILL) if not FOREIGN_PROC else ():
         for pid in processes_naming(root):
             try:
                 os.kill(int(pid), signum)
@@ -610,6 +657,7 @@ class CleanupHelperTests(unittest.TestCase):
         self.assertIn('single-user server is running', said[0])
 
     @unittest.skipUnless(os.path.exists('/proc/self/environ'), 'needs Linux /proc')
+    @unittest.skipIf(FOREIGN_PROC, FOREIGN_PROC_WHY)
     def test_a_process_with_the_data_directory_as_pgdata_is_left_over_and_no_other(self):
         data = '/synthetic/postgresql-fixtures/%d/data' % os.getpid()
         variants = {'PGDATA is the data directory': ({'PGDATA': data}, True),
@@ -648,6 +696,7 @@ class CleanupHelperTests(unittest.TestCase):
                 self.assertIs(left, pids[name] in found)
 
     @unittest.skipUnless(os.path.exists('/proc/self/cwd'), 'needs Linux /proc')
+    @unittest.skipIf(FOREIGN_PROC, FOREIGN_PROC_WHY)
     def test_a_process_working_in_the_data_directory_is_left_over_and_no_other(self):
         root = Path(tempfile.mkdtemp(prefix='launcher-cwd-'))
         self.addCleanup(shutil.rmtree, root)
@@ -676,6 +725,7 @@ class CleanupHelperTests(unittest.TestCase):
                 self.assertNotIn(pids['data-other'], found, 'a directory that only starts the same was taken for it')
 
     @unittest.skipUnless(os.path.exists('/proc/self/cmdline'), 'needs Linux /proc')
+    @unittest.skipIf(FOREIGN_PROC, FOREIGN_PROC_WHY)
     def test_a_process_titled_as_a_server_process_of_the_cluster_is_left_over_and_no_other(self):
         data = '/synthetic/postgresql-fixtures/r7%d/data' % os.getpid()
         name = launcher.cluster_name('/synthetic/postgresql-fixtures/r7%d' % os.getpid())
@@ -713,27 +763,32 @@ class CleanupHelperTests(unittest.TestCase):
         self.addCleanup(live.stdin.close)
         gone = subprocess.Popen([sys.executable, '-c', 'pass'])
         gone.wait()  # and reaped: a postmaster already gone
-        read_bytes, readlink = Path.read_bytes, os.readlink
+        read_bytes, readlink, glob = Path.read_bytes, os.readlink, Path.glob
         everything = ('cmdline', 'environ', 'cwd')
 
-        def proc(pid, refused=(), missing=(), own=None):
-            """/proc/<pid>/ with the reads of the entries in refused refused (PermissionError), and those of the entries
-            in missing failing as for no such process (FileNotFoundError); /proc/self names own (this process's PID,
-            unless this /proc is another PID namespace's). Reads elsewhere are real."""
-            prefix = '/proc/%d/' % pid
+        def proc(entries, own=None):
+            """/proc/<pid>/ for each pid in entries ({pid: (refused, missing)}): the reads of the entries in refused are
+            refused (PermissionError), and those in missing fail as for no such process (FileNotFoundError); the rest
+            show the postmaster of this data directory. /proc/self names own (this process's PID, unless this /proc
+            is another PID namespace's). Reads elsewhere are real."""
             contents = {'cmdline': b'postgres\0-D\0%s\0' % str(data).encode(), 'environ': b'PGDATA=%s\0' % str(data).encode(),
                         'cwd': str(data)}
 
             def faked(path, real):
-                if not str(path).startswith(prefix):
+                pid, _, name = str(path)[len('/proc/'):].partition('/') if str(path).startswith('/proc/') else ('', '', '')
+                if not pid.isdigit() or int(pid) not in entries or not name:
                     return real()
-                name = str(path)[len(prefix):]
+                refused, missing = entries[int(pid)]
                 if name in missing:
                     raise FileNotFoundError(2, 'No such file or directory (synthetic)')
                 if name in refused:
                     raise PermissionError(13, 'Permission denied (synthetic)')
                 return contents[name]
+            def listed(path, pattern, *arguments, **options):  # the faked entries are listed, whatever /proc this is
+                real = list(glob(path, pattern, *arguments, **options))
+                return [Path('/proc/%d' % pid) for pid in entries if Path('/proc/%d' % pid) not in real] + real if str(path) == '/proc' else real
             stack = contextlib.ExitStack()
+            stack.enter_context(patch.object(Path, 'glob', listed))
             stack.enter_context(patch.object(Path, 'read_bytes', lambda path: faked(path, lambda: read_bytes(path))))
             stack.enter_context(patch.object(launcher.os, 'readlink', lambda path, *arguments, **options: (
                 own or str(os.getpid())) if str(path) == '/proc/self' else faked(path, lambda: readlink(path, *arguments, **options))))
@@ -750,15 +805,33 @@ class CleanupHelperTests(unittest.TestCase):
                  ('already gone', gone, (), everything, None),
                  ('gone just after its command line was read', live, (), ('environ', 'cwd'), None),
                  ('gone just after its environment was read', live, (), ('cwd',), None),
-                 ('environment refused, then gone', live, ('environ',), ('cwd',), None),
-                 # This /proc is an ancestor PID namespace's: postmaster.pid's PID is not the postmaster's there.
-                 ("a /proc of another PID namespace", live, (), everything, None, str(os.getpid() + 1000003)))
+                 ('environment refused, then gone', live, ('environ',), ('cwd',), None))
+        # This /proc is an ancestor PID namespace's: postmaster.pid's PID is not the postmaster's there, and the
+        # postmaster is looked up by its command line instead. A second child stands for it there.
+        there = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()'], stdin=subprocess.PIPE)
+        self.addCleanup(there.wait)
+        self.addCleanup(there.stdin.close)
+        other = str(os.getpid() + 1000003)
+        foreign = (("a /proc of another PID namespace, the postmaster found there", live, {there.pid: ((), ())}, None),
+                   ('a /proc of another PID namespace, its environment and working directory refused there', live,
+                    {there.pid: (('environ', 'cwd'), ())}, 'a program the server started'),
+                   ('a /proc of another PID namespace that hides the server', live, {there.pid: ((), everything)}, 'hidden in /proc'),
+                   ('a /proc of another PID namespace, the server already gone', gone, {there.pid: ((), ())}, None))
         with patch.object(launcher.os.path, 'isdir', lambda path: path == '/proc/self'):  # as on Linux
             self.assertIsNone(launcher.server_unseen(info), 'no server runs, so there is nothing to miss')
-            for case, postmaster, refused, missing, said, *own in cases:
+            for case, postmaster, refused, missing, said in cases:
                 with self.subTest(case):
                     (data / 'postmaster.pid').write_text('%d\n%s\n' % (postmaster.pid, data))
-                    with proc(postmaster.pid, refused, missing, *own):
+                    with proc({postmaster.pid: (refused, missing)}):
+                        unseen = launcher.server_unseen(info)
+                    if said is None:
+                        self.assertIsNone(unseen, 'reported as unseen')
+                    else:
+                        self.assertIn(said, unseen or '')
+            for case, postmaster, entries, said in foreign:
+                with self.subTest(case):
+                    (data / 'postmaster.pid').write_text('%d\n%s\n' % (postmaster.pid, data))
+                    with proc({postmaster.pid: ((), everything), **entries}, own=other):
                         unseen = launcher.server_unseen(info)
                     if said is None:
                         self.assertIsNone(unseen, 'reported as unseen')
@@ -772,10 +845,26 @@ class CleanupHelperTests(unittest.TestCase):
                 return kill(pid, signum)
             with self.subTest('hidden, and signal 0 to it refused'):
                 (data / 'postmaster.pid').write_text('%d\n%s\n' % (live.pid, data))
-                with proc(live.pid, (), everything), patch.object(launcher.os, 'kill', refused):
+                with proc({live.pid: ((), everything)}), patch.object(launcher.os, 'kill', refused):
                     self.assertIn('hidden in /proc', launcher.server_unseen(info) or '', 'a running postmaster was taken for gone')
         with patch.object(launcher.os.path, 'isdir', lambda path: False):  # no /proc
             self.assertIn('no /proc here', launcher.server_unseen(info) or '')
+
+    @unittest.skipUnless(os.path.exists('/proc/self/maps'), 'needs Linux /proc')
+    def test_the_checks_read_memory_maps_whose_paths_are_not_text(self):
+        # unmapped() names the /dev/shm files a killed server left; a mapped file whose name is not UTF-8 must not stop it.
+        root = Path(tempfile.mkdtemp(prefix='launcher-maps-'))
+        self.addCleanup(shutil.rmtree, root)
+        odd = Path(os.fsdecode(os.fsencode(root) + b'/synthetic-\xff\xfe-segment'))
+        odd.write_bytes(b'\0' * 4096)
+        mapping = subprocess.Popen([sys.executable, '-c', 'import mmap, sys\nwith open(sys.argv[1], "rb") as file:\n'
+                                    '    view = mmap.mmap(file.fileno(), 0, prot=mmap.PROT_READ)\nprint("mapped", flush=True)\nsys.stdin.read()',
+                                    str(odd)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(mapping.wait)
+        self.addCleanup(mapping.stdout.close)
+        self.addCleanup(mapping.stdin.close)
+        self.assertEqual('mapped', mapping.stdout.readline().strip())
+        self.assertEqual([str(root / 'not-mapped')], unmapped([odd, root / 'not-mapped']))
 
     def test_the_checks_find_the_segment_of_a_killed_postmaster_whatever_the_sign_of_its_key(self):
         # /proc/sysvipc/shm prints a key of 2**31 or more signed; postmaster.pid line 7 has it unsigned, in 64 bits.
@@ -1293,6 +1382,11 @@ class OtherPythonTests(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform.startswith('linux') and binaries_available(), 'needs Linux and the PostgreSQL server binaries')
 class LauncherChecks(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if FOREIGN_PROC:  # the launch checks compare PIDs that commands print with PIDs that /proc gives
+            raise unittest.SkipTest(FOREIGN_PROC_WHY)
+
     def launch(self, *arguments, **options):
         process = launch(*arguments, **options)
         self.addCleanup(self.end, process)  # after a failed check: stop the launcher before the copy goes
@@ -1499,25 +1593,32 @@ class LauncherChecks(unittest.TestCase):
                 (self.assertIn if hidden else self.assertNotIn)(HIDDEN, errors)
                 self.assertNotIn(UNSEEN, errors)  # which would claim that the cleanup still finds the server's own processes
 
-    def test_a_proc_of_another_pid_namespace_brings_no_false_status_line(self):
-        # The launcher in a PID namespace of its own on the parent's /proc (unshare --pid without --mount-proc), with sh
-        # as its init: postmaster.pid names a PID that this /proc does not know, yet the cleanup sees the server.
-        prefix = ['unshare', '--pid', '--fork', '--', 'sh', '-c', '"$@"', 'sh']
-        if not ROOT or not shutil.which('unshare'):
-            self.skipTest('needs root and unshare, for a PID namespace of its own')
-        probe = subprocess.run(prefix + ['true'], stdin=subprocess.DEVNULL, capture_output=True, text=True)
-        if probe.returncode:
-            self.skipTest('cannot make a PID namespace here: %s' % (probe.stderr.strip().splitlines() or ['exit status %d' % probe.returncode])[-1])
-        root, script, fixtures = private_copy(self)
-        process = self.launch(script, 'pass', prefix=prefix)
-        _, errors = finish(process)
-        sockets = next((line.rsplit(': ', 1)[1] for line in errors.splitlines() if line.startswith(SOCKETS)), None)
-        if sockets:
-            self.addCleanup(shutil.rmtree, sockets, ignore_errors=True)
-        self.assertEqual(0, process.returncode, errors)
-        self.assertNothingLeft(root, fixtures, sockets, errors)
-        self.assertNotIn(HIDDEN, errors)
-        self.assertNotIn(UNSEEN, errors)
+    def test_a_proc_of_another_pid_namespace_brings_the_true_status_line(self):
+        # The launcher in a PID namespace of its own on the parent's /proc (unshare --pid without --mount-proc), sh its
+        # init: postmaster.pid's PID is not the postmaster's in that /proc, and the launcher looks the postmaster up
+        # there by its command line. The command prints whether that PID names any process in that /proc.
+        cases = (('with this process\'s capabilities', [], False, None),
+                 ("in Docker's default capability set", outside_dockers_default(), False, UNSEEN),
+                 ("in Docker's default set, on a /proc with hidepid=ptraceable", outside_dockers_default(), True, HIDDEN))
+        for name, drop, hide, said in cases:
+            with self.subTest(name):
+                prefix, why_not = in_pid_namespace(drop, hide)
+                if why_not:
+                    self.skipTest(why_not)
+                root, script, fixtures = private_copy(self)
+                process = self.launch(script, NAMES_A_PROCESS, prefix=prefix)
+                output, errors = finish(process)
+                sockets = next((line.rsplit(': ', 1)[1] for line in errors.splitlines() if line.startswith(SOCKETS)), None)
+                if sockets:
+                    self.addCleanup(shutil.rmtree, sockets, ignore_errors=True)
+                self.assertEqual(0, process.returncode, errors)
+                self.assertNothingLeft(root, fixtures, sockets, errors)
+                for line in (UNSEEN, HIDDEN):
+                    (self.assertIn if line == said else self.assertNotIn)(line, errors)
+                if not drop and output.strip() != 'False':
+                    # Where that PID names some process here too, a launcher that did not look the postmaster up would
+                    # read that process instead, and might well print nothing either.
+                    self.skipTest("postmaster.pid's PID names a process in this /proc as well")
 
     @unittest.skipUnless(shutil.which('ipcrm'), 'needs ipcrm, to remove the shared memory segment that a killed postmaster leaves')
     def test_a_killed_postmaster_is_reported_and_its_cluster_kept(self):
