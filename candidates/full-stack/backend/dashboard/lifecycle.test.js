@@ -54,13 +54,14 @@ const shown = ui => ui.elements.historyRows.children.length === 1 && ui.elements
 // status line: as rendered, 5 ms later (a clear deferred by less would show by then; one deferred longer would not,
 // nor one queued on a case's fake timers, which the timeout cases therefore require empty), and rendered again from
 // the dashboard's own state (a Refresh that emptied that state but left the page as it was would show then). The
-// case's own checks of the page (page) run at once and 5 ms later, before that re-render, which would redraw the
-// cards and re-enable the buttons from the state and so hide what the failed Refresh left on the page.
+// case's own checks of the page (page) run at each of the three: before the re-render, which would redraw the cards
+// and re-enable the buttons from the state and so hide what the failed Refresh left on the page, and after it, which
+// shows what that state holds (an old report kept there but not drawn, for example).
 async function assertKept(ui, why, page = () => {}) {
   for (const when of ["at once", "5 ms later", "re-rendered"]) {
     if (when === "5 ms later") await new Promise(resolve => setTimeout(resolve, 5));
     if (when === "re-rendered") { ui.elements.rangeSelect.value = "all"; ui.elements.rangeSelect.listeners.change(); }
-    else page(when);
+    page(when);
     assert.equal(shown(ui), 3, why + ": the loaded rows, " + when);
     assert.equal(ui.elements.sampleCount.textContent, "3", why + ": the backend's count, " + when);
     assert.match(ui.elements.loadedStatus.textContent, /^3 shown · 3 loaded · 3 in source · /, why + ": the status line, " + when);
@@ -78,8 +79,8 @@ const unconfirmed = ui => when => {
 };
 const refusal = (status, headers) => new Response(JSON.stringify({ detail: "refused" }), { status, headers: { "content-type": "application/json", ...headers } });
 // Ways a request can fail, as the backend or the network answers it: refusals with and without a wait (gateway.py's
-// lockout is a 429 with Retry-After), a network failure, a body that breaks off after its first bytes, one that does
-// not parse or is not UTF-8, a page that is not JSON (a proxy's error page, for example), and an answer labeled as
+// lockout is a 429 with Retry-After), a network failure, a body that breaks off before or after its first bytes, one
+// that does not parse or is not UTF-8, a page that is not JSON (a proxy's error page, for example), and an answer labeled as
 // something else than JSON although its body would pass for one (the content type alone refuses it).
 const FAILURES = [
   ["HTTP 401", () => json({ detail: "Authorization required" }, 401), /Access was refused/],
@@ -89,6 +90,8 @@ const FAILURES = [
   ["HTTP 503", () => json({ detail: "refused" }, 503), /HTTP 503/],
   ["HTTP 503 asking for a wait", () => refusal(503, { "retry-after": "5" }), /HTTP 503\).* asked to wait about 5 seconds/],
   ["a network failure", () => Promise.reject(new TypeError("Failed to fetch")), /could not be reached/],
+  ["a body that breaks off before its first byte", () => new Response(new ReadableStream({ start(controller) { controller.error(new TypeError("network error")); } }),
+    { status: 200, headers: { "content-type": "application/json" } }), /^The backend's answer was cut off\. No current data was confirmed\.$/],
   // Its first bytes are read before it fails (an error queued at once would discard them unread).
   ["a body that breaks off", () => new Response(new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode('{"status":')); },
     pull(controller) { controller.error(new TypeError("network error")); } }), { status: 200, headers: { "content-type": "application/json" } }),

@@ -5,8 +5,9 @@ socket, asyncio leaves TCP_NODELAY off, and every response after a connection's 
 about 40 ms after its headers (Nagle's algorithm waiting for the client's delayed ACK). The documented server
 (``python -m mom_health_backend``) answers within a few milliseconds, so the browser checks would see a slower
 server than the one they stand for. One check times the responses; the other runs main() with Uvicorn's server class
-made to serve nothing, and pins the one server main() starts and the socket it hands that server, which no load on the
-machine can blur. Loopback only, fictional token, a fresh fixture under build/.
+made to serve nothing, and pins the one Uvicorn server main() starts and the socket it hands that server, which no
+load on the machine can blur (another listening socket opened outside Uvicorn is not counted). Loopback only, fictional
+token, a fresh fixture under build/.
 """
 import contextlib
 import importlib.util
@@ -73,7 +74,9 @@ class BrowserBackendTimingTests(unittest.TestCase):
         backend = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(backend)
         # Uvicorn's server class itself is patched, so main() is caught whatever name it reaches it by (uvicorn.Server,
-        # uvicorn.server.Server, uvicorn.run): every server is counted, and none serves.
+        # uvicorn.server.Server, uvicorn.run) and whichever entry point it serves through (run, or the serve() coroutine
+        # that run() wraps): every server is counted, and none serves. Each socket handed over is closed after the check,
+        # even if main() fails after it.
         server_class, servers, served = backend.uvicorn.server.Server, [], []
         initialize = server_class.__init__
 
@@ -82,8 +85,13 @@ class BrowserBackendTimingTests(unittest.TestCase):
             initialize(server, *arguments, **options)
 
         def recorded(server, sockets=None):
+            for listener in sockets or []:
+                self.addCleanup(listener.close)
             served.extend(sockets or [])
             server.started = True
+
+        async def recorded_async(server, sockets=None):
+            recorded(server, sockets)
 
         class Thread:
             """Stands in for threading.Thread in browser_backend alone: runs its target at start(), so nothing main()
@@ -101,12 +109,11 @@ class BrowserBackendTimingTests(unittest.TestCase):
                 pass
         handlers = types.SimpleNamespace(signal=lambda *arguments: None, SIGTERM=signal.SIGTERM, SIGINT=signal.SIGINT)
         with patch.object(server_class, '__init__', counted), patch.object(server_class, 'run', recorded), \
+                patch.object(server_class, 'serve', recorded_async), \
                 patch.object(backend, 'threading', types.SimpleNamespace(Thread=Thread)), patch.object(backend, 'signal', handlers), \
                 patch.object(backend.sys, 'argv', ['browser_backend.py']), patch.object(backend.sys, 'stdin', io.StringIO('')), \
                 contextlib.redirect_stdout(io.StringIO()):
             backend.main()
-        for listener in served:
-            self.addCleanup(listener.close)
         self.assertEqual(1, len(servers), 'main() started %d servers' % len(servers))
         self.assertEqual(1, len(served), served)
         self.assertEqual(socket.IPPROTO_TCP, served[0].proto, 'asyncio sets TCP_NODELAY only on an IPPROTO_TCP socket')
