@@ -46,9 +46,12 @@ directory is named on stderr and removed once the server has stopped. While the
 server runs, it has a System V shared memory segment, which only a server that
 did not stop (killed, for example) leaves behind; its dynamic shared memory is
 kept in data/pg_dynshmem (dynamic_shared_memory_type = mmap), not in /dev/shm.
-Only initdb, which runs before that setting is written, makes short-lived files
-in /dev/shm for the servers it runs, and removes each as it ends (one killed
-with SIGKILL would leave its own).
+Only the servers initdb runs, before that setting is written, keep theirs in
+/dev/shm, each with its own System V segment, and remove both as they end. One
+that does not end by itself leaves both: one killed with SIGKILL, and one that
+a SIGTERM or SIGHUP sent to the whole process group (timeout, a closed
+terminal) reaches while initdb runs it, since initdb then removes the data
+directory under it.
 
 Needs Linux (it reads /proc to confirm the server exited). PostgreSQL refuses to
 run as root, so a root caller names an unprivileged account with --run-as, which
@@ -60,10 +63,13 @@ also lacks CAP_SYS_ADMIN and CAP_PERFMON, not its environments either: the
 cleanup then still finds the server's own processes, by their command line or
 their title (which names the cluster: cluster_name), but not a program the
 server started that outlives it (COPY ... TO PROGRAM, archive_command), and the
-launcher says so when the server starts. Where /proc is mounted with hidepid,
-root without CAP_SYS_PTRACE sees none of that account's processes, and the
-launcher says that too. A postmaster that did not stop (killed, for example)
-leaves its postmaster.pid, which keeps the cluster too.
+launcher says so when the server starts. Where /proc hides that account's
+processes from root (hidepid=ptraceable, as systemd's ProtectProc=ptraceable
+mounts it, or invisible or noaccess with a gid= that root is not in; plain
+invisible and noaccess exempt group 0, and so root), root without
+CAP_SYS_PTRACE sees none of them, and the launcher says that too. A postmaster
+that did not stop (killed, for example) leaves its postmaster.pid, which keeps
+the cluster too.
 From candidates/full-stack/backend:
 
     python tests/postgresql_throwaway.py --run-as postgres -- \\
@@ -330,8 +336,8 @@ def leftover_processes(info):
     this finds a helper of an interrupted initdb (its sh -c and bootstrap backend name no directory), and a
     program the server starts (archive_command, COPY ... TO PROGRAM) inherits it. Any other process working
     in the data directory, a shell someone left in it included, is found too: the cluster is then kept.
-    Command lines are readable to every account unless /proc is mounted with hidepid, so the server's own
-    processes are found whatever else of theirs the caller may read (see server_unseen() for hidepid). A
+    Command lines are readable to every account unless /proc hides that account's processes (hidepid; see
+    server_unseen()), so the server's own processes are found whatever else of theirs the caller may read. A
     program the server started, or an initdb helper, is found only through its environment or its working
     directory, each read on its own: another account's are not readable to an ordinary caller, its working
     directory not to root without CAP_SYS_PTRACE, and neither to root in Docker's default capability set (which
@@ -382,16 +388,22 @@ def exists(pid):
 
 def server_unseen(info):
     """What leftover_processes() cannot see here once the server runs, for main() to say, or None. Without
-    /proc, or where /proc hides the server's processes (hidepid, for root without CAP_SYS_PTRACE), it sees none
-    of them. Where neither the postmaster's environment nor its working directory can be read (root in Docker's
+    /proc, or where /proc hides the server's processes (hidepid=ptraceable, or invisible or noaccess with a gid=
+    that root is not in, for root without CAP_SYS_PTRACE), it sees none of them. Where neither the postmaster's environment nor its working directory can be read (root in Docker's
     default capability set, for example), it still finds the server's own processes by their command line or
     title, but no program the server started (COPY ... TO PROGRAM, archive_command), which it can find only
-    through one of those two. None does not mean that every such program is found (see leftover_processes())."""
+    through one of those two. None does not mean that every such program is found (see leftover_processes()).
+    Where /proc belongs to another PID namespace (an ancestor's, as under unshare --pid without --mount-proc), the
+    postmaster's PID names some other process there, or none, so nothing is said: the cleanup still finds the
+    server's processes by what they show, but a program the server started goes unseen there wherever both of
+    those reads are refused."""
     if not os.path.isdir('/proc/self'):
         return 'no /proc here, so the cleanup cannot see whether any process still uses the cluster'
     try:
         postmaster = int((Path(info['data']) / 'postmaster.pid').read_text().split()[0])
     except (OSError, ValueError, IndexError):  # no server after all: nothing to look at
+        return None
+    if read_or(os.readlink, '/proc/self', None) != str(os.getpid()):  # this /proc is another PID namespace's
         return None
     if read_or(Path.read_bytes, Path('/proc/%d/cmdline' % postmaster), None) is None:
         if not exists(postmaster):  # the server is already gone
