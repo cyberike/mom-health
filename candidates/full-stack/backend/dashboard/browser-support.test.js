@@ -10,7 +10,8 @@
 // comes next blocking again; that a failed run writes its error in full, stack
 // included, also to a reader that waits before it reads; that an error escaping
 // the checks ends it the same way; and that a run whose runner is gone ends. No
-// network, browser or real data. POSIX only: on Windows it runs nothing.
+// network, browser or real data. POSIX only: on Windows it runs nothing, says
+// so, and exits with status 2, as the browser suites do without Playwright.
 const assert = require("node:assert/strict");
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
@@ -18,9 +19,10 @@ const os = require("node:os");
 const path = require("node:path");
 
 if (process.platform === "win32") {
-  // node only emulates signals there (one sent to a run ends it at once, with none of its "exit" listeners).
-  console.log("browser-support ending checks NOT RUN: they need POSIX signals, and Windows has none.");
-  process.exit(0);
+  // node only emulates signals there (one sent to a run ends it at once, with none of its "exit" listeners), and
+  // its os.tmpdir() reads TEMP and TMP, not the TMPDIR each run is given, so not even the checks without a signal hold.
+  console.error("browser-support ending checks NOT RUN: they need POSIX signals, and a node whose temporary directory follows TMPDIR; Windows has neither.");
+  process.exit(2);
 }
 
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "mom-health-support-check-"));
@@ -115,8 +117,14 @@ function removed(ended) {
   assert.equal(fs.existsSync(ended.made), false, "the run's directory was left");
 }
 
-let passed = 0;
-async function check(name, action) { await action(); passed++; console.log("PASS " + name); }
+// A check whose action gives { skipped: why } could not run here: it is counted apart, never as passed.
+let passed = 0, skipped = 0;
+async function check(name, action) {
+  const outcome = await action();
+  if (outcome && outcome.skipped) { skipped++; console.log("SKIP " + name + " (" + outcome.skipped + ")"); return; }
+  passed++;
+  console.log("PASS " + name);
+}
 
 (async () => {
   for (const name of ["SIGINT", "SIGTERM", "SIGHUP"]) {
@@ -131,7 +139,7 @@ async function check(name, action) { await action(); passed++; console.log("PASS
     }
   }
   await check("a run ended by a signal leaves an output it shares with what comes next blocking again", async () => {
-    if (!fs.existsSync("/proc/self/fdinfo")) { console.log("  (skipped: needs Linux /proc to read the output's flags)"); return; }
+    if (!fs.existsSync("/proc/self/fdinfo")) return { skipped: "needs Linux /proc to read the outputs' flags" };
     // The shell's stdout and stderr, which the run writes to and the next command then: sockets node has made non-blocking.
     const shell = spawn("sh", ["-c", '"$0" "$1" self-SIGTERM; echo "status $?"; grep -H "^flags:" /proc/self/fdinfo/1 /proc/self/fdinfo/2', process.execPath, run], { env, stdio: ["pipe", "pipe", "pipe"] });
     let out = "";
@@ -181,5 +189,6 @@ async function check(name, action) { await action(); passed++; console.log("PASS
     removed(ended);
   });
   assert.deepEqual(fs.readdirSync(scratch).sort(), ["run.js"], "the runs left something in their TMPDIR");
-  console.log("\n" + passed + " browser-support ending checks passed. No browser; node runs that stand for one.");
+  console.log("\n" + passed + " browser-support ending checks passed" + (skipped ? ", " + skipped + " skipped (not run here)" : "") +
+              ". No browser; node runs that stand for one.");
 })().catch(error => { console.error(error); process.exitCode = 1; });

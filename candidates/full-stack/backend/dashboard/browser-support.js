@@ -35,13 +35,17 @@ function loopbackArgs(mappings = []) {
 // browser profile and artifacts directories in node's, so the first launch gives
 // both a directory of the run's own under the system's temporary directory: the
 // run removes it as it ends (see end()). A run killed outright (SIGKILL) leaves
-// that one directory, with what Chromium and Playwright had in it.
+// that one directory, with what Chromium and Playwright had in it. Not so on
+// Windows, where node's os.tmpdir() and Chromium follow TEMP and TMP, not
+// TMPDIR: there Playwright makes its directories in %TEMP% itself, and removes
+// them as the run ends, and a run ended outright leaves them there, beside its
+// own directory, empty (not run on Windows: from node's and Chromium's sources).
 let browserTemp = null;
 function launchOptions(args) {
   if (browserTemp === null) {
     browserTemp = fs.mkdtempSync(path.join(os.tmpdir(), "mom-health-chromium-"));
     process.on("exit", removeBrowserTemp);
-    process.env.TMPDIR = browserTemp; // node's os.tmpdir() from now on: Playwright's, and every later backend's
+    process.env.TMPDIR = browserTemp; // node's os.tmpdir() from now on (not on Windows): Playwright's, and every later backend's
   }
   return { args, env: { ...process.env, TMPDIR: browserTemp } };
 }
@@ -114,7 +118,9 @@ function end(status, signal) {
 }
 
 // Ctrl-C, SIGTERM (timeout) or SIGHUP: node's own ending on such a signal runs
-// no "exit" listener (none of the ones above, nor Playwright's).
+// no "exit" listener (none of the ones above, nor Playwright's). On Windows only
+// Ctrl-C and the console closing reach these: a SIGTERM sent there ends the run
+// at once, as SIGKILL does, its directory left.
 for (const name of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(name, () => end(128 + os.constants.signals[name], name));
 
 // A failed run ends once its error is written in full (process.exit drops what
