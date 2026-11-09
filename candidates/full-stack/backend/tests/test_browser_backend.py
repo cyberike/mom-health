@@ -50,17 +50,26 @@ def alarms_here():
 
 @contextlib.contextmanager
 def own_alarm(handler):
-    """SIGALRM goes to handler for the block. Afterwards the timer is off, the handler before it is back, and then a
-    timer that was running (a watchdog around the whole run, say) gets back what was left of it, at least a moment, so
-    that one due meanwhile still fires: given back after its handler, not before, so that it cannot reach this one."""
-    outer, armed = signal.getitimer(signal.ITIMER_REAL), time.monotonic()
-    before = signal.signal(signal.SIGALRM, handler)
+    """SIGALRM goes to handler for the block, which has the timer to itself: a timer that was running (a watchdog
+    around the whole run, say) is turned off as the block starts, so that it cannot fire into handler. Once the block
+    has ended, an alarm still due goes nowhere, so that nothing handler would raise cuts short what follows: the timer
+    is turned off again, the handler before it put back, and only then (so that it cannot reach handler) that earlier
+    timer given back what was left of it, with its interval, or at least a moment should it have come due meanwhile."""
+    live = True
+
+    def during(signum, frame):
+        if live:
+            handler(signum, frame)
+    outer, armed = signal.setitimer(signal.ITIMER_REAL, 0), time.monotonic()
+    before = signal.signal(signal.SIGALRM, during)
     try:
         yield
     finally:
+        live = False
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, before)
-        if outer[0]:
+        # Read just as it came due, before its alarm was taken, a repeating timer shows nothing left, only its interval.
+        if outer[0] or outer[1]:
             signal.setitimer(signal.ITIMER_REAL, max(outer[0] - (time.monotonic() - armed), 0.001), outer[1])
 
 
@@ -228,9 +237,19 @@ class OverdueAlarmTests(unittest.TestCase):
         handler = signal.getsignal(signal.SIGALRM)
         armed = time.monotonic()
         signal.setitimer(signal.ITIMER_REAL, 600, 300)  # repeating
+        # How the structural check sets its alarm: each setitimer() as (seconds, interval, whether stdout is this
+        # check's, that is, not yet or no longer redirected by the structural check).
+        calls, real_setitimer, outside = [], signal.setitimer, sys.stdout
+
+        def recorded(which, seconds, interval=0):
+            calls.append((round(seconds, 2), interval, sys.stdout is outside))
+            return real_setitimer(which, seconds, interval)
         result = unittest.TestResult()
-        BrowserBackendTimingTests('test_main_serves_on_an_ipproto_tcp_socket_on_loopback').run(result)
+        with patch.object(signal, 'setitimer', recorded):
+            BrowserBackendTimingTests('test_main_serves_on_an_ipproto_tcp_socket_on_loopback').run(result)
         self.assertEqual([], result.errors + result.failures, 'the structural check itself failed')
+        self.assertIn((OVERDUE, 1, False), calls, 'the structural check did not set its alarm, repeating every second, inside its patches')
+        self.assertEqual((0, 0, False), calls[calls.index((OVERDUE, 1, False)) + 1], 'its alarm was not turned off before its patches were undone')
         left, interval = signal.getitimer(signal.ITIMER_REAL)
         self.assertLess(abs(left - (600 - (time.monotonic() - armed))), 0.05, 'the watchdog was not given back what was left of it')
         self.assertEqual(300, interval, "the watchdog's interval was not given back")
@@ -242,13 +261,68 @@ class OverdueAlarmTests(unittest.TestCase):
         armed = time.monotonic()
         signal.setitimer(signal.ITIMER_REAL, 600)
         result = unittest.TestResult()
-        for name in ('test_the_alarm_gives_back_what_was_left_or_at_least_a_moment', 'test_the_alarm_gives_back_the_handler_before_the_timer',
-                     'test_the_alarm_comes_again_while_the_block_unwinds'):
+        names = ('test_the_alarm_gives_back_a_timer_already_running', 'test_the_alarm_has_the_timer_to_itself',
+                 'test_the_alarm_gives_back_a_repeating_timer_read_as_it_came_due', 'test_the_alarm_gives_back_what_was_left_or_at_least_a_moment',
+                 'test_the_alarm_gives_back_the_handler_before_the_timer', 'test_an_alarm_due_as_the_block_ends_cuts_nothing_short',
+                 'test_the_alarm_comes_again_while_the_block_unwinds')
+        for name in names:
             OverdueAlarmTests(name).run(result)
         self.assertEqual([], result.errors + result.failures, 'a check failed')
-        self.assertEqual(3, result.testsRun)
+        self.assertEqual(len(names), result.testsRun)
         left = signal.getitimer(signal.ITIMER_REAL)[0]
         self.assertLess(abs(left - (600 - (time.monotonic() - armed))), 0.05, 'the watchdog was not given back what was left of it')
+        self.assertEqual([], fired)
+
+    def test_the_alarm_has_the_timer_to_itself(self):
+        # A watchdog around the block, due while it runs, fires after it (into its own handler), not into the block's.
+        fired, inside = self.watchdog(), []
+        signal.setitimer(signal.ITIMER_REAL, 0.2)
+        with own_alarm(lambda signum, frame: inside.append(time.monotonic())):
+            self.assertEqual((0.0, 0.0), signal.getitimer(signal.ITIMER_REAL), 'the timer around the block still ran inside it')
+            time.sleep(0.6)
+        ended = time.monotonic()
+        while not fired and time.monotonic() - ended < 1:
+            time.sleep(0.01)
+        self.assertEqual([], inside, "the timer around the block fired into the block's handler")
+        self.assertTrue(fired, 'the timer around the block never fired')
+
+    def test_the_alarm_gives_back_a_repeating_timer_read_as_it_came_due(self):
+        # Read just as it comes due, before its alarm is taken, a repeating timer shows nothing left, only its
+        # interval: what Linux gives for one in that state, which lasts microseconds, so setitimer() is faked here.
+        self.watchdog()
+        calls = []
+
+        def due(which, seconds, interval=0):
+            calls.append((seconds, interval))
+            return (0.0, 0.5) if len(calls) == 1 else (0.0, 0.0)
+        with patch.object(signal, 'setitimer', due):
+            with own_alarm(lambda signum, frame: None):
+                pass
+        self.assertEqual([(0, 0), (0, 0), (0.001, 0.5)], calls, 'turned off, off again, then given back at once with its interval')
+
+    def test_an_alarm_due_as_the_block_ends_cuts_nothing_short(self):
+        # The block's alarm comes due just as its timer is turned off (raised here as that call returns): it goes
+        # nowhere, and the handler and a watchdog around the block still come back.
+        fired = self.watchdog()
+        handler = signal.getsignal(signal.SIGALRM)
+        armed = time.monotonic()
+        signal.setitimer(signal.ITIMER_REAL, 600, 300)
+        real_setitimer, ending = signal.setitimer, []
+
+        def late(which, seconds, interval=0):
+            was = real_setitimer(which, seconds, interval)
+            if seconds == 0 and ending:
+                del ending[:]
+                signal.raise_signal(signal.SIGALRM)
+            return was
+        with patch.object(signal, 'setitimer', late):
+            with overdue_alarm(60):
+                ending.append(True)
+        self.assertEqual([], ending, 'the alarm was never made due')
+        self.assertIs(handler, signal.getsignal(signal.SIGALRM), 'the handler before the block was not put back')
+        left, interval = signal.getitimer(signal.ITIMER_REAL)
+        self.assertLess(abs(left - (600 - (time.monotonic() - armed))), 0.05, 'the watchdog was not given back what was left of it')
+        self.assertEqual(300, interval)
         self.assertEqual([], fired)
 
     def test_the_alarm_gives_back_what_was_left_or_at_least_a_moment(self):

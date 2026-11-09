@@ -66,19 +66,50 @@ function removeBrowserTemp() {
 const children = new Set();
 process.on("exit", () => { for (const child of children) child.kill("SIGKILL"); });
 
-// Ends the run with this exit status, or by this signal. The run's directory is
-// removed last, after the "exit" listener that Playwright adds while a browser
-// of its runs or starts, which kills that browser: until then Chromium writes in
-// the directory, and a removal before it could leave the directory behind. Ended
-// by a signal, the run then ends by that signal itself (the signal handled no
-// more), so that what started it sees a run the signal ended: a shell running a
-// script stops there too, as it would not for an exit with status 128 + n.
-function end(status, signal) {
+// Moves the removal of the run's directory after every other "exit" listener, so
+// after the one that Playwright adds while a browser of its runs or starts, which
+// kills that browser: until then Chromium writes in the directory, and a removal
+// before it could leave the directory behind.
+function removalLast() {
   if (browserTemp !== null) {
     process.removeListener("exit", removeBrowserTemp);
     process.on("exit", removeBrowserTemp);
   }
-  if (signal) process.on("exit", () => { process.removeAllListeners(signal); process.kill(process.pid, signal); });
+}
+
+// An error that escapes the checks' .catch(failed) (thrown, or a rejection left
+// unhandled, in a callback that nothing awaits, such as a page's route handler)
+// ends the run through node's own handling, with status 1: the removal comes last
+// on that ending too.
+process.on("uncaughtExceptionMonitor", removalLast);
+
+// libuv makes the pipe or socket that stdout or stderr writes to non-blocking,
+// and that pipe is shared with whatever else writes to it (the next command of a
+// shell pipeline, say). Node makes it blocking again as it ends, also when its
+// own handling of SIGINT or SIGTERM ends it, but not when the run kills itself as
+// end() does, so that is done here first; a later writer would otherwise fail
+// with EAGAIN, or lose output, once its reader fell behind. _handle and its
+// setBlocking() are node's own; an output without them (a file) needs nothing.
+function blockingAgain() {
+  for (const stream of [process.stdout, process.stderr]) {
+    const handle = stream._handle;
+    if (handle && typeof handle.setBlocking === "function") handle.setBlocking(true);
+  }
+}
+
+// Ends the run with this exit status, or by this signal, the removal of the run's
+// directory last (see removalLast()). Ended by a signal, the run then ends by that
+// signal itself (handled no more), so that what started it sees a run the signal
+// ended (Python sees -15, not 143), and bash running a script stops there at
+// Ctrl-C, as it does not for an exit with status 130; a signal sent to the run
+// alone (kill, timeout) ends the run only, either way. Not on Windows, where node
+// only emulates signals (one it sends itself ends it at once with status 1, and
+// SIGHUP cannot be sent): there the run exits with status 128 + n.
+function end(status, signal) {
+  removalLast();
+  if (signal && process.platform !== "win32") {
+    process.on("exit", () => { blockingAgain(); process.removeAllListeners(signal); process.kill(process.pid, signal); });
+  }
   process.exit(status); // with status 128 + n, should the signal not end it
 }
 
