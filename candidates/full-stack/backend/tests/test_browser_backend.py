@@ -56,45 +56,61 @@ def own_alarm(handler):
     it that had just come goes to the handler before. Once the block has ended, an alarm still due goes nowhere, so
     that nothing handler would raise cuts short what follows: the timer is turned off again, the handler before it put
     back, and only then (so that it cannot reach handler) that earlier timer given back what was left of it, with its
-    interval: its next period if its alarm had just come, or at least a moment should it have come due meanwhile. Only
-    in the main thread, the only one that signals reach: anywhere else a ValueError, the timer left as it was."""
+    interval: its next period if its alarm had just come, or at least a moment should it have come due meanwhile. So
+    too where the block never starts: should the handler before raise as that alarm reaches it (a harness's timeout,
+    say), or signal.signal() refuse the block's handler (as in a subinterpreter's main thread), the mask is put back
+    and the timer given back before what was raised goes on. Only in the main thread, the only one that signals
+    reach: in another thread a ValueError before anything is done, the timer left as it was."""
     if threading.current_thread() is not threading.main_thread():
         raise ValueError('own_alarm() needs the main thread, the only one that signals reach')
-    live = True
+    live, back, armed = True, None, None
 
     def during(signum, frame):
         if live:
             handler(signum, frame)
-    # Taken with SIGALRM held back, so that a timer whose alarm has just come can be told from one turned off in its
-    # last microsecond: Linux gives what is left in whole microseconds, and reads both as nothing left, only their
-    # interval, but the second never fires. One read as no timer at all is given time to come due first, should it be
-    # in its last microsecond. (Held back in this thread only: where other threads run, an alarm that comes meanwhile
-    # can reach the handler through one of them, and is then taken for the second, so that it comes again a moment
-    # after the block.)
-    held = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+
+    def give_back():
+        if back is not None:
+            signal.setitimer(signal.ITIMER_REAL, max(back[0] - (time.monotonic() - armed), 0.001), back[1])
     try:
-        read = signal.getitimer(signal.ITIMER_REAL)
-        if read == (0.0, 0.0):
-            time.sleep(1e-05)
-        left, interval = signal.setitimer(signal.ITIMER_REAL, 0)
-        armed = time.monotonic()
-        if not left and signal.SIGALRM in signal.sigpending():
-            back = (interval, interval) if interval else None  # its alarm has come: its next period, if it repeats
-        elif left or interval or read != (0.0, 0.0):
-            back = (left, interval)  # with nothing left, turned off in its last microsecond: a moment, below
-        else:
-            back = None  # no timer
-    finally:
-        signal.pthread_sigmask(signal.SIG_SETMASK, held)  # an alarm held back reaches the handler before here
-    before = signal.signal(signal.SIGALRM, during)
+        # Taken with SIGALRM held back, so that a timer whose alarm has just come can be told from one turned off in
+        # its last microsecond: Linux gives what is left in whole microseconds, and reads both as nothing left, only
+        # their interval, but the second never fires. One read as no timer at all is given time to come due first,
+        # should it be in its last microsecond. (Held back in this thread only: where other threads run, an alarm that
+        # comes meanwhile can reach the handler through one of them, and is then taken for the second, so that it
+        # comes again a moment after the block.) SIGALRM is blocked inside the try: CPython runs the handler of an
+        # alarm that has come inside the call that changed the mask, once it has, so that a handler before that raises
+        # there still has the mask put back. It is put back a second time should such a handler cut that short at its
+        # entry (where another thread took the alarm, its handler runs here at any moment).
+        held = signal.pthread_sigmask(signal.SIG_BLOCK, ())  # the mask as it is
+        try:
+            signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+            read = signal.getitimer(signal.ITIMER_REAL)
+            if read == (0.0, 0.0):
+                time.sleep(1e-05)
+            left, interval = signal.setitimer(signal.ITIMER_REAL, 0)
+            armed = time.monotonic()
+            if left or interval or read != (0.0, 0.0):
+                back = (left, interval)  # with nothing left, turned off in its last microsecond: a moment, below
+            if not left and signal.SIGALRM in signal.sigpending():
+                back = (interval, interval) if interval else None  # its alarm has come: its next period, if it repeats
+        finally:
+            try:
+                signal.pthread_sigmask(signal.SIG_SETMASK, held)  # an alarm held back reaches the handler before here
+            except BaseException:
+                signal.pthread_sigmask(signal.SIG_SETMASK, held)
+                raise
+        before = signal.signal(signal.SIGALRM, during)
+    except BaseException:
+        give_back()
+        raise
     try:
         yield
     finally:
         live = False
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, before)
-        if back is not None:
-            signal.setitimer(signal.ITIMER_REAL, max(back[0] - (time.monotonic() - armed), 0.001), back[1])
+        give_back()
 
 
 @contextlib.contextmanager
@@ -258,6 +274,42 @@ class OverdueAlarmTests(unittest.TestCase):
         stack.enter_context(own_alarm(lambda signum, frame: fired.append(time.monotonic())))
         return fired
 
+    def alone(self):
+        """Skips a check whose alarm this thread must hold back where another thread runs: Linux then gives the alarm
+        to that thread, and its handler runs here all the same. Threads the threading module does not know of (a C
+        extension's) are counted in /proc/self/task, where this process has one."""
+        others = sorted(thread.name for thread in threading.enumerate() if thread is not threading.current_thread())
+        try:
+            unknown = len(os.listdir('/proc/self/task')) - 1 - len(others)
+        except OSError:
+            unknown = 0
+        if others or unknown > 0:
+            self.skipTest('other threads run here (%s), and would take the alarm this one holds back'
+                          % ', '.join(others + ['%d not started through threading' % unknown] * (unknown > 0)))
+
+    @staticmethod
+    def coming_due_in_the_take(seconds, interval):
+        """A stand-in for signal.setitimer in whose first call (the block's take) a timer of seconds, repeating every
+        interval, first comes due, its alarm held back there, and is then left as the take itself holds it. Returns
+        it, whether that alarm was still held back when the timer was taken, and when the take returned."""
+        real_setitimer, taking, pending, taken = signal.setitimer, [True], [], []
+
+        def take(which, after, every=0):
+            if not taking:
+                return real_setitimer(which, after, every)
+            del taking[:]
+            held = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+            try:
+                real_setitimer(which, seconds, interval)
+                time.sleep(seconds + 0.02)  # it comes due, its alarm held back here
+                pending.append(signal.SIGALRM in signal.sigpending())
+                was = real_setitimer(which, after, every)
+                taken.append(time.monotonic())
+                return was
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, held)  # held back still only if the take holds it
+        return take, pending, taken
+
     def test_the_alarm_gives_back_a_timer_already_running(self):
         fired = self.watchdog()
         handler = signal.getsignal(signal.SIGALRM)
@@ -296,6 +348,8 @@ class OverdueAlarmTests(unittest.TestCase):
         names = ('test_the_alarm_gives_back_a_timer_already_running', 'test_the_alarm_has_the_timer_to_itself',
                  'test_the_alarm_gives_back_a_moment_to_a_timer_it_turned_off_in_its_last_microsecond',
                  'test_the_alarm_gives_back_the_next_period_of_a_timer_whose_alarm_came_as_it_was_taken',
+                 'test_the_alarm_puts_the_mask_back_after_a_handler_before_that_raised_as_the_timer_was_taken',
+                 'test_the_alarm_gives_back_the_timer_should_the_blocks_handler_be_refused',
                  'test_the_alarm_gives_back_what_was_left_or_at_least_a_moment',
                  'test_the_alarm_gives_back_the_handler_before_the_timer', 'test_an_alarm_that_comes_as_the_timer_is_taken_reaches_the_handler_before',
                  'test_the_alarm_gives_back_the_timer_after_a_block_that_raised',
@@ -327,20 +381,26 @@ class OverdueAlarmTests(unittest.TestCase):
         # before it fires: with no alarm of it held back, it is given back a moment, with its interval. No timer can be
         # made to wait in its last microsecond, so getitimer() and setitimer() are faked here: a one-shot read with time
         # left that the take finds with none, and a repeating one read and taken so. One read and taken as no timer at
-        # all is none, and gets nothing.
+        # all is none, and gets nothing. With its alarm held back as it is taken (sigpending() faked too, so that no
+        # alarm needs to stay with this thread, where other threads run), a repeating one gets its next period, and a
+        # one-shot, spent, nothing.
         self.watchdog()
-        for read, taken, given in (((1e-05, 0.0), (0.0, 0.0), [(0.001, 0.0)]), ((0.0, 0.5), (0.0, 0.5), [(0.001, 0.5)]),
-                                   ((0.0, 0.0), (0.0, 0.0), [])):
-            with self.subTest(read=read, taken=taken):
+        for read, taken, held, given in (((1e-05, 0.0), (0.0, 0.0), False, [(0.001, 0.0)]), ((0.0, 0.5), (0.0, 0.5), False, [(0.001, 0.5)]),
+                                         ((0.0, 0.0), (0.0, 0.0), False, []), ((0.0, 0.5), (0.0, 0.5), True, [(0.5, 0.5)]),
+                                         ((1e-05, 0.0), (0.0, 0.0), True, [])):
+            with self.subTest(read=read, taken=taken, held=held):
                 calls = []
 
                 def reading(which):
                     return read
 
                 def taking(which, seconds, interval=0):
-                    calls.append((seconds, interval))
+                    calls.append((seconds if seconds < 0.01 else round(seconds, 2), interval))  # a moment exactly, a period less the take
                     return taken if len(calls) == 1 else (0.0, 0.0)
-                with patch.object(signal, 'getitimer', reading), patch.object(signal, 'setitimer', taking):
+
+                def pending():
+                    return {signal.SIGALRM} if held else set()
+                with patch.object(signal, 'getitimer', reading), patch.object(signal, 'setitimer', taking), patch.object(signal, 'sigpending', pending):
                     with own_alarm(lambda signum, frame: None):
                         pass
                 self.assertEqual([(0, 0), (0, 0)] + given, calls, 'turned off, off again, then given back at once with its interval')
@@ -349,30 +409,113 @@ class OverdueAlarmTests(unittest.TestCase):
         # A repeating timer comes due just as the block takes it (made to, inside the take's own call, its alarm held
         # back there and then left as the take holds it): Linux reads it as nothing left, only its interval, as one
         # turned off in its last microsecond, but its alarm has come and goes to the handler before the block, so what
-        # is left of it is its next period, not a moment.
+        # is left of it is its next period, not a moment. So too where that handler raises (a harness's timeout, say),
+        # which keeps the block from starting: the timer is given back all the same, and the mask put back.
         fired, inside = self.watchdog(), []
-        real_setitimer, taking = signal.setitimer, [True]
+        self.alone()
+        handler, mask = signal.getsignal(signal.SIGALRM), signal.pthread_sigmask(signal.SIG_BLOCK, ())
+        self.addCleanup(signal.signal, signal.SIGALRM, handler)
 
-        def take(which, seconds, interval=0):
-            if not taking:
-                return real_setitimer(which, seconds, interval)
-            del taking[:]
-            held = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
-            try:
-                real_setitimer(which, 0.001, 0.5)
-                time.sleep(0.02)  # it comes due, its alarm held back here
-                return real_setitimer(which, seconds, interval)
-            finally:
-                signal.pthread_sigmask(signal.SIG_SETMASK, held)  # held back still only if the take holds it
-        with patch.object(signal, 'setitimer', take):
-            with own_alarm(lambda signum, frame: inside.append(time.monotonic())):
+        class Raised(Exception):
+            pass
+
+        def raising(signum, frame):
+            fired.append(time.monotonic())
+            if len(fired) == 1:
+                raise Raised('synthetic: the handler before the block')
+        for before in (handler, raising):
+            with self.subTest('its handler raises' if before is raising else 'its handler records it'):
+                del fired[:], inside[:]
+                take, pending, taken = self.coming_due_in_the_take(0.001, 0.5)
+                ran = []
+                signal.signal(signal.SIGALRM, before)
+                try:
+                    with patch.object(signal, 'setitimer', take):
+                        with own_alarm(lambda signum, frame: inside.append(time.monotonic())):
+                            ran.append(True)
+                except Raised:
+                    pass
+                left, interval = signal.getitimer(signal.ITIMER_REAL)
+                since = time.monotonic() - taken[0] if taken else 0
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, handler)
+                self.assertEqual([True], pending, 'its alarm was not held back in the take')
+                self.assertEqual([] if before is raising else [True], ran, 'the block ran though the handler before raised, or did not run')
+                self.assertEqual([], inside, "its alarm went to the block's handler")
+                self.assertEqual(1, len(fired), 'its alarm did not reach the handler before the block, once')
+                # What is left of it and the time since it was taken add up to its period, whatever stalls the run (a
+                # moment would add up to a few milliseconds).
+                self.assertGreater(left + since, 0.45, 'given back %.5f s, %.5f s after it was taken: not its next period' % (left, since))
+                self.assertEqual(0.5, interval)
+                self.assertEqual(mask, signal.pthread_sigmask(signal.SIG_BLOCK, ()), 'the mask was not put back')
+
+    def test_the_alarm_puts_the_mask_back_after_a_handler_before_that_raised_as_the_timer_was_taken(self):
+        # The handler before the block raises (a harness's timeout, say) as its alarm comes while the take holds
+        # SIGALRM back: CPython runs it inside the call that blocks SIGALRM, once the mask has changed, or, where
+        # another thread took the alarm, at the entry of the call that puts the mask back, before it has (both made to
+        # happen here). The mask is put back all the same, so that later alarms still reach this thread, and the timer
+        # around the block runs on as it was, or is given back what was left of it.
+        fired = self.watchdog()
+        handler, mask, real_mask = signal.getsignal(signal.SIGALRM), signal.pthread_sigmask(signal.SIG_BLOCK, ()), signal.pthread_sigmask
+        self.addCleanup(real_mask, signal.SIG_SETMASK, mask)  # should a check below leave SIGALRM blocked
+
+        class Raised(Exception):
+            pass
+
+        def raising(signum, frame):
+            raise Raised('synthetic: the handler before the block')
+        for where in ('blocking it', 'putting it back'):
+            with self.subTest(where):
+                tripping = [True]
+
+                def tripped(how, signals):
+                    if where == 'putting it back' and how == signal.SIG_SETMASK and tripping:
+                        del tripping[:]
+                        signal.getsignal(signal.SIGALRM)(signal.SIGALRM, None)  # at its entry: the mask not yet put back
+                    was = real_mask(how, signals)
+                    if where == 'blocking it' and how == signal.SIG_BLOCK and signal.SIGALRM in set(signals) and tripping:
+                        del tripping[:]
+                        signal.getsignal(signal.SIGALRM)(signal.SIGALRM, None)  # as CPython does once the mask has changed
+                    return was
+                armed = time.monotonic()
+                signal.setitimer(signal.ITIMER_REAL, 600, 300)
+                signal.signal(signal.SIGALRM, raising)
+                try:
+                    with patch.object(signal, 'pthread_sigmask', tripped), self.assertRaises(Raised):
+                        with own_alarm(lambda signum, frame: None):
+                            pass
+                finally:
+                    signal.signal(signal.SIGALRM, handler)
+                self.assertEqual([], tripping, 'the handler before was never made to run')
+                self.assertEqual(mask, real_mask(signal.SIG_BLOCK, ()), 'the mask was not put back')
+                left, interval = signal.getitimer(signal.ITIMER_REAL)
+                self.assertLess(abs(left - (600 - (time.monotonic() - armed))), 0.05, 'the timer around the block did not run on, or was not given back')
+                self.assertEqual(300, interval)
+        self.assertEqual([], fired)
+
+    def test_the_alarm_gives_back_the_timer_should_the_blocks_handler_be_refused(self):
+        # signal.signal() refuses the block's handler in a subinterpreter's main thread, which the test for the main
+        # thread lets through (made to refuse here): the timer has been taken by then, and is given back.
+        fired = self.watchdog()
+        handler = signal.getsignal(signal.SIGALRM)
+        armed = time.monotonic()
+        signal.setitimer(signal.ITIMER_REAL, 600, 300)
+        real_signal, refusing = signal.signal, [True]
+
+        def refused(signum, handler):
+            if refusing:
+                del refusing[:]
+                raise ValueError('signal only works in main thread of the main interpreter (synthetic)')
+            return real_signal(signum, handler)
+        with patch.object(signal, 'signal', refused), self.assertRaises(ValueError):
+            with own_alarm(lambda signum, frame: None):
                 pass
+        self.assertEqual([], refusing, 'the handler was never refused')
         left, interval = signal.getitimer(signal.ITIMER_REAL)
-        self.assertEqual([], taking, 'the timer was never taken')
-        self.assertEqual([], inside, "its alarm went to the block's handler")
-        self.assertEqual(1, len(fired), 'its alarm did not reach the handler before the block, once')
-        self.assertGreater(left, 0.4, 'given back %.5f s, not its next period' % left)
-        self.assertEqual(0.5, interval)
+        self.assertLess(abs(left - (600 - (time.monotonic() - armed))), 0.05, 'the timer was not given back')
+        self.assertEqual(300, interval)
+        self.assertIs(handler, signal.getsignal(signal.SIGALRM))
+        self.assertEqual([], fired)
 
     def test_an_alarm_due_as_the_block_ends_cuts_nothing_short(self):
         # The block's alarm comes due just as its timer is turned off (raised here as that call returns): it goes
@@ -420,42 +563,52 @@ class OverdueAlarmTests(unittest.TestCase):
     def test_the_alarm_gives_back_the_handler_before_the_timer(self):
         self.watchdog()
         signal.setitimer(signal.ITIMER_REAL, 5)
-        calls, real_signal, real_setitimer = [], signal.signal, signal.setitimer
+        calls, real_signal, real_setitimer, real_mask = [], signal.signal, signal.setitimer, signal.pthread_sigmask
+
+        def held():  # whether this thread holds SIGALRM back
+            return signal.SIGALRM in real_mask(signal.SIG_BLOCK, ())
 
         def recorded_signal(signum, handler):
-            calls.append(('handler', handler))
+            calls.append(('handler', handler, held()))
             return real_signal(signum, handler)
 
         def recorded_setitimer(which, seconds, interval=0):
-            calls.append(('timer', round(seconds)))
+            calls.append(('timer', round(seconds), held()))
             return real_setitimer(which, seconds, interval)
         before = signal.getsignal(signal.SIGALRM)
         with patch.object(signal, 'signal', recorded_signal), patch.object(signal, 'setitimer', recorded_setitimer):
             with overdue_alarm(60):
-                # The timer is taken before the block's handler goes in, so that an alarm of it that has just come
-                # reaches the handler before the block.
-                self.assertEqual(['timer', 'handler'], [kind for kind, _ in calls[:2]], "the block's handler went in before the timer was taken")
+                # The timer is taken, with SIGALRM held back, before the block's handler goes in, with the mask put
+                # back, so that an alarm of it that has just come reaches the handler before the block.
+                self.assertEqual([('timer', True), ('handler', False)], [(kind, blocked) for kind, _, blocked in calls[:2]],
+                                 "the timer was not taken with SIGALRM held back, or the block's handler went in before it, or before the mask was back")
                 del calls[:]  # what was done to set it up
-        self.assertEqual([('timer', 0), ('handler', before), ('timer', 5)], calls)
+        self.assertEqual([('timer', 0, False), ('handler', before, False), ('timer', 5, False)], calls)
 
     def test_an_alarm_that_comes_as_the_timer_is_taken_reaches_the_handler_before(self):
-        # An alarm of the timer around the block comes just as the block takes that timer (made to come here, inside
-        # the take's call): it goes to the handler before the block, not to the block's.
+        # An alarm of a one-shot timer around the block comes just as the block takes that timer (made to come here,
+        # inside the take's call, where the take holds it back): it goes to the handler before the block, not to the
+        # block's, once, and the timer, spent, gets nothing back.
         fired, inside = self.watchdog(), []
-        real_setitimer, taking = signal.setitimer, [True]
+        self.alone()
+        real_setitimer, taking, pending = signal.setitimer, [True], []
 
         def take(which, seconds, interval=0):
             if taking:
                 del taking[:]
                 real_setitimer(which, 1e-06)
-                time.sleep(0.005)  # it comes due, and is held back or not as the take finds it
+                time.sleep(0.005)  # it comes due, held back as the take holds it
+                pending.append(signal.SIGALRM in signal.sigpending())
             return real_setitimer(which, seconds, interval)
         with patch.object(signal, 'setitimer', take):
             with own_alarm(lambda signum, frame: inside.append(time.monotonic())):
                 time.sleep(0.005)
-        self.assertEqual([], taking, 'the timer was never taken')
+        self.assertEqual([True], pending, 'the take did not hold its alarm back')
         self.assertEqual([], inside, "it went to the block's handler")
         self.assertEqual(1, len(fired), 'it did not reach the handler before the block, once')
+        self.assertEqual((0.0, 0.0), signal.getitimer(signal.ITIMER_REAL), 'the spent one-shot was given time back')
+        time.sleep(0.02)
+        self.assertEqual(1, len(fired), 'the spent one-shot fired again after the block')
 
     def test_the_alarm_gives_back_the_timer_after_a_block_that_raised(self):
         # The structural check fails by an exception from main(), its own alarm's Overdue among them: a watchdog
@@ -502,7 +655,12 @@ class OverdueAlarmTests(unittest.TestCase):
     def test_the_alarm_comes_again_while_the_block_unwinds(self):
         # main() catches the first alarm, or waits for what it started while it unwinds: the next one ends it.
         self.watchdog()
-        release = threading.Event()
+        release, running = threading.Event(), set(threading.enumerate())
+
+        def ended():  # and their threads with them, so that none runs on into a check whose alarm this thread holds back
+            for thread in set(threading.enumerate()) - running:
+                thread.join(10)
+        self.addCleanup(ended)
         self.addCleanup(release.set)  # the waits it started end after the check
 
         def caught():
