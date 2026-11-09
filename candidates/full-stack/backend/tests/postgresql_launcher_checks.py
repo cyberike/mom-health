@@ -33,7 +33,8 @@ among them, are skipped, and no cleanup signals a process that /proc names:
 /proc's PIDs are not theirs there. The other checks need only POSIX, except
 five that read /proc and are skipped without it (the environment,
 working-directory and title checks of the cleanup and the memory-maps check,
-Linux; the runuser step check, Linux, root and runuser) and one skipped
+Linux; the runuser step check, Linux, root and runuser), most of the one that
+reads a pidfd's fdinfo, skipped without pidfds or /proc, and one skipped
 without ctypes (a Ctrl-C just as the exit begins). The checks that need no
 server also run under the first complete interpreter of every other CPython 3
 version installed in /usr/bin or /usr/local/bin (before 3.13, communicate()
@@ -127,6 +128,14 @@ class Popen(subprocess.Popen):
 subprocess.Popen = Popen
 sys.argv = sys.argv[3:]
 runpy.run_path(launcher, run_name='__main__')
+'''
+# Runs the launcher as on a Python without os.pidfd_open (before 3.9): it then decides with signal 0 whether the
+# postmaster has ended, and looks it up by its command line where /proc is an ancestor PID namespace's.
+WITHOUT_PIDFDS = r'''
+import os, runpy, sys
+vars(os).pop('pidfd_open', None)
+sys.argv = sys.argv[1:]
+runpy.run_path(sys.argv[0], run_name='__main__')
 '''
 # The launcher failing before its first status line: find_bindir() fails in one of two ways, or (usage) the
 # arguments are wrong, or (interrupt) a Ctrl-C arrives in find_bindir(), before main() installs its handlers.
@@ -412,13 +421,24 @@ def effective_capabilities():
         return 0
 
 
+def pidfds_work():
+    """Whether pidfds work here: os.pidfd_open exists (Python 3.9 or later) and the kernel opens one (Linux 5.3 or
+    later, and no seccomp filter refusing it)."""
+    try:
+        os.close(os.pidfd_open(os.getpid()))
+    except (AttributeError, OSError):
+        return False
+    return True
+
+
 def in_pid_namespace(numbers=(), hide=False):
     """(prefix, None): the prefix that runs a command as root in a PID namespace of its own on its parent's /proc
     (unshare --pid without --mount-proc; sh, which does not exec a command that is not its last, stays its init),
     without the capabilities numbered, and with hide on a /proc mounted with hidepid=ptraceable first (see
     hiding_processes()); or (None, why not), where that cannot be done here (it needs root, unshare and
     CAP_SYS_ADMIN). With --kill-child, killing unshare (as finish() and end() do after a failed check) kills that
-    init, and with it every process of the namespace, so none of them keeps the command's output open. The init
+    init, and with it every process of the namespace, so none of them keeps the command's output open (finish(),
+    given the copy's fixtures, first gives its server SIGQUIT, so that it removes its System V segment). The init
     first moves the namespace's next PIDs to far_pid(), where it may (a read-only /proc/sys refuses it), so that
     they name no process in the parent's /proc: the namespace's own low PIDs would (its postmaster's is 23, which a
     kernel thread can hold there)."""
@@ -440,16 +460,23 @@ def in_pid_namespace(numbers=(), hide=False):
 
 
 def far_pid():
-    """Where a new PID namespace should count its PIDs from, so that its processes take PIDs that name no process in
-    this /proc (right after a boot, the low PIDs here are kernel threads): the first PID, from halfway round the space
-    of PIDs after the last one given here (they wrap past the highest to 300), whose next 500 PIDs name no process
-    here; or None where /proc/sys/kernel does not tell, or no such PID is found."""
+    """Where a new PID namespace should count its PIDs from, so that its processes take PIDs that name no process or
+    thread in this /proc (right after a boot, the low PIDs here are kernel threads; /proc/<n> also resolves for a
+    thread's ID, which /proc does not list): the first of the PIDs tried, 997 apart from halfway round the space of
+    PIDs after the last one given here (they wrap past the highest to 300), whose next 500 PIDs name nothing here; or
+    None where /proc/sys/kernel does not tell, or none of those does."""
     try:
         last = int(Path('/proc/sys/kernel/ns_last_pid').read_text())
         top = int(Path('/proc/sys/kernel/pid_max').read_text())
     except (OSError, ValueError):
         return None
-    taken = {int(entry.name) for entry in Path('/proc').glob('[0-9]*')}
+    taken = set()
+    for entry in Path('/proc').glob('[0-9]*'):
+        taken.add(int(entry.name))
+        try:
+            taken.update(int(task.name) for task in (entry / 'task').iterdir() if task.name.isdigit())
+        except OSError:  # gone meanwhile
+            pass
     span = top - 300
     for step in range(0, span, 997):
         start = 300 + (last - 300 + span // 2 + step) % span
@@ -472,13 +499,14 @@ def unmapped(paths):
 
 def proc_of_another_pid_namespace():
     """Whether /proc belongs to another PID namespace than this process's: an ancestor's (as under unshare --pid
-    without --mount-proc), whose /proc/self names another process, or a child's or sibling's, which shows processes
-    but no /proc/self (as after nsenter --mount into a container). Its PIDs are then not the ones this process's
-    children have. Without a /proc at all, False."""
+    without --mount-proc), whose /proc/self names another process, or a child's or sibling's, which has no
+    /proc/self (as after nsenter --mount into a container), whatever processes it shows: none, where that namespace
+    has ended, or only some, where it hides the others (hidepid). Its PIDs are then not the ones this process's
+    children have. Without a /proc at all (nothing, or no procfs, mounted there), False."""
     try:
         return os.readlink('/proc/self') != str(os.getpid())
-    except OSError:
-        return os.path.isdir('/proc/1')
+    except OSError:  # a procfs has /proc/sys, unless mounted with subset=pid, which still lists the processes it shows
+        return os.path.isdir('/proc/sys') or any(Path('/proc').glob('[0-9]*'))
 
 
 FOREIGN_PROC = proc_of_another_pid_namespace()
@@ -525,10 +553,13 @@ def ended(path, timeout=10):
         time.sleep(0.05)
 
 
-def remove_copy(root):
-    """Stop anything still running from a private copy (only after a failed check), then remove it. Where /proc is
-    another PID namespace's, its PIDs would name other processes here, so none is signalled."""
-    for signum in (signal.SIGQUIT, signal.SIGKILL) if not FOREIGN_PROC else ():
+def stop_naming(root, signums=None):
+    """Stop what still runs from a private copy (only after a failed check): each signal in turn (SIGQUIT, then
+    SIGKILL, unless signums says otherwise) to every process that names it, waiting up to 10 s after each until none
+    does. A postmaster ends at once on SIGQUIT and removes its System V segment itself. Where /proc is another PID
+    namespace's, its PIDs would name other processes here, so none is signalled."""
+    signums = (signal.SIGQUIT, signal.SIGKILL) if signums is None else signums
+    for signum in signums if not FOREIGN_PROC else ():
         for pid in processes_naming(root):
             try:
                 os.kill(int(pid), signum)
@@ -537,6 +568,11 @@ def remove_copy(root):
         deadline = time.monotonic() + 10
         while processes_naming(root) and time.monotonic() < deadline:
             time.sleep(0.1)
+
+
+def remove_copy(root):
+    """Stop anything still running from a private copy (see stop_naming()), then remove it."""
+    stop_naming(root)
     shutil.rmtree(root, ignore_errors=True)
 
 
@@ -582,12 +618,19 @@ def read_until(lines, prefix, seen):
     return None
 
 
-def finish(process, timeout=180):
+def finish(process, timeout=180, servers=None):
     """Wait for the launcher, then return the rest of its output. The rest is read through the same
-    buffered streams the checks read lines from (communicate() would skip what they buffered)."""
+    buffered streams the checks read lines from (communicate() would skip what they buffered). After timeout
+    seconds the launcher is killed. With servers, a private copy's fixtures directory, what names it (the
+    postmaster names its data directory) first gets SIGQUIT and up to 10 s to end (see stop_naming()): under
+    in_pid_namespace()'s prefix, the kill takes every process of the namespace with it, and a postmaster killed
+    so would leave its System V segment. The launcher is not signalled first: there it is the only child of the
+    namespace's init, which ends with it, and with that init every process of the namespace."""
     try:
         process.wait(timeout)
     except subprocess.TimeoutExpired:
+        if servers is not None:
+            stop_naming(servers, (signal.SIGQUIT,))
         process.kill()
         process.wait()
     output = process.stdout.read() if process.stdout else ''
@@ -800,27 +843,44 @@ class CleanupHelperTests(unittest.TestCase):
         gone = subprocess.Popen([sys.executable, '-c', 'pass'])
         gone.wait()  # and reaped: a postmaster already gone
         read_bytes, readlink, glob = Path.read_bytes, os.readlink, Path.glob
+        real_pidfd_open, opened = getattr(os, 'pidfd_open', None), {}  # opened: {pidfd: the PID it was opened for}
         everything = ('cmdline', 'environ', 'cwd')
 
-        def proc(entries, own=None):
-            """/proc/<pid>/ for each pid in entries ({pid: (refused, missing[, command line])}): the reads of the entries
-            in refused are refused (PermissionError), and those in missing fail as for no such process
-            (FileNotFoundError); the rest show the postmaster of this data directory, or the command line given.
-            /proc/self names own (this process's PID, unless this /proc is another PID namespace's). Reads elsewhere
-            are real."""
+        def proc(entries, own=None, shown=None, pid_line=True):
+            """/proc/<pid>/ for each pid in entries ({pid: (refused, missing[, command line[, exiting]])}): the reads of
+            the entries in refused are refused (PermissionError), those in missing fail as for no such process
+            (FileNotFoundError), and those in exiting as for a process whose exit is under way (ProcessLookupError: its
+            memory, and with it its environment, is gone already); the rest show the postmaster of this data directory,
+            or the command line given. /proc/self names own (this process's PID, unless this /proc is another PID
+            namespace's). The fdinfo of a pidfd opened here gives on its Pid: line the PID that shown gives its process
+            (as an ancestor's /proc numbers it), or else its own, and has no Pid: line without pid_line (as before Linux
+            5.5). Reads elsewhere are real."""
             contents = {'cmdline': b'postgres\0-D\0%s\0' % str(data).encode(), 'environ': b'PGDATA=%s\0' % str(data).encode(),
                         'cwd': str(data)}
 
+            def fdinfo(descriptor, real):
+                pid, text = opened[descriptor], real()
+                if pid_line and pid not in (shown or {}):
+                    return text
+                text = b''.join(line for line in text.splitlines(keepends=True) if not line.startswith((b'Pid:', b'NSpid:')))
+                return text + (b'Pid:\t%d\nNSpid:\t%d\t%d\n' % (shown[pid], shown[pid], pid) if pid_line else b'')
+
             def faked(path, real):
-                pid, _, name = str(path)[len('/proc/'):].partition('/') if str(path).startswith('/proc/') else ('', '', '')
+                text = str(path)
+                if text.startswith('/proc/self/fdinfo/') and text.rsplit('/', 1)[1].isdigit() and int(text.rsplit('/', 1)[1]) in opened:
+                    return fdinfo(int(text.rsplit('/', 1)[1]), real)
+                pid, _, name = text[len('/proc/'):].partition('/') if text.startswith('/proc/') else ('', '', '')
                 if not pid.isdigit() or int(pid) not in entries or not name:
                     return real()
-                refused, missing, *command = entries[int(pid)]
+                entry = entries[int(pid)]
+                refused, missing, command, exiting = entry + (None, ())[len(entry) - 2:]
                 if name in missing:
                     raise FileNotFoundError(2, 'No such file or directory (synthetic)')
+                if name in exiting:
+                    raise ProcessLookupError(errno.ESRCH, 'No such process (synthetic: its exit is under way)')
                 if name in refused:
                     raise PermissionError(13, 'Permission denied (synthetic)')
-                return command[0] if command and name == 'cmdline' else contents[name]
+                return command if command is not None and name == 'cmdline' else contents[name]
             def listed(path, pattern, *arguments, **options):  # the faked entries are listed first, whatever /proc this is
                 real = list(glob(path, pattern, *arguments, **options))
                 return [Path('/proc/%d' % pid) for pid in entries if Path('/proc/%d' % pid) not in real] + real if str(path) == '/proc' else real
@@ -831,22 +891,47 @@ class CleanupHelperTests(unittest.TestCase):
                 own or str(os.getpid())) if str(path) == '/proc/self' else faked(path, lambda: readlink(path, *arguments, **options))))
             return stack
 
-        def no_pidfds(pid):
+        def recording(pid, *arguments):
+            descriptor = real_pidfd_open(pid, *arguments)
+            opened[descriptor] = pid
+            return descriptor
+
+        def no_pidfds(pid, *arguments):
             raise OSError(errno.ENOSYS, 'Function not implemented (synthetic)')
-        # Each case runs with pidfds, where this system has them, and as on a system without (signal 0 alone).
-        modes = (('', contextlib.nullcontext), (' (without pidfds)', lambda: patch.object(launcher.os, 'pidfd_open', no_pidfds, create=True)))
+
+        @contextlib.contextmanager
+        def no_pidfd_open():  # as on Python before 3.9
+            saved = vars(launcher.os).pop('pidfd_open', None)
+            try:
+                yield
+            finally:
+                if saved is not None:
+                    launcher.os.pidfd_open = saved
+        # Each case runs with pidfds, where this system has them, whose fdinfo has a Pid: line (Linux 5.5 or later) or
+        # not (Linux 5.3 and 5.4), and as on a system without pidfds: refused (an older kernel, or a seccomp filter), or
+        # with no os.pidfd_open at all (Python before 3.9). Without pidfds, signal 0 decides whether a process has ended.
+        # (suffix, the pidfds, whether their fdinfo has a Pid: line, whether pidfds work then)
+        works = pidfds_work()
+        with_pidfds = lambda: patch.object(launcher.os, 'pidfd_open', recording) if real_pidfd_open else contextlib.nullcontext()
+        modes = (('', with_pidfds, True, works), (' (pidfds whose fdinfo has no Pid: line)', with_pidfds, False, works),
+                 (' (without pidfds)', lambda: patch.object(launcher.os, 'pidfd_open', no_pidfds, create=True), False, False),
+                 (' (without os.pidfd_open)', no_pidfd_open, False, False))
         real_ended = launcher.ended
 
-        def dies_after_the_first_check(process):
-            """ended() as the launcher has it, but the process is killed and reaped as soon as the first call has
-            returned: a postmaster that dies just after server_unseen() first saw it running."""
+        def dies_after_the_first_check(process, reaped=True):
+            """ended() as the launcher has it, but the process is killed as soon as the first call has returned, then
+            reaped, or left a zombie (exited, not reaped yet): a postmaster that dies just after server_unseen() first
+            saw it running."""
             calls = []
 
             def ending(pid):
                 answer = real_ended(pid)
                 if not calls:
                     process.kill()
-                    process.wait()
+                    if reaped:
+                        process.wait()
+                    else:
+                        os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOWAIT)
                 calls.append(answer)
                 return answer
             return patch.object(launcher, 'ended', ending)
@@ -870,70 +955,204 @@ class CleanupHelperTests(unittest.TestCase):
                  ('gone just after its environment was read', live, (), ('cwd',), None),
                  ('environment refused, then gone', live, ('environ',), ('cwd',), None))
         # This /proc is an ancestor PID namespace's: postmaster.pid's PID is not the postmaster's there (each case
-        # shows it as no process, unless it says otherwise), and the postmaster is looked up by its command line
-        # instead. A second child stands for it there.
+        # shows it as no process, unless it says otherwise). The postmaster's PID there is read from its pidfd's fdinfo,
+        # which here gives the second child's PID, or, without that, the postmaster is looked up by its command line;
+        # that second child stands for it there. (case, postmaster, entries there, said where its PID there is read from
+        # its pidfd, said where it is looked up by its command line)
         there = child()
         other = str(os.getpid() + 1000003)
         decoy = os.getpid() + 1000005  # a PID that only the faked /proc lists
-        foreign = (("a /proc of another PID namespace, the postmaster found there", live, {there.pid: ((), ())}, None),
+        foreign = (("a /proc of another PID namespace, the postmaster found there", live, {there.pid: ((), ())}, None, None),
                    ('a /proc of another PID namespace, its environment and working directory refused there', live,
-                    {there.pid: (('environ', 'cwd'), ())}, 'a program the server started'),
-                   ('a /proc of another PID namespace that hides the server', live, {there.pid: ((), everything)}, 'hidden in /proc'),
+                    {there.pid: (('environ', 'cwd'), ())}, 'a program the server started', 'a program the server started'),
+                   ('a /proc of another PID namespace that hides the server', live, {there.pid: ((), everything)},
+                    'hidden in /proc', 'hidden in /proc'),
                    # Nothing there names the data directory any more, as in a real run.
-                   ('a /proc of another PID namespace, the server already gone', gone, {}, None),
+                   ('a /proc of another PID namespace, the server already gone', gone, {}, None, None),
                    # The server is gone, so whatever still names its data directory there is not looked at.
                    ('a /proc of another PID namespace, the server already gone, its data directory still named there', gone,
-                    {there.pid: (('environ', 'cwd'), ())}, None),
+                    {there.pid: (('environ', 'cwd'), ())}, None, None),
                    # Only an argument that is the data directory names it: a path inside it does not.
                    ('a /proc of another PID namespace, a process there naming a path inside the data directory', live,
-                    {decoy: (('environ', 'cwd'), (), b'tail\0%s/pg_wal\0' % str(data).encode()), there.pid: ((), ())}, None))
+                    {decoy: (('environ', 'cwd'), (), b'tail\0%s/pg_wal\0' % str(data).encode()), there.pid: ((), ())}, None, None),
+                   # Early in its exit, before it is a zombie, its command line reads empty and its environment is gone:
+                   # read through its pidfd it has ended, but the lookup by command line does not find it.
+                   ('a /proc of another PID namespace, the server exiting there', live, {there.pid: ((), (), b'', ('environ',))},
+                    None, 'hidden in /proc'))
         with patch.object(launcher.os.path, 'isdir', lambda path: path == '/proc/self'):  # as on Linux
             self.assertIsNone(launcher.server_unseen(info), 'no server runs, so there is nothing to miss')
-            for suffix, pidfds in modes:
+            for suffix, pidfds, pid_line, working in modes:
                 for case, postmaster, refused, missing, said in cases:
                     with self.subTest(case + suffix):
                         (data / 'postmaster.pid').write_text('%d\n%s\n' % (postmaster.pid, data))
-                        with proc({postmaster.pid: (refused, missing)}), pidfds():
+                        with proc({postmaster.pid: (refused, missing)}, pid_line=pid_line), pidfds():
                             assertSays(said, launcher.server_unseen(info))
-                for case, postmaster, entries, said in foreign:
+                for case, postmaster, entries, read, looked_up in foreign:
                     with self.subTest(case + suffix):
                         (data / 'postmaster.pid').write_text('%d\n%s\n' % (postmaster.pid, data))
-                        with proc({postmaster.pid: ((), everything), **entries}, own=other), pidfds():
-                            assertSays(said, launcher.server_unseen(info))
+                        with proc({postmaster.pid: ((), everything), **entries}, own=other, shown={postmaster.pid: there.pid},
+                                  pid_line=pid_line), pidfds():
+                            assertSays(read if working and pid_line else looked_up, launcher.server_unseen(info))
                 with self.subTest("a /proc of another PID namespace, postmaster.pid's PID another process there" + suffix):
                     # That process (live, shown as it is) is not the postmaster, which /proc hides there.
                     (data / 'postmaster.pid').write_text('%d\n%s\n' % (live.pid, data))
-                    with proc({there.pid: ((), everything)}, own=other), pidfds():
+                    with proc({there.pid: ((), everything)}, own=other, shown={live.pid: there.pid}, pid_line=pid_line), pidfds():
                         assertSays('hidden in /proc', launcher.server_unseen(info))
-                for case, own in (('gone just before its command line was read', None),
-                                  ('a /proc of another PID namespace, the server gone just before it was looked up there', other)):
+                # A zombie still answers signal 0, and shows no command line: its pidfd tells that it has ended. Without
+                # pidfds it gets the line that its /proc gives a running server, here the hidden one.
+                for case, own, reaped in (('gone just before its command line was read', None, True),
+                                          ('a zombie just before its command line was read', None, False),
+                                          ('a /proc of another PID namespace, the server gone just before it was looked up there', other, True),
+                                          ('a /proc of another PID namespace, the server a zombie just before it was looked up there', other, False)):
                     with self.subTest(case + suffix):
+                        if not reaped and not hasattr(os, 'waitid'):
+                            self.skipTest('needs os.waitid, to leave a zombie')
                         dying = child()
                         (data / 'postmaster.pid').write_text('%d\n%s\n' % (dying.pid, data))
-                        with proc({dying.pid: ((), everything)}, own=own), pidfds(), dies_after_the_first_check(dying):
-                            assertSays(None, launcher.server_unseen(info))
-            # A zombie still answers signal 0, and an ancestor's /proc shows it with no command line: its pidfd tells.
-            with self.subTest('a /proc of another PID namespace, the server a zombie'):
-                if not hasattr(os, 'pidfd_open') or not hasattr(os, 'waitid'):
-                    self.skipTest('needs pidfds (Linux 5.3 or later)')
-                zombie = subprocess.Popen([sys.executable, '-c', 'pass'])
-                self.addCleanup(zombie.wait)
-                os.waitid(os.P_PID, zombie.pid, os.WEXITED | os.WNOWAIT)  # it has exited, and is not reaped yet
-                (data / 'postmaster.pid').write_text('%d\n%s\n' % (zombie.pid, data))
-                with proc({zombie.pid: ((), everything)}, own=other):
-                    assertSays(None, launcher.server_unseen(info))
+                        with proc({dying.pid: ((), everything)}, own=own, pid_line=pid_line), pidfds(), \
+                                dies_after_the_first_check(dying, reaped):
+                            assertSays(None if reaped or working else 'hidden in /proc', launcher.server_unseen(info))
+                # Another account's zombie refuses its environment and working directory, as its running process did: the
+                # last look, after those reads, tells that it has ended. Without pidfds, the Docker-set line.
+                for case, own in (("both refused, then a zombie before the last look", None),
+                                  ('a /proc of another PID namespace, both refused there, then a zombie before the last look', other)):
+                    with self.subTest(case + suffix):
+                        if not hasattr(os, 'waitid'):
+                            self.skipTest('needs os.waitid, to leave a zombie')
+                        dying = child()
+                        (data / 'postmaster.pid').write_text('%d\n%s\n' % (dying.pid, data))
+                        entries = ({dying.pid: (('environ', 'cwd'), ())} if own is None else
+                                   {dying.pid: ((), everything), there.pid: (('environ', 'cwd'), ())})
+                        with proc(entries, own=own, shown={dying.pid: there.pid}, pid_line=pid_line), pidfds(), \
+                                dies_after_the_first_check(dying, reaped=False):
+                            assertSays(None if working else 'a program the server started', launcher.server_unseen(info))
+                with self.subTest('a /proc of another PID namespace, the server a zombie' + suffix):
+                    if not hasattr(os, 'waitid'):
+                        self.skipTest('needs os.waitid, to leave a zombie')
+                    zombie = subprocess.Popen([sys.executable, '-c', 'pass'])
+                    self.addCleanup(zombie.wait)
+                    os.waitid(os.P_PID, zombie.pid, os.WEXITED | os.WNOWAIT)  # it has exited, and is not reaped yet
+                    (data / 'postmaster.pid').write_text('%d\n%s\n' % (zombie.pid, data))
+                    with proc({zombie.pid: ((), everything)}, own=other, pid_line=pid_line), pidfds():
+                        assertSays(None if working else 'hidden in /proc', launcher.server_unseen(info))
             kill = os.kill
 
             def refused(pid, signum):  # as for root without CAP_KILL: another account's process may not be signalled
                 if pid == live.pid:
                     raise PermissionError(1, 'Operation not permitted (synthetic)')
                 return kill(pid, signum)
-            with self.subTest('hidden, and signal 0 to it refused (without pidfds)'):
-                (data / 'postmaster.pid').write_text('%d\n%s\n' % (live.pid, data))
-                with proc({live.pid: ((), everything)}), modes[1][1](), patch.object(launcher.os, 'kill', refused):
-                    self.assertIn('hidden in /proc', launcher.server_unseen(info) or '', 'a running postmaster was taken for gone')
+            for suffix, pidfds, _, _ in modes[2:]:
+                with self.subTest('hidden, and signal 0 to it refused' + suffix):
+                    (data / 'postmaster.pid').write_text('%d\n%s\n' % (live.pid, data))
+                    with proc({live.pid: ((), everything)}), pidfds(), patch.object(launcher.os, 'kill', refused):
+                        self.assertIn('hidden in /proc', launcher.server_unseen(info) or '', 'a running postmaster was taken for gone')
         with patch.object(launcher.os.path, 'isdir', lambda path: False):  # no /proc
             self.assertIn('no /proc here', launcher.server_unseen(info) or '')
+
+    def test_the_pid_that_proc_gives_a_process_is_read_from_its_pidfd(self):
+        process = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()'], stdin=subprocess.PIPE)
+        self.addCleanup(process.wait)
+        self.addCleanup(process.stdin.close)
+        gone = subprocess.Popen([sys.executable, '-c', 'pass'])
+        gone.wait()
+
+        def no_pidfds(pid, *arguments):
+            raise OSError(errno.ENOSYS, 'Function not implemented (synthetic)')
+        with patch.object(launcher.os, 'pidfd_open', no_pidfds, create=True):
+            self.assertIsNone(launcher.pid_in_proc(process.pid), 'without pidfds')
+        saved = vars(launcher.os).pop('pidfd_open', None)  # as on Python before 3.9
+        try:
+            self.assertIsNone(launcher.pid_in_proc(process.pid), 'without os.pidfd_open')
+        finally:
+            if saved is not None:
+                launcher.os.pidfd_open = saved
+        if not pidfds_work() or not os.path.exists('/proc/self/fdinfo'):
+            self.skipTest('needs pidfds (Linux 5.3 or later) and /proc')
+        self.assertIsNone(launcher.pid_in_proc(gone.pid), 'a process already reaped')
+        if not FOREIGN_PROC:  # on another PID namespace's /proc, the child has another PID
+            descriptor = os.pidfd_open(process.pid)
+            real = Path('/proc/self/fdinfo/%d' % descriptor).read_bytes()
+            os.close(descriptor)
+            # This process's own PID namespace's /proc numbers the child as this process does (from Linux 5.5).
+            self.assertEqual(process.pid if b'\nPid:' in b'\n' + real else None, launcher.pid_in_proc(process.pid), real)
+        read_bytes = Path.read_bytes
+        before = sorted(os.listdir('/proc/self/fd'))
+        for fdinfo, number in ((b'pos:\t0\nflags:\t02000002\nmnt_id:\t15\nino:\t1057\nPid:\t4321\nNSpid:\t4321\t7\n', 4321),
+                               (b'pos:\t0\nflags:\t02000002\nmnt_id:\t15\nino:\t1057\nPid:\t-1\nNSpid:\t-1\n', None),  # reaped meanwhile
+                               (b'pos:\t0\nflags:\t02000002\nmnt_id:\t15\nino:\t1057\nPid:\t0\nNSpid:\t0\n', None),  # not in this /proc
+                               (b'pos:\t0\nflags:\t02000002\nmnt_id:\t15\n', None),  # Linux 5.3 and 5.4
+                               (None, None)):  # unreadable
+            with self.subTest(fdinfo=fdinfo):
+                def faked(path, fdinfo=fdinfo):
+                    if str(path).startswith('/proc/self/fdinfo/'):
+                        if fdinfo is None:
+                            raise PermissionError(13, 'Permission denied (synthetic)')
+                        return fdinfo
+                    return read_bytes(path)
+                with patch.object(Path, 'read_bytes', faked):
+                    self.assertEqual(number, launcher.pid_in_proc(process.pid))
+        self.assertEqual(before, sorted(os.listdir('/proc/self/fd')), 'a pidfd was left open')
+
+    def test_the_checks_tell_a_proc_of_another_pid_namespace(self):
+        # What FOREIGN_PROC rests on, with /proc faked: (its /proc/self, whether it has /proc/sys, the PIDs it lists).
+        readlink, isdir, glob = os.readlink, os.path.isdir, Path.glob
+        layouts = (("this process's own", str(os.getpid()), True, [1, os.getpid()], False),
+                   ("an ancestor PID namespace's: its /proc/self names another process", str(os.getpid() + 1000003), True, [1], True),
+                   ("a child or sibling PID namespace's, as after nsenter --mount", None, True, [1, 7], True),
+                   ('such a /proc mounted with hidepid=invisible: only some of its processes listed, PID 1 not', None, True, [4], True),
+                   ("a PID namespace's that has ended: nothing listed", None, True, [], True),
+                   ('a procfs mounted with subset=pid, which has no /proc/sys', None, False, [4], True),
+                   ('no procfs at /proc (nothing mounted there, or a tmpfs)', None, False, [], False))
+        for case, link, sysctl, listed, foreign in layouts:
+            with self.subTest(case):
+                def faked_readlink(path, *arguments, **options):
+                    if str(path) != '/proc/self':
+                        return readlink(path, *arguments, **options)
+                    if link is None:
+                        raise FileNotFoundError(2, 'No such file or directory (synthetic)')
+                    return link
+
+                def faked_isdir(path):
+                    return sysctl if str(path) == '/proc/sys' else int(str(path)[len('/proc/'):]) in listed if re.fullmatch(r'/proc/\d+', str(path)) else isdir(path)
+
+                def faked_glob(path, pattern, *arguments, **options):
+                    return [Path('/proc/%d' % pid) for pid in listed] if str(path) == '/proc' else glob(path, pattern, *arguments, **options)
+                with patch.object(os, 'readlink', faked_readlink), patch.object(os.path, 'isdir', faked_isdir), patch.object(Path, 'glob', faked_glob):
+                    self.assertIs(foreign, proc_of_another_pid_namespace())
+
+    def test_far_pid_takes_a_start_whose_next_500_pids_name_no_process_or_thread(self):
+        # /proc/sys/kernel and /proc faked: ns_last_pid 1000 and pid_max 32768 make 17234 the first PID tried (halfway
+        # round from 1000 over 300..32767), then every 997th after it.
+        read_text, glob, iterdir = Path.read_text, Path.glob, Path.iterdir
+        kernel = {'/proc/sys/kernel/ns_last_pid': '1000\n', '/proc/sys/kernel/pid_max': '32768\n'}
+        layouts = (('nothing listed', {}, 17234),
+                   ('a process among the next 500', {17241: [17241]}, 18231),
+                   ('a thread among them, of a process listed elsewhere (/proc lists no thread)', {5: [5, 17241]}, 18231),
+                   ('a process right after them', {17735: [17735]}, 17234),
+                   ('a process gone before its threads were listed', {17241: OSError}, 18231),
+                   ('no /proc/sys/kernel to tell', None, None))
+        for case, processes, start in layouts:
+            with self.subTest(case):
+                def faked_text(path, *arguments, **options):
+                    if str(path) in kernel:
+                        if processes is None:
+                            raise FileNotFoundError(2, 'No such file or directory (synthetic)')
+                        return kernel[str(path)]
+                    return read_text(path, *arguments, **options)
+
+                def faked_glob(path, pattern, *arguments, **options):
+                    return [Path('/proc/%d' % pid) for pid in processes or {}] if str(path) == '/proc' else glob(path, pattern, *arguments, **options)
+
+                def faked_iterdir(path):
+                    match = re.fullmatch(r'/proc/(\d+)/task', str(path))
+                    if not match:
+                        return iterdir(path)
+                    threads = processes[int(match.group(1))]
+                    if threads is OSError:
+                        raise FileNotFoundError(2, 'No such file or directory (synthetic)')
+                    return iter([path / str(thread) for thread in threads])
+                with patch.object(Path, 'read_text', faked_text), patch.object(Path, 'glob', faked_glob), patch.object(Path, 'iterdir', faked_iterdir):
+                    self.assertEqual(start, far_pid())
 
     @unittest.skipUnless(os.path.exists('/proc/self/maps'), 'needs Linux /proc')
     def test_the_checks_read_memory_maps_whose_paths_are_not_text(self):
@@ -1682,19 +1901,25 @@ class LauncherChecks(unittest.TestCase):
 
     def test_a_proc_of_another_pid_namespace_brings_the_true_status_line(self):
         # The launcher in a PID namespace of its own on the parent's /proc (unshare --pid without --mount-proc), sh its
-        # init: postmaster.pid's PID is not the postmaster's in that /proc, and the launcher looks the postmaster up
-        # there by its command line. The command prints whether that PID names any process in that /proc.
-        cases = (('with this process\'s capabilities', [], False, None),
-                 ("in Docker's default capability set", outside_dockers_default(), False, UNSEEN),
-                 ("in Docker's default set, on a /proc with hidepid=ptraceable", outside_dockers_default(), True, HIDDEN))
-        for name, drop, hide, said in cases:
+        # init: postmaster.pid's PID is not the postmaster's in that /proc. The launcher reads the postmaster's PID there
+        # from its pidfd's fdinfo, or, without pidfds (as on Python before 3.9), looks it up there by its command line.
+        # The command prints whether postmaster.pid's PID names any process in that /proc.
+        cases = (('with this process\'s capabilities', [], False, None, False),
+                 ('with this process\'s capabilities, without pidfds', [], False, None, True),
+                 ("in Docker's default capability set", outside_dockers_default(), False, UNSEEN, False),
+                 ("in Docker's default set, on a /proc with hidepid=ptraceable", outside_dockers_default(), True, HIDDEN, False))
+        for name, drop, hide, said, without_pidfds in cases:
             with self.subTest(name):
                 prefix, why_not = in_pid_namespace(drop, hide)
                 if why_not:
                     self.skipTest(why_not)
                 root, script, fixtures = private_copy(self)
-                process = self.launch(script, NAMES_A_PROCESS, prefix=prefix)
-                output, errors = finish(process)
+                wrapper = []
+                if without_pidfds:
+                    wrapper = [str(root / 'without_pidfds.py')]
+                    Path(wrapper[0]).write_text(WITHOUT_PIDFDS)
+                process = self.launch(script, NAMES_A_PROCESS, prefix=prefix, wrapper=wrapper)
+                output, errors = finish(process, servers=fixtures)
                 sockets = next((line.rsplit(': ', 1)[1] for line in errors.splitlines() if line.startswith(SOCKETS)), None)
                 if sockets:
                     self.addCleanup(shutil.rmtree, sockets, ignore_errors=True)
@@ -1703,8 +1928,8 @@ class LauncherChecks(unittest.TestCase):
                 for line in (UNSEEN, HIDDEN):
                     (self.assertIn if line == said else self.assertNotIn)(line, errors)
                 if not drop and output.strip() != 'False':
-                    # Where that PID names some process here too, a launcher that did not look the postmaster up would
-                    # read that process instead, and might well print nothing either.
+                    # Where that PID names some process here too, a launcher that read that PID there instead of the
+                    # postmaster's would read that process, and might well print nothing either.
                     self.skipTest("postmaster.pid's PID names a process in this /proc as well")
 
     @unittest.skipUnless(shutil.which('ipcrm'), 'needs ipcrm, to remove the shared memory segment that a killed postmaster leaves')

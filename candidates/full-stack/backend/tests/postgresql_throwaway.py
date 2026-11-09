@@ -407,6 +407,23 @@ def ended(pid):
         os.close(descriptor)
 
 
+def pid_in_proc(pid):
+    """The PID that /proc gives the process with this PID (as this process's own PID namespace numbers it), from the
+    Pid: line of its pidfd's fdinfo, which numbers it as the /proc read does (Linux 5.5 or later), however that
+    process's command line reads; or None where pidfds or that line are missing, or the process has ended (the line
+    then says -1)."""
+    try:
+        descriptor = os.pidfd_open(pid)
+    except (AttributeError, OSError):  # no pidfds here, or no such process any more
+        return None
+    try:
+        fdinfo = read_or(Path.read_bytes, Path('/proc/self/fdinfo/%d' % descriptor), b'')
+    finally:
+        os.close(descriptor)
+    number = next((line[len(b'Pid:'):].strip() for line in fdinfo.splitlines() if line.startswith(b'Pid:')), b'')
+    return int(number) if number.isdigit() and int(number) > 0 else None
+
+
 def server_unseen(info):
     """What leftover_processes() cannot see here once the server runs, for main() to say, or None. Without a
     /proc that shows this process (none is mounted, or a child or sibling PID namespace's is), or where /proc
@@ -417,9 +434,13 @@ def server_unseen(info):
     PROGRAM, archive_command), which it can find only through one of those two. None does not mean that every
     such program is found (see leftover_processes()). Where /proc belongs to an ancestor's PID namespace (as
     under unshare --pid without --mount-proc), postmaster.pid's PID names another process there, or none, so
-    the postmaster is looked up there by its command line, which names the data directory. A postmaster that has
-    ended (exited, or a zombie, whose command line is empty: see ended()) is nothing to miss, also where it ends
-    while it is looked at: None."""
+    the postmaster's PID there is read from its pidfd (see pid_in_proc()); where that cannot be read, the
+    postmaster is looked up there by its command line, which names the data directory. A postmaster that has
+    ended (exited, or a zombie: see ended()) is nothing to miss: None, also where it ends while it is looked at,
+    unless ended() cannot tell yet when it is last asked (the exit is still under way, or pidfds are missing and it
+    is a zombie). It then gets the line that its /proc gave while it ran, where that hides it or refuses its reads
+    anyway; and the hidden line where it is looked up by its command line, which reads empty from early in an
+    exit."""
     if not os.path.isdir('/proc/self'):
         return ("no /proc here that shows this process (none, or another PID namespace's), so the cleanup cannot see "
                 'whether any process still uses the cluster')
@@ -430,9 +451,11 @@ def server_unseen(info):
     if ended(pid):  # the server is already gone (pidfds and signal 0 take this process's own PID namespace's PIDs)
         return None
     if read_or(os.readlink, '/proc/self', None) != str(os.getpid()):  # this /proc is an ancestor PID namespace's
-        named = info['data'].encode()
-        postmaster = next((int(entry.name) for entry in Path('/proc').glob('[0-9]*')
-                           if named in read_or(Path.read_bytes, entry / 'cmdline', b'').split(b'\0')), None)
+        postmaster = pid_in_proc(pid)
+        if postmaster is None:  # no pidfds, or their fdinfo has no Pid: line (before Linux 5.5), or it has ended
+            named = info['data'].encode()
+            postmaster = next((int(entry.name) for entry in Path('/proc').glob('[0-9]*')
+                               if named in read_or(Path.read_bytes, entry / 'cmdline', b'').split(b'\0')), None)
     if postmaster is None or read_or(Path.read_bytes, Path('/proc/%d/cmdline' % postmaster), None) is None:
         if ended(pid):  # it ended meanwhile
             return None
@@ -441,9 +464,9 @@ def server_unseen(info):
     try:
         environment = can_read(Path.read_bytes, Path('/proc/%d/environ' % postmaster))
         working_directory = can_read(os.readlink, '/proc/%d/cwd' % postmaster)
-    except OSError:  # the server is already gone
+    except OSError:  # the server is already gone, or is exiting (its memory released: no environment to read)
         return None
-    if environment or working_directory:
+    if environment or working_directory or ended(pid):  # ended meanwhile: another account's zombie refuses both reads
         return None
     return ("the server account's environments and working directories are not readable here (root without "
             "CAP_SYS_PTRACE, as in Docker's default capability set?), so the cleanup cannot find a program the server "
