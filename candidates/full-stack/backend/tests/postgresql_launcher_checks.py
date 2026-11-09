@@ -499,14 +499,15 @@ def unmapped(paths):
 
 def proc_of_another_pid_namespace():
     """Whether /proc belongs to another PID namespace than this process's: an ancestor's (as under unshare --pid
-    without --mount-proc), whose /proc/self names another process, or a child's or sibling's, which has no
-    /proc/self (as after nsenter --mount into a container), whatever processes it shows: none, where that namespace
-    has ended, or only some, where it hides the others (hidepid). Its PIDs are then not the ones this process's
-    children have. Without a /proc at all (nothing, or no procfs, mounted there), False."""
+    without --mount-proc), whose /proc/self names another process, or a child's or sibling's (as after nsenter --mount
+    into a container), whose /proc/self is there but names no process, whatever processes it shows: none, where that
+    namespace has ended, or only some, where it hides the others (hidepid). Its PIDs are then not the ones this
+    process's children have. Without a procfs at /proc (nothing, or a tmpfs, mounted there), which has no /proc/self at
+    all, False."""
     try:
         return os.readlink('/proc/self') != str(os.getpid())
-    except OSError:  # a procfs has /proc/sys, unless mounted with subset=pid, which still lists the processes it shows
-        return os.path.isdir('/proc/sys') or any(Path('/proc').glob('[0-9]*'))
+    except OSError:  # every procfs has its self link (mounted with subset=pid too), which here names no process
+        return os.path.lexists('/proc/self')
 
 
 FOREIGN_PROC = proc_of_another_pid_namespace()
@@ -624,8 +625,9 @@ def finish(process, timeout=180, servers=None):
     seconds the launcher is killed. With servers, a private copy's fixtures directory, what names it (the
     postmaster names its data directory) first gets SIGQUIT and up to 10 s to end (see stop_naming()): under
     in_pid_namespace()'s prefix, the kill takes every process of the namespace with it, and a postmaster killed
-    so would leave its System V segment. The launcher is not signalled first: there it is the only child of the
-    namespace's init, which ends with it, and with that init every process of the namespace."""
+    so would leave its System V segment. The launcher is not signalled first: the namespace's init (sh) exits as soon
+    as the launcher does, and its end takes every process of the namespace with it, the postmaster among them (pg_ctl
+    leaves the postmaster to that init)."""
     try:
         process.wait(timeout)
     except subprocess.TimeoutExpired:
@@ -853,15 +855,21 @@ class CleanupHelperTests(unittest.TestCase):
             memory, and with it its environment, is gone already); the rest show the postmaster of this data directory,
             or the command line given. /proc/self names own (this process's PID, unless this /proc is another PID
             namespace's). The fdinfo of a pidfd opened here gives on its Pid: line the PID that shown gives its process
-            (as an ancestor's /proc numbers it), or else its own, and has no Pid: line without pid_line (as before Linux
-            5.5). Reads elsewhere are real."""
+            (as an ancestor's /proc numbers it), or else its own, and has no Pid: line without pid_line (an fdinfo
+            that this code cannot read the line from). Where it is faked, the real one is read only for its other
+            lines, if there is one to read (there is no /proc/self where none is mounted, or another PID namespace's
+            is). Reads elsewhere are real."""
             contents = {'cmdline': b'postgres\0-D\0%s\0' % str(data).encode(), 'environ': b'PGDATA=%s\0' % str(data).encode(),
                         'cwd': str(data)}
 
             def fdinfo(descriptor, real):
-                pid, text = opened[descriptor], real()
+                pid = opened[descriptor]
                 if pid_line and pid not in (shown or {}):
-                    return text
+                    return real()
+                try:
+                    text = real()
+                except OSError:  # no /proc/self here: only the lines faked below
+                    text = b''
                 text = b''.join(line for line in text.splitlines(keepends=True) if not line.startswith((b'Pid:', b'NSpid:')))
                 return text + (b'Pid:\t%d\nNSpid:\t%d\t%d\n' % (shown[pid], shown[pid], pid) if pid_line else b'')
 
@@ -907,9 +915,10 @@ class CleanupHelperTests(unittest.TestCase):
             finally:
                 if saved is not None:
                     launcher.os.pidfd_open = saved
-        # Each case runs with pidfds, where this system has them, whose fdinfo has a Pid: line (Linux 5.5 or later) or
-        # not (Linux 5.3 and 5.4), and as on a system without pidfds: refused (an older kernel, or a seccomp filter), or
-        # with no os.pidfd_open at all (Python before 3.9). Without pidfds, signal 0 decides whether a process has ended.
+        # Each case runs with pidfds, where this system has them, whose fdinfo has a Pid: line or not (one that this
+        # code cannot read the line from), and as on a system without pidfds: refused (an older kernel, or a seccomp
+        # filter), or with no os.pidfd_open at all (Python before 3.9). Without pidfds, signal 0 decides whether a
+        # process has ended; the one case about signal 0 itself (the last below) runs only in the two ways without them.
         # (suffix, the pidfds, whether their fdinfo has a Pid: line, whether pidfds work then)
         works = pidfds_work()
         with_pidfds = lambda: patch.object(launcher.os, 'pidfd_open', recording) if real_pidfd_open else contextlib.nullcontext()
@@ -1012,8 +1021,11 @@ class CleanupHelperTests(unittest.TestCase):
                         with proc({dying.pid: ((), everything)}, own=own, pid_line=pid_line), pidfds(), \
                                 dies_after_the_first_check(dying, reaped):
                             assertSays(None if reaped or working else 'hidden in /proc', launcher.server_unseen(info))
-                # Another account's zombie refuses its environment and working directory, as its running process did: the
-                # last look, after those reads, tells that it has ended. Without pidfds, the Docker-set line.
+                # Both reads refused, as while another account's postmaster runs, then a zombie (here it dies first, and
+                # both reads are faked as refused: where root is the host's, its read of such a zombie's environment
+                # fails with ESRCH instead; where root is a user namespace's own, as in a rootless container, both are
+                # refused): the last look, after those reads, tells that it has ended. Without pidfds, the Docker-set
+                # line.
                 for case, own in (("both refused, then a zombie before the last look", None),
                                   ('a /proc of another PID namespace, both refused there, then a zombie before the last look', other)):
                     with self.subTest(case + suffix):
@@ -1073,14 +1085,14 @@ class CleanupHelperTests(unittest.TestCase):
             descriptor = os.pidfd_open(process.pid)
             real = Path('/proc/self/fdinfo/%d' % descriptor).read_bytes()
             os.close(descriptor)
-            # This process's own PID namespace's /proc numbers the child as this process does (from Linux 5.5).
+            # This process's own PID namespace's /proc numbers the child as this process does (where the line is there).
             self.assertEqual(process.pid if b'\nPid:' in b'\n' + real else None, launcher.pid_in_proc(process.pid), real)
         read_bytes = Path.read_bytes
         before = sorted(os.listdir('/proc/self/fd'))
         for fdinfo, number in ((b'pos:\t0\nflags:\t02000002\nmnt_id:\t15\nino:\t1057\nPid:\t4321\nNSpid:\t4321\t7\n', 4321),
                                (b'pos:\t0\nflags:\t02000002\nmnt_id:\t15\nino:\t1057\nPid:\t-1\nNSpid:\t-1\n', None),  # reaped meanwhile
                                (b'pos:\t0\nflags:\t02000002\nmnt_id:\t15\nino:\t1057\nPid:\t0\nNSpid:\t0\n', None),  # not in this /proc
-                               (b'pos:\t0\nflags:\t02000002\nmnt_id:\t15\n', None),  # Linux 5.3 and 5.4
+                               (b'pos:\t0\nflags:\t02000002\nmnt_id:\t15\n', None),  # no Pid: line
                                (None, None)):  # unreadable
             with self.subTest(fdinfo=fdinfo):
                 def faked(path, fdinfo=fdinfo):
@@ -1094,30 +1106,30 @@ class CleanupHelperTests(unittest.TestCase):
         self.assertEqual(before, sorted(os.listdir('/proc/self/fd')), 'a pidfd was left open')
 
     def test_the_checks_tell_a_proc_of_another_pid_namespace(self):
-        # What FOREIGN_PROC rests on, with /proc faked: (its /proc/self, whether it has /proc/sys, the PIDs it lists).
-        readlink, isdir, glob = os.readlink, os.path.isdir, Path.glob
-        layouts = (("this process's own", str(os.getpid()), True, [1, os.getpid()], False),
-                   ("an ancestor PID namespace's: its /proc/self names another process", str(os.getpid() + 1000003), True, [1], True),
-                   ("a child or sibling PID namespace's, as after nsenter --mount", None, True, [1, 7], True),
-                   ('such a /proc mounted with hidepid=invisible: only some of its processes listed, PID 1 not', None, True, [4], True),
-                   ("a PID namespace's that has ended: nothing listed", None, True, [], True),
-                   ('a procfs mounted with subset=pid, which has no /proc/sys', None, False, [4], True),
-                   ('no procfs at /proc (nothing mounted there, or a tmpfs)', None, False, [], False))
-        for case, link, sysctl, listed, foreign in layouts:
+        # What FOREIGN_PROC rests on, with /proc/self faked: what it names (None: the link is there, but readlink fails,
+        # as where it names no process; False: there is no such link), and whether /proc is another namespace's. What
+        # such a /proc lists, and whether it has /proc/sys, does not matter.
+        readlink, lexists = os.readlink, os.path.lexists
+        layouts = (("this process's own", str(os.getpid()), False),
+                   ("an ancestor PID namespace's: its /proc/self names another process", str(os.getpid() + 1000003), True),
+                   ("a child or sibling PID namespace's, as after nsenter --mount", None, True),
+                   ('such a /proc mounted with hidepid=invisible: only some of its processes listed, PID 1 not', None, True),
+                   ("a PID namespace's that has ended: nothing listed", None, True),
+                   ('a procfs mounted with subset=pid, which has no /proc/sys', None, True),
+                   ("an ended PID namespace's procfs mounted with subset=pid: nothing listed, no /proc/sys", None, True),
+                   ('no procfs at /proc (nothing mounted there, or a tmpfs)', False, False))
+        for case, link, foreign in layouts:
             with self.subTest(case):
                 def faked_readlink(path, *arguments, **options):
                     if str(path) != '/proc/self':
                         return readlink(path, *arguments, **options)
-                    if link is None:
+                    if not link:
                         raise FileNotFoundError(2, 'No such file or directory (synthetic)')
                     return link
 
-                def faked_isdir(path):
-                    return sysctl if str(path) == '/proc/sys' else int(str(path)[len('/proc/'):]) in listed if re.fullmatch(r'/proc/\d+', str(path)) else isdir(path)
-
-                def faked_glob(path, pattern, *arguments, **options):
-                    return [Path('/proc/%d' % pid) for pid in listed] if str(path) == '/proc' else glob(path, pattern, *arguments, **options)
-                with patch.object(os, 'readlink', faked_readlink), patch.object(os.path, 'isdir', faked_isdir), patch.object(Path, 'glob', faked_glob):
+                def faked_lexists(path):
+                    return link is not False if str(path) == '/proc/self' else lexists(path)
+                with patch.object(os, 'readlink', faked_readlink), patch.object(os.path, 'lexists', faked_lexists):
                     self.assertIs(foreign, proc_of_another_pid_namespace())
 
     def test_far_pid_takes_a_start_whose_next_500_pids_name_no_process_or_thread(self):

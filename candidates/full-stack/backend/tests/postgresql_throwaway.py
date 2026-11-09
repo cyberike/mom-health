@@ -409,9 +409,10 @@ def ended(pid):
 
 def pid_in_proc(pid):
     """The PID that /proc gives the process with this PID (as this process's own PID namespace numbers it), from the
-    Pid: line of its pidfd's fdinfo, which numbers it as the /proc read does (Linux 5.5 or later), however that
-    process's command line reads; or None where pidfds or that line are missing, or the process has ended (the line
-    then says -1)."""
+    Pid: line of its pidfd's fdinfo, which numbers it as the /proc read does, however that process's command line
+    reads. None where pidfds or that line are missing, where the process has been reaped (no pidfd opens for it, or
+    the line then says -1), or where that /proc's namespace does not hold it (the line says 0). A zombie, which
+    ended() counts as ended, still gets its PID."""
     try:
         descriptor = os.pidfd_open(pid)
     except (AttributeError, OSError):  # no pidfds here, or no such process any more
@@ -452,7 +453,7 @@ def server_unseen(info):
         return None
     if read_or(os.readlink, '/proc/self', None) != str(os.getpid()):  # this /proc is an ancestor PID namespace's
         postmaster = pid_in_proc(pid)
-        if postmaster is None:  # no pidfds, or their fdinfo has no Pid: line (before Linux 5.5), or it has ended
+        if postmaster is None:  # no pidfds, or no Pid: line in their fdinfo, or it has been reaped
             named = info['data'].encode()
             postmaster = next((int(entry.name) for entry in Path('/proc').glob('[0-9]*')
                                if named in read_or(Path.read_bytes, entry / 'cmdline', b'').split(b'\0')), None)
@@ -466,7 +467,8 @@ def server_unseen(info):
         working_directory = can_read(os.readlink, '/proc/%d/cwd' % postmaster)
     except OSError:  # the server is already gone, or is exiting (its memory released: no environment to read)
         return None
-    if environment or working_directory or ended(pid):  # ended meanwhile: another account's zombie refuses both reads
+    # Ended meanwhile, since a read was refused while it ran (for root of a user namespace, a zombie refuses both too).
+    if environment or working_directory or ended(pid):
         return None
     return ("the server account's environments and working directories are not readable here (root without "
             "CAP_SYS_PTRACE, as in Docker's default capability set?), so the cleanup cannot find a program the server "
