@@ -3,13 +3,14 @@
 // Starts ../tests/browser_backend.py as "python" (put the backend's Python
 // environment first on PATH), always on 127.0.0.1, and kills only processes it
 // started. Gives headless Chromium and Playwright a temporary directory of the
-// run's own, and removes it, by its exact path, as the run exits. Not a test file
+// run's own, and removes it, by its exact path, as the run ends. Not a test file
 // by itself.
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const { createInterface } = require("node:readline");
 const path = require("node:path");
+const util = require("node:util");
 
 let chromium = null, unavailable = null;
 try { ({ chromium } = require("playwright")); } catch (error) { unavailable = error.message; }
@@ -33,33 +34,65 @@ function loopbackArgs(mappings = []) {
 // then, passing runs included (most of them empty), and Playwright makes its
 // browser profile and artifacts directories in node's, so the first launch gives
 // both a directory of the run's own under the system's temporary directory: the
-// run removes it as it exits. A run killed outright (SIGKILL) leaves that one
-// directory, with what Chromium and Playwright had in it.
+// run removes it as it ends (see end()). A run killed outright (SIGKILL) leaves
+// that one directory, with what Chromium and Playwright had in it.
 let browserTemp = null;
 function launchOptions(args) {
   if (browserTemp === null) {
     browserTemp = fs.mkdtempSync(path.join(os.tmpdir(), "mom-health-chromium-"));
-    const made = browserTemp;
-    process.on("exit", () => fs.rmSync(made, { recursive: true, force: true }));
-    process.env.TMPDIR = made; // node's os.tmpdir() from now on: Playwright's, and every later backend's
+    process.on("exit", removeBrowserTemp);
+    process.env.TMPDIR = browserTemp; // node's os.tmpdir() from now on: Playwright's, and every later backend's
   }
   return { args, env: { ...process.env, TMPDIR: browserTemp } };
 }
 
+// Removes the run's directory, trying again for up to a second while a browser
+// just killed may still be ending, and never throws: an "exit" listener that
+// throws keeps the ones after it from running.
+function removeBrowserTemp() {
+  const pause = new Int32Array(new SharedArrayBuffer(4));
+  for (let attempt = 1; ; attempt++) {
+    try {
+      fs.rmSync(browserTemp, { recursive: true, force: true });
+      if (!fs.existsSync(browserTemp)) return;
+    } catch (error) {
+      if (attempt >= 40) { console.error("could not remove " + browserTemp + ": " + error.message); return; }
+    }
+    if (attempt >= 40) { console.error("could not remove " + browserTemp + ": it was made again"); return; }
+    Atomics.wait(pause, 0, 0, 25);
+  }
+}
+
 const children = new Set();
 process.on("exit", () => { for (const child of children) child.kill("SIGKILL"); });
-// Ended by Ctrl-C, SIGTERM (timeout) or SIGHUP, a run exits with 128 + that
-// signal's number (what a shell reports for a process the signal ended), so that
-// the "exit" listeners above, and Playwright's, which kills its browsers and
-// removes their directories, still run: node's own ending on such a signal runs
-// none of them.
-for (const name of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(name, () => process.exit(128 + os.constants.signals[name]));
 
-// A failed run exits at once, so that a browser or backend still running (one
-// whose start or launch failed part-way, say) cannot keep it alive.
+// Ends the run with this exit status, or by this signal. The run's directory is
+// removed last, after the "exit" listener that Playwright adds while a browser
+// of its runs or starts, which kills that browser: until then Chromium writes in
+// the directory, and a removal before it could leave the directory behind. Ended
+// by a signal, the run then ends by that signal itself (the signal handled no
+// more), so that what started it sees a run the signal ended: a shell running a
+// script stops there too, as it would not for an exit with status 128 + n.
+function end(status, signal) {
+  if (browserTemp !== null) {
+    process.removeListener("exit", removeBrowserTemp);
+    process.on("exit", removeBrowserTemp);
+  }
+  if (signal) process.on("exit", () => { process.removeAllListeners(signal); process.kill(process.pid, signal); });
+  process.exit(status); // with status 128 + n, should the signal not end it
+}
+
+// Ctrl-C, SIGTERM (timeout) or SIGHUP: node's own ending on such a signal runs
+// no "exit" listener (none of the ones above, nor Playwright's).
+for (const name of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(name, () => end(128 + os.constants.signals[name], name));
+
+// A failed run ends once its error is written in full (process.exit drops what
+// a pipe has not taken yet), or after 10 s, so that a browser or backend still
+// running (one whose start or launch failed part-way, say) cannot keep it alive.
 function failed(error) {
-  console.error(error);
-  process.exit(1);
+  process.exitCode = 1;
+  setTimeout(() => end(1), 10000);
+  process.stderr.write(util.format(error) + "\n", () => end(1));
 }
 
 function withDeadline(promise, ms, label) {

@@ -7,11 +7,14 @@ about 40 ms after its headers (Nagle's algorithm waiting for the client's delaye
 server than the one they stand for. One check times the responses; the other runs main() with every way into Uvicorn's
 server class made to serve nothing, and pins the one Uvicorn server main() starts and the socket it hands that server,
 which no load on the machine can blur. A listening socket or a server other than Uvicorn's that main() also opens is
-not counted; one that keeps main() from returning fails the check after OVERDUE seconds instead of hanging it. Only
-browser_backend's threading.Thread is replaced, though: a thread or process that main() starts another way
+not counted; one that keeps main() from returning fails the check after OVERDUE seconds instead of hanging it (the
+alarm comes again every second until main() has returned, so a main() that waits for what it started as it unwinds,
+as a with ThreadPoolExecutor() block or asyncio.run() around asyncio.to_thread does, fails a second or two later).
+Only browser_backend's threading.Thread is replaced, though: a thread or process that main() starts another way
 (concurrent.futures, asyncio.to_thread, multiprocessing) keeps running after that failure, and keeps the run from
 exiting where it is not a daemon thread. Loopback only, fictional token, a fresh fixture under build/.
 """
+import concurrent.futures
 import contextlib
 import importlib.util
 import io
@@ -37,6 +40,44 @@ class Overdue(SystemExit):
     """main() has not returned in time. A SystemExit, so that neither an except Exception in main() nor asyncio, which
     passes on only SystemExit and KeyboardInterrupt from its tasks and callbacks, swallows it (not a
     KeyboardInterrupt, which uvicorn.run catches)."""
+
+
+def alarms_here():
+    """Whether a SIGALRM timer can be used here: setitimer exists, and this is the main thread (the only one that
+    signals reach)."""
+    return hasattr(signal, 'setitimer') and threading.current_thread() is threading.main_thread()
+
+
+@contextlib.contextmanager
+def own_alarm(handler):
+    """SIGALRM goes to handler for the block. Afterwards the timer is off, the handler before it is back, and then a
+    timer that was running (a watchdog around the whole run, say) gets back what was left of it, at least a moment, so
+    that one due meanwhile still fires: given back after its handler, not before, so that it cannot reach this one."""
+    outer, armed = signal.getitimer(signal.ITIMER_REAL), time.monotonic()
+    before = signal.signal(signal.SIGALRM, handler)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, before)
+        if outer[0]:
+            signal.setitimer(signal.ITIMER_REAL, max(outer[0] - (time.monotonic() - armed), 0.001), outer[1])
+
+
+@contextlib.contextmanager
+def overdue_alarm(seconds=OVERDUE, again=1):
+    """Raises Overdue in the main thread once the block has run for seconds, and again every again seconds until it
+    ends: a block that catches the first one, or waits for what it started while it unwinds, still ends. Nothing
+    where alarms cannot be used (see alarms_here())."""
+    if not alarms_here():
+        yield
+        return
+
+    def overdue(signum, frame):
+        raise Overdue('main() had not returned after %g s: something it started still runs inside this check' % seconds)
+    with own_alarm(overdue):
+        signal.setitimer(signal.ITIMER_REAL, seconds, again)
+        yield
 
 
 def read_response(connection, pending=b''):
@@ -125,36 +166,17 @@ class BrowserBackendTimingTests(unittest.TestCase):
             def join(self, timeout=None):
                 pass
         handlers = types.SimpleNamespace(signal=lambda *arguments: None, SIGTERM=signal.SIGTERM, SIGINT=signal.SIGINT)
-
-        def overdue(signum, frame):
-            raise Overdue('main() had not returned after %d s: something it started still runs inside this check' % OVERDUE)
-        alarm = hasattr(signal, 'setitimer') and threading.current_thread() is threading.main_thread()
-        if alarm:
-            # A timer already running (a watchdog around the whole run, say) is given back what was left of it, at least
-            # a moment, so that one due meanwhile still fires. Cleanups run last in, first out: this timer off, the
-            # handler back, then that timer.
-            outer, armed = signal.getitimer(signal.ITIMER_REAL), time.monotonic()
-
-            def give_back():
-                if outer[0]:
-                    signal.setitimer(signal.ITIMER_REAL, max(outer[0] - (time.monotonic() - armed), 0.001), outer[1])
-            self.addCleanup(give_back)
-            self.addCleanup(signal.signal, signal.SIGALRM, signal.signal(signal.SIGALRM, overdue))
-            self.addCleanup(signal.setitimer, signal.ITIMER_REAL, 0)
-            signal.setitimer(signal.ITIMER_REAL, OVERDUE)
+        # The alarm is set last, so that it is off again before anything else is undone.
         try:
             with patch.object(server_class, '__init__', counted), patch.object(server_class, 'run', recorded), \
                     patch.object(server_class, 'serve', recorded_async), patch.object(server_class, 'startup', recorded_async), \
                     patch.object(server_class, 'main_loop', idle), patch.object(server_class, 'shutdown', idle), \
                     patch.object(backend, 'threading', types.SimpleNamespace(Thread=Thread)), patch.object(backend, 'signal', handlers), \
                     patch.object(backend.sys, 'argv', ['browser_backend.py']), patch.object(backend.sys, 'stdin', io.StringIO('')), \
-                    contextlib.redirect_stdout(io.StringIO()):
+                    contextlib.redirect_stdout(io.StringIO()), overdue_alarm():
                 backend.main()
         except Overdue as late:
             self.fail(str(late))
-        finally:
-            if alarm:
-                signal.setitimer(signal.ITIMER_REAL, 0)
         self.assertEqual(1, len(servers), 'main() started %d servers' % len(servers))
         self.assertEqual(1, len(served), served)
         self.assertEqual(socket.IPPROTO_TCP, served[0].proto, 'asyncio sets TCP_NODELAY only on an IPPROTO_TCP socket')
@@ -191,25 +213,110 @@ class OverdueAlarmTests(unittest.TestCase):
         for task in tasks:  # the task keeps the alarm too: taken from it, so that asyncio does not log it as never retrieved
             self.assertIsInstance(task.exception(), Overdue)
 
-    @unittest.skipUnless(hasattr(signal, 'setitimer'), 'needs setitimer')
-    def test_the_alarm_gives_back_a_timer_already_running(self):
-        if threading.current_thread() is not threading.main_thread():
-            self.skipTest('signals reach only the main thread')
-        fired = []
+    def watchdog(self):
+        """A stand-in for a watchdog around the whole run, which records when it fires: its handler for the test, and a
+        real one already running given back afterwards (own_alarm())."""
+        if not hasattr(signal, 'setitimer') or threading.current_thread() is not threading.main_thread():
+            self.skipTest('needs setitimer, in the main thread (signals reach only that)')
+        fired, stack = [], contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(own_alarm(lambda signum, frame: fired.append(time.monotonic())))
+        return fired
 
-        def watchdog(signum, frame):
-            fired.append(signum)
-        self.addCleanup(signal.signal, signal.SIGALRM, signal.signal(signal.SIGALRM, watchdog))
-        self.addCleanup(signal.setitimer, signal.ITIMER_REAL, 0)
-        signal.setitimer(signal.ITIMER_REAL, 600, 300)  # a watchdog around the whole run, repeating
+    def test_the_alarm_gives_back_a_timer_already_running(self):
+        fired = self.watchdog()
+        handler = signal.getsignal(signal.SIGALRM)
+        armed = time.monotonic()
+        signal.setitimer(signal.ITIMER_REAL, 600, 300)  # repeating
         result = unittest.TestResult()
         BrowserBackendTimingTests('test_main_serves_on_an_ipproto_tcp_socket_on_loopback').run(result)
         self.assertEqual([], result.errors + result.failures, 'the structural check itself failed')
         left, interval = signal.getitimer(signal.ITIMER_REAL)
-        self.assertGreater(left, 500, 'the watchdog was not given back what was left of it')
+        self.assertLess(abs(left - (600 - (time.monotonic() - armed))), 0.05, 'the watchdog was not given back what was left of it')
         self.assertEqual(300, interval, "the watchdog's interval was not given back")
-        self.assertIs(watchdog, signal.getsignal(signal.SIGALRM), "the watchdog's handler was not given back")
+        self.assertIs(handler, signal.getsignal(signal.SIGALRM), "the watchdog's handler was not given back")
         self.assertEqual([], fired)
+
+    def test_these_checks_give_back_a_watchdog_around_them(self):
+        fired = self.watchdog()
+        armed = time.monotonic()
+        signal.setitimer(signal.ITIMER_REAL, 600)
+        result = unittest.TestResult()
+        for name in ('test_the_alarm_gives_back_what_was_left_or_at_least_a_moment', 'test_the_alarm_gives_back_the_handler_before_the_timer',
+                     'test_the_alarm_comes_again_while_the_block_unwinds'):
+            OverdueAlarmTests(name).run(result)
+        self.assertEqual([], result.errors + result.failures, 'a check failed')
+        self.assertEqual(3, result.testsRun)
+        left = signal.getitimer(signal.ITIMER_REAL)[0]
+        self.assertLess(abs(left - (600 - (time.monotonic() - armed))), 0.05, 'the watchdog was not given back what was left of it')
+        self.assertEqual([], fired)
+
+    def test_the_alarm_gives_back_what_was_left_or_at_least_a_moment(self):
+        fired = self.watchdog()
+        armed = time.monotonic()
+        signal.setitimer(signal.ITIMER_REAL, 5)
+        with overdue_alarm(60):
+            time.sleep(0.3)
+        left = signal.getitimer(signal.ITIMER_REAL)[0]
+        self.assertLess(abs(left - (5 - (time.monotonic() - armed))), 0.05, 'not given back what was left of it, %.3f s' % left)
+        # One due while the block ran fires as soon as it has ended.
+        signal.setitimer(signal.ITIMER_REAL, 0.05)
+        with overdue_alarm(60):
+            time.sleep(0.3)
+        ended = time.monotonic()
+        while not fired and time.monotonic() - ended < 1:
+            time.sleep(0.01)
+        self.assertTrue(fired, 'a watchdog due while the block ran never fired')
+        self.assertLess(fired[0] - ended, 0.5)
+
+    def test_the_alarm_gives_back_the_handler_before_the_timer(self):
+        self.watchdog()
+        signal.setitimer(signal.ITIMER_REAL, 5)
+        calls, real_signal, real_setitimer = [], signal.signal, signal.setitimer
+
+        def recorded_signal(signum, handler):
+            calls.append(('handler', handler))
+            return real_signal(signum, handler)
+
+        def recorded_setitimer(which, seconds, interval=0):
+            calls.append(('timer', round(seconds)))
+            return real_setitimer(which, seconds, interval)
+        before = signal.getsignal(signal.SIGALRM)
+        with patch.object(signal, 'signal', recorded_signal), patch.object(signal, 'setitimer', recorded_setitimer):
+            with overdue_alarm(60):
+                del calls[:]  # what was done to set it up
+        self.assertEqual([('timer', 0), ('handler', before), ('timer', 5)], calls)
+
+    def test_the_alarm_comes_again_while_the_block_unwinds(self):
+        # main() catches the first alarm, or waits for what it started while it unwinds: the next one ends it.
+        self.watchdog()
+        release = threading.Event()
+        self.addCleanup(release.set)  # the waits it started end after the check
+
+        def caught():
+            try:
+                release.wait(5)
+            except Overdue:
+                release.wait(5)
+
+        def with_an_executor():
+            with concurrent.futures.ThreadPoolExecutor(1) as pool:  # whose exit waits for its worker
+                pool.submit(release.wait, 5).result()
+
+        def with_asyncio_to_thread():
+            async def serving():
+                await asyncio.to_thread(release.wait, 5)
+            asyncio.run(serving())  # which waits for the executor's worker as it ends
+        import asyncio
+        for main in (caught, with_an_executor, with_asyncio_to_thread):
+            with self.subTest(main.__name__):
+                if main is with_asyncio_to_thread and not hasattr(asyncio, 'to_thread'):
+                    self.skipTest('needs asyncio.to_thread (Python 3.9 or later)')
+                started = time.monotonic()
+                with self.assertRaises(Overdue):
+                    with overdue_alarm(0.2, 0.2):
+                        main()
+                self.assertLess(time.monotonic() - started, 2, 'the block ran on after the second alarm')
 
 if __name__ == '__main__':
     unittest.main()
