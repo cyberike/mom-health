@@ -1,9 +1,10 @@
 """Opt-in checks of the throwaway PostgreSQL launcher itself. Fictional data only.
 
-Not collected by ``unittest discover``. The launch checks need Linux and the
-PostgreSQL server binaries; as root, the launcher's server runs as the postgres
-account, and the failed-setup check also runs once as that account without
---run-as. Each launch check runs a private copy of the launcher in a unique
+Not collected by ``unittest discover``. The launch checks need Linux, a procfs
+at /proc and the PostgreSQL server binaries, and are skipped without them; as
+root, the launcher's server runs as the postgres account, and the failed-setup
+check also runs once as that account without --run-as. Each launch check runs
+a private copy of the launcher in a unique
 directory (under build/, deep enough that its socket goes in a private
 directory under /tmp; one layout of the ownership check uses a short copy under
 /tmp, whose socket stays in the cluster), with a small probe command and
@@ -1704,6 +1705,8 @@ class LauncherChecks(unittest.TestCase):
     def setUpClass(cls):
         if FOREIGN_PROC:  # the launch checks compare PIDs that commands print with PIDs that /proc gives
             raise unittest.SkipTest(FOREIGN_PROC_WHY)
+        if not os.path.isdir('/proc/self'):  # no procfs at /proc at all: the launcher's cleanup sees no process there
+            raise unittest.SkipTest('needs Linux /proc: without it the launcher cannot see whether any process still uses the cluster')
 
     def launch(self, *arguments, **options):
         process = launch(*arguments, **options)
