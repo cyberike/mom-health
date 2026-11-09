@@ -7,7 +7,7 @@
 // "python", like integration.test.js):  node browser.test.js
 const assert = require("node:assert/strict");
 const { randomUUID } = require("node:crypto");
-const { requireBrowser, loopbackArgs, launchOptions, startBackend, stopBackend } = require("./browser-support.js");
+const { requireBrowser, loopbackArgs, launchOptions, failed, startBackend, stopBackend } = require("./browser-support.js");
 
 const chromium = requireBrowser();
 // Test constant shared with ../tests/browser_backend.py; never deployed.
@@ -158,10 +158,14 @@ let passed = 0;
 async function check(name, action) { await action(); passed++; console.log("PASS " + name); }
 
 (async () => {
-  browser = await chromium.launch(launchOptions(loopbackArgs()));
-  const empty = await startBackend();
-  const seeded = await startBackend();
+  const backends = [];
   try {
+    // Inside the try, so that a launch or start that fails part-way still closes and stops what did start.
+    browser = await chromium.launch(launchOptions(loopbackArgs()));
+    const empty = await startBackend();
+    backends.push(empty);
+    const seeded = await startBackend();
+    backends.push(seeded);
     const { alpha, bravo } = await seed(seeded);
 
     await check("initial empty state makes no API request and offers only connect or preview", async () => {
@@ -607,8 +611,7 @@ async function check(name, action) { await action(); passed++; console.log("PASS
 
     console.log(passed + " real-browser checks passed. Headless Chromium " + browser.version() + " against a loopback FastAPI/SQLite backend with fictional data; not a phone, other-browser, screen-reader or hosted-deployment validation.");
   } finally {
-    await browser.close();
-    await stopBackend(seeded);
-    await stopBackend(empty);
+    if (browser) await browser.close();
+    for (const backend of backends.reverse()) await stopBackend(backend);
   }
-})().catch(error => { console.error(error); process.exitCode = 1; });
+})().catch(failed);

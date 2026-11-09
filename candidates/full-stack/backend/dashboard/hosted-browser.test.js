@@ -12,7 +12,7 @@
 const assert = require("node:assert/strict");
 const http = require("node:http");
 const { randomUUID } = require("node:crypto");
-const { requireBrowser, loopbackArgs, launchOptions, startBackend, stopBackend } = require("./browser-support.js");
+const { requireBrowser, loopbackArgs, launchOptions, failed, startBackend, stopBackend } = require("./browser-support.js");
 
 const chromium = requireBrowser();
 // Test constants shared with ../tests/browser_backend.py; never deployed.
@@ -129,8 +129,16 @@ async function connected(view) {
 
 async function withHosted(mode, action) {
   const backend = await startBackend({ mode });
-  const browser = await chromium.launch(launchOptions(loopbackArgs([[HOST, backend.port]])));
-  try { await seed(backend, mode); await action(browser, backend); } finally { await browser.close(); await stopBackend(backend); }
+  let browser = null;
+  try {
+    // Inside the try, so that a launch that fails (or is ended by a signal) still stops the backend.
+    browser = await chromium.launch(launchOptions(loopbackArgs([[HOST, backend.port]])));
+    await seed(backend, mode);
+    await action(browser, backend);
+  } finally {
+    if (browser) await browser.close();
+    await stopBackend(backend);
+  }
 }
 
 let passed = 0;
@@ -376,4 +384,4 @@ async function check(name, action) { await action(); passed++; console.log("PASS
   }));
 
   console.log(passed + " hosted real-browser checks passed. Headless Chromium with real Basic sign-in against loopback gateway.py and direct_candidate.py; fictional host, credentials and records. Not TLS, proxy, Railway edge, public-domain or deployment validation.");
-})().catch(error => { console.error(error); process.exitCode = 1; });
+})().catch(failed);

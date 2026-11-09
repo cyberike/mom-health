@@ -7,8 +7,10 @@ about 40 ms after its headers (Nagle's algorithm waiting for the client's delaye
 server than the one they stand for. One check times the responses; the other runs main() with every way into Uvicorn's
 server class made to serve nothing, and pins the one Uvicorn server main() starts and the socket it hands that server,
 which no load on the machine can blur. A listening socket or a server other than Uvicorn's that main() also opens is
-not counted; one that keeps main() from returning fails the check after OVERDUE seconds instead of hanging it.
-Loopback only, fictional token, a fresh fixture under build/.
+not counted; one that keeps main() from returning fails the check after OVERDUE seconds instead of hanging it. Only
+browser_backend's threading.Thread is replaced, though: a thread or process that main() starts another way
+(concurrent.futures, asyncio.to_thread, multiprocessing) keeps running after that failure, and keeps the run from
+exiting where it is not a daemon thread. Loopback only, fictional token, a fresh fixture under build/.
 """
 import contextlib
 import importlib.util
@@ -31,8 +33,10 @@ TOKEN = 'synthetic-browser-token-not-for-deployment-0001'  # the test constant b
 OVERDUE = 20  # seconds; main() returns within about 0.3 s when nothing it starts runs on
 
 
-class Overdue(BaseException):
-    """main() has not returned in time (a BaseException, so that no except Exception in main() swallows it)."""
+class Overdue(SystemExit):
+    """main() has not returned in time. A SystemExit, so that neither an except Exception in main() nor asyncio, which
+    passes on only SystemExit and KeyboardInterrupt from its tasks and callbacks, swallows it (not a
+    KeyboardInterrupt, which uvicorn.run catches)."""
 
 
 def read_response(connection, pending=b''):
@@ -107,8 +111,8 @@ class BrowserBackendTimingTests(unittest.TestCase):
 
         class Thread:
             """Stands in for threading.Thread in browser_backend alone: runs its target at start(), so nothing main()
-            starts (its stdin reader included) outlives the check. A target that never returns (an event loop run
-            forever, a server other than Uvicorn's) would hang the check: the alarm below fails it instead."""
+            starts through it (its stdin reader included) outlives the check. A target that never returns (an event
+            loop run forever, a server other than Uvicorn's) would hang the check: the alarm below fails it instead."""
             def __init__(self, target, args=(), kwargs=None, daemon=None):
                 self.target, self.args, self.kwargs = target, args, kwargs or {}
 
@@ -126,6 +130,15 @@ class BrowserBackendTimingTests(unittest.TestCase):
             raise Overdue('main() had not returned after %d s: something it started still runs inside this check' % OVERDUE)
         alarm = hasattr(signal, 'setitimer') and threading.current_thread() is threading.main_thread()
         if alarm:
+            # A timer already running (a watchdog around the whole run, say) is given back what was left of it, at least
+            # a moment, so that one due meanwhile still fires. Cleanups run last in, first out: this timer off, the
+            # handler back, then that timer.
+            outer, armed = signal.getitimer(signal.ITIMER_REAL), time.monotonic()
+
+            def give_back():
+                if outer[0]:
+                    signal.setitimer(signal.ITIMER_REAL, max(outer[0] - (time.monotonic() - armed), 0.001), outer[1])
+            self.addCleanup(give_back)
             self.addCleanup(signal.signal, signal.SIGALRM, signal.signal(signal.SIGALRM, overdue))
             self.addCleanup(signal.setitimer, signal.ITIMER_REAL, 0)
             signal.setitimer(signal.ITIMER_REAL, OVERDUE)
@@ -146,6 +159,57 @@ class BrowserBackendTimingTests(unittest.TestCase):
         self.assertEqual(1, len(served), served)
         self.assertEqual(socket.IPPROTO_TCP, served[0].proto, 'asyncio sets TCP_NODELAY only on an IPPROTO_TCP socket')
         self.assertEqual('127.0.0.1', served[0].getsockname()[0])
+
+
+class OverdueAlarmTests(unittest.TestCase):
+    """The structural check's alarm, without waiting OVERDUE seconds for it."""
+
+    def test_the_alarm_reaches_main_through_an_event_loop_of_its_own(self):
+        # Where main() runs an event loop, the alarm lands in one of its tasks or callbacks, which keep any other
+        # exception to themselves (logged, or kept in the task), so that the loop and main() would run on.
+        import asyncio
+
+        def overdue():
+            raise Overdue('synthetic: the alarm')
+        tasks = []
+
+        async def in_a_task():
+            async def busy():
+                overdue()
+            tasks.append(asyncio.get_running_loop().create_task(busy()))
+            await asyncio.sleep(2)
+
+        async def in_a_callback():
+            asyncio.get_running_loop().call_soon(overdue)
+            await asyncio.sleep(2)
+        for where in (in_a_task, in_a_callback):
+            with self.subTest(where.__name__):
+                started = time.monotonic()
+                with self.assertRaises(Overdue):
+                    asyncio.run(where())
+                self.assertLess(time.monotonic() - started, 1, 'the loop ran on after the alarm')
+        for task in tasks:  # the task keeps the alarm too: taken from it, so that asyncio does not log it as never retrieved
+            self.assertIsInstance(task.exception(), Overdue)
+
+    @unittest.skipUnless(hasattr(signal, 'setitimer'), 'needs setitimer')
+    def test_the_alarm_gives_back_a_timer_already_running(self):
+        if threading.current_thread() is not threading.main_thread():
+            self.skipTest('signals reach only the main thread')
+        fired = []
+
+        def watchdog(signum, frame):
+            fired.append(signum)
+        self.addCleanup(signal.signal, signal.SIGALRM, signal.signal(signal.SIGALRM, watchdog))
+        self.addCleanup(signal.setitimer, signal.ITIMER_REAL, 0)
+        signal.setitimer(signal.ITIMER_REAL, 600, 300)  # a watchdog around the whole run, repeating
+        result = unittest.TestResult()
+        BrowserBackendTimingTests('test_main_serves_on_an_ipproto_tcp_socket_on_loopback').run(result)
+        self.assertEqual([], result.errors + result.failures, 'the structural check itself failed')
+        left, interval = signal.getitimer(signal.ITIMER_REAL)
+        self.assertGreater(left, 500, 'the watchdog was not given back what was left of it')
+        self.assertEqual(300, interval, "the watchdog's interval was not given back")
+        self.assertIs(watchdog, signal.getsignal(signal.SIGALRM), "the watchdog's handler was not given back")
+        self.assertEqual([], fired)
 
 if __name__ == '__main__':
     unittest.main()
