@@ -632,10 +632,19 @@ class OverdueAlarmTests(unittest.TestCase):
 
     def test_the_alarm_leaves_the_timer_alone_outside_the_main_thread(self):
         # Signals reach only the main thread, so the block's handler could not be put in from another one: refused
-        # there before anything is done, the watchdog left running.
+        # there before anything is done (no call there touches the timer, the mask or a handler), the watchdog left
+        # running.
         fired = self.watchdog()
-        armed, raised = time.monotonic(), []
+        armed, raised, touched = time.monotonic(), [], []
         signal.setitimer(signal.ITIMER_REAL, 600, 300)
+        real = {name: getattr(signal, name) for name in ('setitimer', 'getitimer', 'pthread_sigmask', 'sigpending', 'signal')}
+
+        def recorded(name):
+            def call(*arguments):
+                if threading.current_thread() is not threading.main_thread():
+                    touched.append(name)
+                return real[name](*arguments)
+            return call
 
         def elsewhere():
             try:
@@ -643,10 +652,14 @@ class OverdueAlarmTests(unittest.TestCase):
                     pass
             except ValueError as refused:
                 raised.append(refused)
-        thread = threading.Thread(target=elsewhere)
-        thread.start()
-        thread.join(10)
+        with contextlib.ExitStack() as stack:
+            for name in real:
+                stack.enter_context(patch.object(signal, name, recorded(name)))
+            thread = threading.Thread(target=elsewhere)
+            thread.start()
+            thread.join(10)
         self.assertEqual(1, len(raised), 'not refused outside the main thread')
+        self.assertEqual([], touched, 'the timer, the mask or a handler was touched there before the refusal')
         left, interval = signal.getitimer(signal.ITIMER_REAL)
         self.assertLess(abs(left - (600 - (time.monotonic() - armed))), 0.05, 'the watchdog was turned off')
         self.assertEqual(300, interval)
