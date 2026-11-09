@@ -26,7 +26,9 @@ set, where capsh can drop those (it needs CAP_SETPCAP and /bin/bash), and skips
 them otherwise; the check that a /proc hiding the server's processes is
 reported also needs unshare and CAP_SYS_ADMIN, to mount one with hidepid in a
 mount namespace of its own (Linux 5.8 or later), and the check of a /proc that
-belongs to another PID namespace needs unshare and CAP_SYS_ADMIN too. Run where
+belongs to another PID namespace needs unshare and CAP_SYS_ADMIN too, as does the
+check of what the module takes for another PID namespace's /proc on real
+mounts, each made in a mount namespace of its own (root too). Run where
 /proc is another PID namespace's (its parent's, in a PID namespace of its own
 under unshare --pid without --mount-proc, or one that does not show it at all),
 the checks that compare their processes' PIDs with /proc's, the launch checks
@@ -46,6 +48,7 @@ candidates/full-stack/backend:
 """
 import contextlib
 import errno
+import fnmatch
 import io
 import itertools
 import json
@@ -500,11 +503,11 @@ def unmapped(paths):
 
 def proc_of_another_pid_namespace():
     """Whether /proc belongs to another PID namespace than this process's: an ancestor's (as under unshare --pid
-    without --mount-proc), whose /proc/self names another process, or a child's or sibling's (as after nsenter --mount
-    into a container), whose /proc/self is there but names no process, whatever processes it shows: none, where that
-    namespace has ended, or only some, where it hides the others (hidepid). Its PIDs are then not the ones this
-    process's children have. Without a procfs at /proc (nothing, or a tmpfs, mounted there), which has no /proc/self at
-    all, False."""
+    without --mount-proc), whose /proc/self names this process by another PID (the ancestor's number for it), or a
+    child's or sibling's (as after nsenter --mount into a container), whose /proc/self is there but names no process,
+    whatever processes it shows: none, where that namespace has ended, or only some, where it hides the others
+    (hidepid). Its PIDs are then not the ones this process's children have. Without a procfs at /proc (nothing, or a
+    tmpfs, mounted there), which has no /proc/self at all, False."""
     try:
         return os.readlink('/proc/self') != str(os.getpid())
     except OSError:  # every procfs has its self link (mounted with subset=pid too), which here names no process
@@ -1024,8 +1027,8 @@ class CleanupHelperTests(unittest.TestCase):
                                 dies_after_the_first_check(dying, reaped):
                             assertSays(None if reaped or working else 'hidden in /proc', launcher.server_unseen(info))
                 # Both reads refused, as while another account's postmaster runs, then a zombie (here it dies first, and
-                # both reads are faked as refused: where root is the host's, its read of such a zombie's environment
-                # fails with ESRCH instead; where root is a user namespace's own, as in a rootless container, both are
+                # both reads are faked as refused: where root is the host's uid 0, its read of such a zombie's environment
+                # fails with ESRCH instead; where it is not, as in a rootless container's user namespace, both are
                 # refused): the last look, after those reads, tells that it has ended. Without pidfds, the Docker-set
                 # line.
                 for case, own in (("both refused, then a zombie before the last look", None),
@@ -1111,11 +1114,15 @@ class CleanupHelperTests(unittest.TestCase):
         # What FOREIGN_PROC rests on, with /proc faked: what /proc/self names (None: the link is there, but readlink
         # fails, as where it names no process; False: there is no such link), whether /proc has /proc/sys, the PIDs it
         # lists, and whether it is another namespace's. Only the link decides: what such a /proc lists, and whether it
-        # has /proc/sys, are faked so that a test of them gives some layout here the wrong answer.
-        readlink, lexists, exists, isdir = os.readlink, os.path.lexists, os.path.exists, os.path.isdir
+        # has /proc/sys, are faked so that a test of them gives some layout here the wrong answer. Faked are readlink,
+        # lexists, islink, exists and isdir of /proc/self, /proc/thread-self, /proc/sys and /proc/<n>, and listdir,
+        # iterdir and glob of /proc, each as that layout would answer (a procfs lists self and thread-self, and sys
+        # where it has it); any other way to look reads the real /proc, which the next check covers, on real mounts.
+        readlink, lexists, islink, exists, isdir = os.readlink, os.path.lexists, os.path.islink, os.path.exists, os.path.isdir
         glob, iterdir, listdir = Path.glob, Path.iterdir, os.listdir
         layouts = (("this process's own", str(os.getpid()), True, [1, os.getpid()], False),
-                   ("an ancestor PID namespace's: its /proc/self names another process", str(os.getpid() + 1000003), True, [1], True),
+                   ("an ancestor PID namespace's: its /proc/self names this process by another PID", str(os.getpid() + 1000003), True,
+                    [1, os.getpid() + 1000003], True),
                    ("a child or sibling PID namespace's, as after nsenter --mount", None, True, [1, 7], True),
                    ('such a /proc mounted with hidepid=invisible: only some of its processes listed, PID 1 not', None, True, [4], True),
                    ("a PID namespace's that has ended: nothing listed", None, True, [], True),
@@ -1125,10 +1132,12 @@ class CleanupHelperTests(unittest.TestCase):
                    ('a tmpfs at /proc holding what a procfs lists (/proc/sys, numbered directories) but no self link', False, True, [1, 7], False))
         for case, link, sysctl, listed, foreign in layouts:
             with self.subTest(case):
-                def shown(path):  # whether this /proc shows path: None for a path outside it
-                    text = str(path)
-                    if text == '/proc/self':
-                        return bool(link)
+                names = [str(pid) for pid in listed] + (['self', 'thread-self'] if link is not False else []) + (['sys'] if sysctl else [])
+
+                def shown(path, follow=True):  # whether this /proc shows path (following a link, or not): None outside it
+                    text = os.path.normpath(os.fspath(path))
+                    if text in ('/proc/self', '/proc/thread-self'):
+                        return bool(link) if follow else link is not False
                     if text == '/proc/sys':
                         return sysctl
                     if re.fullmatch(r'/proc/\d+', text):
@@ -1136,14 +1145,19 @@ class CleanupHelperTests(unittest.TestCase):
                     return None
 
                 def faked_readlink(path, *arguments, **options):
-                    if str(path) != '/proc/self':
+                    if os.path.normpath(os.fspath(path)) != '/proc/self':
                         return readlink(path, *arguments, **options)
                     if not link:
                         raise FileNotFoundError(2, 'No such file or directory (synthetic)')
                     return link
 
                 def faked_lexists(path):
-                    return link is not False if str(path) == '/proc/self' else lexists(path)
+                    return lexists(path) if shown(path, False) is None else shown(path, False)
+
+                def faked_islink(path):
+                    if os.path.normpath(os.fspath(path)) in ('/proc/self', '/proc/thread-self'):
+                        return link is not False
+                    return islink(path) if shown(path) is None else False
 
                 def faked_exists(path):
                     return exists(path) if shown(path) is None else shown(path)
@@ -1152,17 +1166,57 @@ class CleanupHelperTests(unittest.TestCase):
                     return isdir(path) if shown(path) is None else shown(path)
 
                 def faked_glob(path, pattern, *arguments, **options):
-                    return iter([Path('/proc/%d' % pid) for pid in listed]) if str(path) == '/proc' else glob(path, pattern, *arguments, **options)
+                    if os.path.normpath(os.fspath(path)) != '/proc':
+                        return glob(path, pattern, *arguments, **options)
+                    return iter([Path('/proc', name) for name in names if '/' not in pattern and fnmatch.fnmatchcase(name, pattern)])
 
                 def faked_iterdir(path):
-                    return iter([Path('/proc/%d' % pid) for pid in listed]) if str(path) == '/proc' else iterdir(path)
+                    return iter([Path('/proc', name) for name in names]) if os.path.normpath(os.fspath(path)) == '/proc' else iterdir(path)
 
                 def faked_listdir(path='.'):
-                    return [str(pid) for pid in listed] if str(path) == '/proc' else listdir(path)
+                    return list(names) if os.path.normpath(os.fspath(path)) == '/proc' else listdir(path)
                 with patch.object(os, 'readlink', faked_readlink), patch.object(os.path, 'lexists', faked_lexists), \
-                        patch.object(os.path, 'exists', faked_exists), patch.object(os.path, 'isdir', faked_isdir), \
-                        patch.object(Path, 'glob', faked_glob), patch.object(Path, 'iterdir', faked_iterdir), patch.object(os, 'listdir', faked_listdir):
+                        patch.object(os.path, 'islink', faked_islink), patch.object(os.path, 'exists', faked_exists), \
+                        patch.object(os.path, 'isdir', faked_isdir), patch.object(Path, 'glob', faked_glob), \
+                        patch.object(Path, 'iterdir', faked_iterdir), patch.object(os, 'listdir', faked_listdir):
                     self.assertIs(foreign, proc_of_another_pid_namespace())
+
+    def test_the_checks_tell_a_proc_of_another_pid_namespace_on_real_mounts(self):
+        # FOREIGN_PROC as the module itself computes it, imported in a process that sees /proc as each layout has it,
+        # made for real in a mount namespace of its own (and PID namespaces of their own), whatever this process's
+        # /proc is: so that what decides is the layout, whichever way a test of it looks.
+        if not ROOT or not shutil.which('unshare'):
+            self.skipTest('needs root and unshare, to mount a /proc in a mount namespace of its own')
+        private = ['unshare', '--mount', '--propagation', 'private', '--', 'sh', '-c']
+        # sh, the namespace's init, runs the command as a child (not its last command), so that it is not PID 1 there.
+        own = ['unshare', '--pid', '--fork', '--mount-proc', '--kill-child', '--', 'sh', '-c', '"$@"; exit $?', 'sh']
+        probe = subprocess.run(private + ['mount -t tmpfs -o size=1m tmpfs /proc'], stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        if probe.returncode:
+            self.skipTest('cannot mount in a mount namespace of its own here: %s' % (probe.stderr.strip().splitlines() or ['exit status %d' % probe.returncode])[-1])
+        subset = not subprocess.run(private + ['mount -t proc -o subset=pid proc /proc'], stdin=subprocess.DEVNULL, capture_output=True).returncode
+        # The child's init mounts its procfs over /proc in the mount namespace that the command runs in, and sleeps;
+        # the command runs once /proc is that new mount (another device), and the init is killed after.
+        child = ('before=$(stat -c %d /proc); unshare --pid --fork --kill-child -- sh -c "mount -t proc proc /proc && exec sleep 20" & '
+                 'n=0; while [ "$(stat -c %d /proc)" = "$before" ] && [ $n -lt 200 ]; do sleep 0.05; n=$((n + 1)); done; '
+                 '"$0" "$@"; status=$?; { kill -KILL $!; wait $!; } 2> /dev/null; exit $status')
+        layouts = (("this process's own (a PID namespace's, with its own procfs)", own, False),
+                   ("an ancestor PID namespace's (unshare --pid without --mount-proc, inside that)",
+                    own + ['unshare', '--pid', '--fork', '--kill-child', '--'], True),
+                   ("a child PID namespace's, mounted by its init, as after nsenter --mount", private + [child], True),
+                   ("a PID namespace's that has ended", private + ['unshare --pid --fork -- mount -t proc proc /proc && exec "$0" "$@"'], True),
+                   ("an ended PID namespace's procfs mounted with subset=pid", private + [
+                       'unshare --pid --fork -- mount -t proc -o subset=pid proc /proc && exec "$0" "$@"'] if subset else None, True),
+                   ('a tmpfs at /proc', private + ['mount -t tmpfs -o size=1m tmpfs /proc && exec "$0" "$@"'], False),
+                   ('a tmpfs at /proc holding what a procfs lists (/proc/sys, numbered directories) but no self link', private + [
+                       'mount -t tmpfs -o size=1m tmpfs /proc && mkdir /proc/sys /proc/1 /proc/7 && exec "$0" "$@"'], False))
+        importing = 'import sys; sys.path.insert(0, sys.argv[1]); import postgresql_launcher_checks as checks; print(checks.FOREIGN_PROC)'
+        for case, prefix, foreign in layouts:
+            with self.subTest(case):
+                if prefix is None:
+                    self.skipTest('this kernel mounts no procfs with subset=pid (Linux 5.8 or later)')
+                run = subprocess.run(prefix + [sys.executable, '-I', '-c', importing, str(HERE)], stdin=subprocess.DEVNULL,
+                                     capture_output=True, text=True, timeout=60)
+                self.assertEqual(str(foreign), run.stdout.strip(), run.stderr[-2000:])
 
     def test_far_pid_takes_a_start_whose_next_500_pids_name_no_process_or_thread(self):
         # /proc/sys/kernel and /proc faked: ns_last_pid 1000 and pid_max 32768 make 17234 the first PID tried (halfway
@@ -1736,8 +1790,9 @@ class LauncherChecks(unittest.TestCase):
     def setUpClass(cls):
         if FOREIGN_PROC:  # the launch checks compare PIDs that commands print with PIDs that /proc gives
             raise unittest.SkipTest(FOREIGN_PROC_WHY)
-        # No procfs at /proc at all: the launcher's cleanup sees no process there, and each launch check's "nothing left"
-        # would hold whatever was left (some of them pass there all the same, on what else they check).
+        # No procfs at /proc at all: the launcher's cleanup sees no process there, so the process parts of the launch
+        # checks' "nothing left" (the launcher's "stopped and exited: yes", processes_naming(), /proc/<pid>) would hold
+        # whatever processes were left, and the check that must see a process still using the cluster fails there.
         if not os.path.isdir('/proc/self'):
             raise unittest.SkipTest('needs Linux /proc: without it the launcher cannot see whether any process still uses the cluster')
 
