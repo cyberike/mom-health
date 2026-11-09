@@ -1114,10 +1114,10 @@ class CleanupHelperTests(unittest.TestCase):
         # What FOREIGN_PROC rests on, with /proc faked: what /proc/self names (None: the link is there, but readlink
         # fails, as where it names no process; False: there is no such link), whether /proc has /proc/sys, the PIDs it
         # lists, and whether it is another namespace's. Only the link decides: what such a /proc lists, and whether it
-        # has /proc/sys, are faked so that a test of them gives some layout here the wrong answer. Faked are readlink,
-        # lexists, islink, exists and isdir of /proc/self, /proc/thread-self, /proc/sys and /proc/<n>, and listdir,
-        # iterdir and glob of /proc, each as that layout would answer (a procfs lists self and thread-self, and sys
-        # where it has it); any other way to look reads the real /proc, which the next check covers, on real mounts.
+        # has /proc/sys, are faked so that a test of them gives some layout here the wrong answer. Faked are readlink of
+        # /proc/self; lexists, islink, exists and isdir of /proc/self, /proc/thread-self, /proc/sys and /proc/<n>; and
+        # listdir, iterdir and glob of /proc; each as that layout would answer (a procfs lists self and thread-self, and
+        # sys where it has it). Any other way to look reads the real /proc, which the next check covers, on real mounts.
         readlink, lexists, islink, exists, isdir = os.readlink, os.path.lexists, os.path.islink, os.path.exists, os.path.isdir
         glob, iterdir, listdir = Path.glob, Path.iterdir, os.listdir
         layouts = (("this process's own", str(os.getpid()), True, [1, os.getpid()], False),

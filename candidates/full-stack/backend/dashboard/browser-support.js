@@ -39,7 +39,8 @@ function loopbackArgs(mappings = []) {
 // Windows, where node's os.tmpdir() and Chromium follow TEMP and TMP, not
 // TMPDIR: there Playwright makes its directories in %TEMP% itself, and removes
 // them as the run ends, and a run ended outright leaves them there, beside its
-// own directory, empty (not run on Windows: from node's and Chromium's sources).
+// own directory, empty (not run on Windows: from node's and Playwright's sources
+// and Chromium's documentation).
 let browserTemp = null;
 function launchOptions(args) {
   if (browserTemp === null) {

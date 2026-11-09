@@ -27,7 +27,8 @@ if (process.platform === "win32") {
 
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "mom-health-support-check-"));
 process.on("exit", () => fs.rmSync(scratch, { recursive: true, force: true }));
-// Ended by a signal itself, the runner still removes its scratch directory; each run it started ends as its stdin closes.
+// Ended by a signal itself, the runner still removes its scratch directory; each run it started that waits ends as its
+// stdin closes, and a failed one once its write fails.
 for (const name of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(name, () => process.exit(128 + os.constants.signals[name]));
 
 // An error larger than any socket buffer a spawn gets on a usual host (Linux
