@@ -117,7 +117,7 @@ From `candidates/full-stack/backend`:
 
 | Command | Result |
 | --- | --- |
-| `python -m unittest discover -s tests -v` | 182 tests OK (1 Windows-only skip) |
+| `python -m unittest discover -s tests -v` | 185 tests OK (1 Windows-only skip) |
 | `python -m unittest railway_candidate.test_gateway -v` | 12 OK |
 | `cd tests && python -m unittest integration_contract_android -v` | 5 OK |
 | `cd dashboard && node core.test.js` | 39 passed |
@@ -125,12 +125,12 @@ From `candidates/full-stack/backend`:
 | `node hosted.test.js` | 6 passed |
 | `node lifecycle.test.js` | 110 passed |
 | `node integration.test.js` | 6 passed |
-| `node browser-support.test.js` (no browser needed) | 9 passed |
+| `node browser-support.test.js` (no browser needed) | 13 passed (on Windows it runs nothing and says so) |
 | `node browser.test.js` (Playwright + Chromium) | 17 passed |
 | `node hosted-browser.test.js` (Playwright + Chromium) | 13 passed |
 | `node --check app.js && node --check core.js && node --check ../railway_candidate/dashboard-app.js && node --check browser-support.js` | OK |
 
-Counts include the November 7 follow-up and all thirteen rounds of corrections. The full backend run takes about 32 s and both browser suites about 54 s on four shared CPUs. New fixture directories accumulate under `candidates/full-stack/build/` (gitignored), as with the existing suites. Each browser-suite run gives headless Chromium and Playwright a temporary directory of its own under `/tmp` and removes it as it ends, after Playwright has killed a browser still running, also when a check fails, an error escapes the checks, or Ctrl-C, SIGTERM or SIGHUP ends the run (which then ends by that signal itself, its outputs left blocking; on Windows it exits with status 128 + n); a run killed outright (SIGKILL) leaves that one `mom-health-chromium-*` directory, with what they had in it.
+Counts include the November 7 follow-up and all fourteen rounds of corrections. The full backend run takes about 33 s and both browser suites about 54 s on four shared CPUs. New fixture directories accumulate under `candidates/full-stack/build/` (gitignored), as with the existing suites. Each browser-suite run gives headless Chromium and Playwright a temporary directory of its own under `/tmp` and removes it as it ends, after Playwright has killed a browser still running, also when a check fails, an error escapes the checks, or Ctrl-C, SIGTERM or SIGHUP ends the run (which then ends by that signal itself, its outputs left blocking; on Windows it exits with status 128 + n); a run killed outright (SIGKILL) leaves that one `mom-health-chromium-*` directory, with what they had in it.
 
 ## Blocked or not run
 
@@ -233,7 +233,7 @@ New checks:
 | The suite as committed in `9039d45`, against the code before the fixes | C: 7 failures (4 lock-wait subtests, 2 isolation subtests, the forced-collation check). ICU `en-US`: 8 (also the inherited listing-order check). Re-measured after the verification. |
 | `python -m unittest tests.postgresql_launcher_checks -v` | 58 OK, as root, with and without `PYTHONUNBUFFERED` (the failed-setup check also runs once as the `postgres` account, the check of every server process once without CAP_SYS_PTRACE and once in Docker's default capability set, the check of a `/proc` that hides the server's processes in Docker's set and with the test's own capabilities, and the check of a PID namespace of its own on its parent's `/proc` in four setups, one of them without `os.pidfd_open`), and under Python 3.11 and 3.12; the checks that need no server also run under the first complete interpreter of every other CPython 3 version installed. The whole module also passes as root without CAP_SYS_PTRACE, in Docker's default set, as the `postgres` account, in a PID namespace of its own on its parent's `/proc` (where the checks that compare PIDs with `/proc`'s are skipped), and on a child namespace's `/proc` or a `/proc` with no procfs (where the launch checks and the checks that read `/proc` are skipped). Each of 107 launcher changes, reverted (or applied) on its own, makes a check fail, but one that this round's second looks made equivalent (106 of 107; see the twelfth verification). The first 5 checks, against the launcher as merged in `7911545`: 4 failures and 2 errors |
 | `python -m unittest tests.postgresql_parity` without a database | exits 1: `POSTGRESQL PARITY CHECKS NOT RUN` |
-| `python -m unittest discover -s tests -v` | 182 OK (1 Windows-only skip) after all follow-up changes; the parity and launcher modules are not discovered |
+| `python -m unittest discover -s tests -v` | 185 OK (1 Windows-only skip) after all follow-up changes; the parity and launcher modules are not discovered |
 
 Run as a non-root account, the launcher needs no `--run-as`. The two cluster directories from the first runs on unfixed code (stopped, fictional data, about 47 MB each) were retained under `build/postgresql-fixtures/`; the other runs used `--discard`. A verifier's cluster left by the container restart, and the reviewers' scratch copies, were removed.
 
