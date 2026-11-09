@@ -467,7 +467,8 @@ def server_unseen(info):
         working_directory = can_read(os.readlink, '/proc/%d/cwd' % postmaster)
     except OSError:  # the server is already gone, or is exiting (its memory released: no environment to read)
         return None
-    # Ended meanwhile, since a read was refused while it ran (for root of a user namespace, a zombie refuses both too).
+    # Ended meanwhile, since a read was refused while it ran (where root is not the host's uid 0, as in a rootless
+    # container's user namespace, a zombie refuses both too).
     if environment or working_directory or ended(pid):
         return None
     return ("the server account's environments and working directories are not readable here (root without "
