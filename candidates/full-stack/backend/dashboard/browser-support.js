@@ -127,6 +127,10 @@ for (const name of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(name, () => end(1
 // A failed run ends once its error is written in full (process.exit drops what
 // a pipe has not taken yet), or after 10 s, so that a browser or backend still
 // running (one whose start or launch failed part-way, say) cannot keep it alive.
+// Not on Windows where stderr is a pipe: node writes to a pipe synchronously
+// there (lib/net.js), so a reader that has stopped reading holds the run in
+// that write, and neither the 10 s nor Ctrl-C ends it (not run on Windows:
+// from node's source).
 function failed(error) {
   process.exitCode = 1;
   setTimeout(() => end(1), 10000);
